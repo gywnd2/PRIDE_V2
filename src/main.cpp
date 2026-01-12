@@ -1,18 +1,22 @@
 #include <Arduino.h>
+#include <DisplayMgr.h>
+#include <StorageMgr.h>
 
-// put function declarations here:
-int myFunction(int, int);
+DisplayMgr displayMgr;
+StorageMgr storageMgr;
 
 void setup() {
-  // put your setup code here, to run once:
-  int result = myFunction(2, 3);
+  Serial.begin(115200);
+  Serial.println("Setup started");
+
+  displayMgr.Init();
+  displayMgr.DrawTestScreen();
+
+  storageMgr.Init();
+
+  Serial.println("Setup completed");
 }
 
 void loop() {
-  // put your main code here, to run repeatedly:
-}
 
-// put function definitions here:
-int myFunction(int x, int y) {
-  return x + y;
 }
