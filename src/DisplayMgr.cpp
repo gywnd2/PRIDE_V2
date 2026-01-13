@@ -55,7 +55,7 @@ void DisplayMgr::Init()
     Serial.println("[DisplayMgr] rgb_panel created");
 
 
-    display = new Arduino_RGB_Display(
+    gfx = new Arduino_RGB_Display(
         SCREEN_WIDTH,
         SCREEN_HEIGHT,
         rgbPanel,
@@ -64,26 +64,18 @@ void DisplayMgr::Init()
         nullptr,
         GFX_NOT_DEFINED,
         nullptr,
-        GFX_NOT_DEFINED
+        GFX_NOT_DEFINED,
+        0, // col_offset1
+        0, // row_offset1
+        0, // col_offset2
+        0  // row_offset2
     );
-    Serial.println("[DisplayMgr] display created");
-}
 
-void DisplayMgr::DrawTestScreen()
-{
-    if (display->begin())
-    {
-        display->fillScreen(RGB565_WHITE);
-        display->setTextColor(RGB565_BLACK);
-        display->setTextSize(4);
-        display->setCursor(50, 50);
-        display->print("Display Initialized!");
-        Serial.println("[DisplayMgr] Display initialized and test screen drawn");
-    }
-    else
-    {
-        Serial.println("[DisplayMgr] Failed to begin display");
-    }
+    // Initialize the display and remember whether it succeeded
+    bool ok = gfx->begin(ST7262_PANEL_CONFIG_TIMINGS_PCLK_HZ);
+    _gfxInitialized = ok;
+    Serial.printf("[DisplayMgr] gfx->begin returned %d\n", ok);
+    Serial.println("[DisplayMgr] gfx created");
 }
 
 void DisplayMgr::BacklightOn()
@@ -111,4 +103,76 @@ static uint32_t lastToggleTime = 0;
     backlightOn = !backlightOn;
     lastToggleTime = millis();
   }
+}
+
+void DisplayMgr::Println(const String& text)
+{
+    Serial.println(text);
+    PushLine(text);
+    if (_gfxInitialized)
+    {
+        Redraw();
+    }
+}
+
+void DisplayMgr::Printf(const String& text)
+{
+    Serial.print(text);
+    AppendToLastLine(text);
+    if (_gfxInitialized)
+    {
+        Redraw();
+    }
+}
+
+void DisplayMgr::PushLine(const String& line)
+{
+    _lines.push_back(line);
+    Serial.println("[DisplayMgr] Pushed line: " + line);
+    if (_lines.size() > CONSOLE_ROWS)
+    {
+        _lines.erase(_lines.begin());
+    }
+}
+
+void DisplayMgr::AppendToLastLine(const String& text)
+{
+    if (_lines.empty())
+    {
+        _lines.push_back(text);
+    }
+    else
+    {
+        _lines.back() += text;
+    }
+}
+
+void DisplayMgr::Redraw()
+{
+    if (not _gfxInitialized) {
+        Serial.println("[DisplayMgr] Redraw skipped: gfx not initialized");
+        return;
+    }
+
+    gfx->fillScreen(RGB565_BLACK);
+    gfx->setTextColor(RGB565_WHITE);
+    gfx->setTextSize(2);
+
+    int y = 1;
+    for (const String& line : _lines)
+    {
+        gfx->setCursor(1, y);
+        gfx->print(line);
+        gfx->print("\n");
+        y += 20;
+    }
+}
+
+void DisplayMgr::Clear()
+{
+    _lines.clear();
+    if (_gfxInitialized)
+    {
+        gfx->fillScreen(RGB565_BLACK);
+    }
 }

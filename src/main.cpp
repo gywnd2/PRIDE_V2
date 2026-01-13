@@ -10,11 +10,18 @@ void setup() {
   Serial.println("Setup started");
 
   displayMgr.Init();
-  displayMgr.DrawTestScreen();
+  displayMgr.BacklightOn();
+
+  displayMgr.Println("ESP32 / Guition JC8048W550_I Start Up");
+  displayMgr.Println("Display Initialized");
 
   storageMgr.Init();
+  storageMgr.ScanDirectory("/", 0);
+  displayMgr.Println("Storage Scanned");
 
-  Serial.println("Setup completed");
+
+
+  displayMgr.Println("Setup Completed");
 }
 
 void loop() {
