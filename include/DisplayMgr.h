@@ -24,6 +24,21 @@ class DisplayMgr
         std::vector<String> _lines;
         int _cursor;
 
+        // Animated GIF instance (reused)
+        AnimatedGIF _gif;
+        bool _gifPlaying = false;
+
+        // Double-buffering members
+        uint16_t* _fb_buf[2] = {nullptr, nullptr};
+        uint8_t _fb_active = 0; // index of buffer currently used by panel
+        size_t _fb_pixels = 0;
+
+        // Internal draw callback used by AnimatedGIF
+        static void GifDrawStatic(GIFDRAW *pDraw);
+        static void PlaySplash(void* pvParameters);
+
+        TaskHandle_t _splashTaskHandle = nullptr;
+
     public:
         DisplayMgr();
         ~DisplayMgr();
@@ -37,6 +52,11 @@ class DisplayMgr
         void AppendToLastLine(const String& text);
         void Redraw();
         void Clear();
+
+        bool PlayGifFromSD(const char* path, bool loop = true);
+        void StopGif();
+
+        bool PlayGifFromMemory(uint8_t* pData, size_t iSize, bool loop);
 };
 
 #endif
