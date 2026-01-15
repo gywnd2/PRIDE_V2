@@ -1,13 +1,17 @@
 #include <Arduino.h>
 #include <DisplayMgr.h>
 #include <StorageMgr.h>
+#include <Mp3Mgr.h>
 
 DisplayMgr displayMgr;
 StorageMgr storageMgr;
+Mp3Mgr mp3Mgr;
 
 void setup() {
   Serial.begin(115200);
   Serial.println("Setup started");
+
+  mp3Mgr.InitMp3();
 
   displayMgr.Init();
   displayMgr.BacklightOn();
@@ -21,17 +25,12 @@ void setup() {
   displayMgr.Println("Storage Scanned");
 
   GIFMemory splashMem = storageMgr.LoadGifToPSRAM("/anim/splash.gif");
-  if(splashMem.size > 0)
-  {
-    displayMgr.Println("Load splash anim successful");
+  if(splashMem.size > 0) {
+    displayMgr._pendingGifData = splashMem.data;
+    displayMgr._pendingGifSize = splashMem.size;
   }
 
-  if(storageMgr.SDExists("/anim/splash.gif"))
-  {
-    displayMgr.Clear();
-    displayMgr.PlayGifFromMemory(splashMem.data, splashMem.size, false);
-  }
-
+  displayMgr.Println("Setup continue while GIF playing...");
   displayMgr.Println("Setup Completed");
 }
 

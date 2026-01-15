@@ -35,9 +35,12 @@ class DisplayMgr
 
         // Internal draw callback used by AnimatedGIF
         static void GifDrawStatic(GIFDRAW *pDraw);
-        static void PlaySplash(void* pvParameters);
+        static void PlayGifTask(void* pvParameters);
 
-        TaskHandle_t _splashTaskHandle = nullptr;
+        TaskHandle_t _gifTaskHandle = nullptr;
+
+        // PSRAM 데이터를 가리킬 포인터와 사이즈
+
 
     public:
         DisplayMgr();
@@ -57,6 +60,9 @@ class DisplayMgr
         void StopGif();
 
         bool PlayGifFromMemory(uint8_t* pData, size_t iSize, bool loop);
+
+        uint8_t* _pendingGifData = nullptr;
+        size_t _pendingGifSize = 0;
 };
 
 #endif

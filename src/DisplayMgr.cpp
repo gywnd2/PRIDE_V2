@@ -87,9 +87,44 @@ void DisplayMgr::Init()
         if(_fb_buf[1] != nullptr) {
             memset(_fb_buf[0], 0, bufferSize);
             memset(_fb_buf[1], 0, bufferSize);
-            Serial.println("[DisplayMgr] Double-buffering enabled & Buffers cleared");
+            Serial.println("[DisplayMgr] Double-buffering enabled");
         }
+
+        xTaskCreatePinnedToCore(
+            DisplayMgr::PlayGifTask,   // 태스크 함수
+            "GifPlayTask",             // 태스크 이름
+            16384,                      // 스택 크기
+            this,                      // 파라미터 (this 포인터 전달)
+            2,                         // 우선순위
+            &_gifTaskHandle,           // 태스크 핸들
+            1                          // 코어 번호 (1번 코어 권장)
+        );
     }
+}
+
+// SD 카드로부터 GIF를 재생하는 태스크 구현
+void DisplayMgr::PlayGifTask(void* pvParameters)
+{
+    DisplayMgr* self = static_cast<DisplayMgr*>(pvParameters);
+
+    Serial.println("[DisplayMgr] Task: Waiting for PSRAM data...");
+
+    // 데이터가 로드될 때까지 최대 5초 대기 (main의 LoadGifToPSRAM 완료 대기)
+    int timeout = 50;
+    while (self->_pendingGifData == nullptr && timeout-- > 0) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    if (self->_pendingGifData != nullptr) {
+        Serial.println("[DisplayMgr] Task: PSRAM data found. Starting play.");
+        self->Clear();
+        self->PlayGifFromMemory(self->_pendingGifData, self->_pendingGifSize, false);
+    } else {
+        Serial.println("[DisplayMgr] Task: Timeout waiting for data.");
+    }
+
+    self->_gifTaskHandle = NULL;
+    vTaskDelete(NULL);
 }
 
 void DisplayMgr::BacklightOn()
@@ -163,6 +198,10 @@ void DisplayMgr::AppendToLastLine(const String& text)
 
 void DisplayMgr::Redraw()
 {
+    while(_gifPlaying) {
+        delay(10); // GIF 재생 중이면 잠시 대기
+    }
+
     if (!_gfxInitialized) {
         Serial.println("[DisplayMgr] Redraw skipped: gfx not initialized");
         return;
@@ -253,7 +292,6 @@ bool DisplayMgr::PlayGifFromSD(const char* path, bool loop)
     _gif.close();
     _gifPlaying = false;
 
-    // [핵심] 재생 종료 후 로그 복구
     Serial.println("[DisplayMgr] SD GIF finished. Restoring log screen...");
     this->Redraw();
 
@@ -277,8 +315,6 @@ void DisplayMgr::GifDrawStatic(GIFDRAW *pDraw)
     uint16_t fbw = self->gfx->getFrameBufferWidth();
     uint16_t fbh = self->gfx->getFrameBufferHeight();
 
-    // --- [중앙 정렬 로직 수정] ---
-    // 구조체에 iCanvasHeight가 없으므로 _gif 객체에서 직접 가져옵니다.
     int canvasW = pDraw->iCanvasWidth;
     int canvasH = self->_gif.getCanvasHeight();
 
@@ -376,7 +412,6 @@ bool DisplayMgr::PlayGifFromMemory(uint8_t* pData, size_t iSize, bool loop)
     _gif.close();
     _gifPlaying = false;
 
-    // 재생이 끝났으므로 로그 화면으로 복구
     Serial.println("[DisplayMgr] Memory GIF finished. Restoring log screen...");
     this->Redraw();
 

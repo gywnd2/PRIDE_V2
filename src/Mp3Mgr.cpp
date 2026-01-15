@@ -6,7 +6,7 @@ bool Mp3Mgr::InitMp3(void)
     dfpSerial.begin(9600, SERIAL_8N1, DFPLAYER_RX, DFPLAYER_TX);
 
     // 시리얼 연결 확인 (DFPlayer는 응답이 느릴 수 있어 잠시 대기)
-    delay(500);
+    delay(200);
 
     if (!dfPlayer.begin(dfpSerial))
     {
@@ -34,7 +34,7 @@ bool Mp3Mgr::InitMp3(void)
         this,               // 파라미터로 현재 인스턴스(this) 전달
         4,                  // 우선순위
         &_playTaskHandle,   // 핸들
-        1                   // Core 1
+        0                   // Core 0
     );
 
     return true;
