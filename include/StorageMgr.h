@@ -4,10 +4,8 @@
 #include <Arduino.h>
 #include <SD.h>
 #include <vector>
-#include <AnimatedGIF.h> // needed for GIF file callbacks
 #include <SPI.h>
-
-#define SD_CS_PIN 5
+#include <AnimatedGIF.h>
 
 struct GIFMemory
 {
@@ -26,14 +24,22 @@ class StorageMgr
 {
     private:
         std::vector<FileNode> fileList;
-
         size_t ReadAll(const char* path, uint8_t* buffer, size_t maxLen);
         void Exists(const char* path);
         File OpenFile(const char* path, const char* mode);
+        TaskHandle_t taskHandler = nullptr;
+
+        static void Subscribe(void* pvParameters);
 
     public:
-        StorageMgr();
-        ~StorageMgr();
+        StorageMgr()
+        {
+            Serial.println("====StorageMgr");
+        }
+        ~StorageMgr()
+        {
+            Serial.println("~~~~StorageMgr");
+        }
 
         void Init();
         void ScanDirectory(const char* path, uint8_t depth);

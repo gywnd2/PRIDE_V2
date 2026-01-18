@@ -1,14 +1,7 @@
 #include "DisplayMgr.h"
-
-DisplayMgr::DisplayMgr()
-{
-    Serial.println("====DisplayMgr");
-}
-
-DisplayMgr::~DisplayMgr()
-{
-    Serial.println("~~~~DisplayMgr");
-}
+#include <CommonApi.h>
+#include <StorageMgr.h>
+#include <AnimatedGIF.h>
 
 void DisplayMgr::Init()
 {
@@ -54,7 +47,6 @@ void DisplayMgr::Init()
     );
     Serial.println("[DisplayMgr] rgb_panel created");
 
-
     gfx = new Arduino_RGB_Display(
         SCREEN_WIDTH,
         SCREEN_HEIGHT,
@@ -90,19 +82,19 @@ void DisplayMgr::Init()
             Serial.println("[DisplayMgr] Double-buffering enabled");
         }
 
-        xTaskCreatePinnedToCore(
-            DisplayMgr::PlayGifTask,   // 태스크 함수
-            "GifPlayTask",             // 태스크 이름
-            16384,                      // 스택 크기
-            this,                      // 파라미터 (this 포인터 전달)
-            2,                         // 우선순위
-            &_gifTaskHandle,           // 태스크 핸들
-            1                          // 코어 번호 (1번 코어 권장)
-        );
+        this->BacklightOn();
     }
+
+    xTaskCreate(
+        DisplayMgr::Subscribe,
+        "DisplayEventSubscriber",
+        4096,
+        this,
+        1,
+        &taskHandler
+    );
 }
 
-// SD 카드로부터 GIF를 재생하는 태스크 구현
 void DisplayMgr::PlayGifTask(void* pvParameters)
 {
     DisplayMgr* self = static_cast<DisplayMgr*>(pvParameters);
@@ -123,8 +115,92 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
         Serial.println("[DisplayMgr] Task: Timeout waiting for data.");
     }
 
-    self->_gifTaskHandle = NULL;
+    SystemAPI::getInstance()->storageSubscriber.SetEvent(STORAGE_CLEAR_LOADED_PSRAM);
     vTaskDelete(NULL);
+}
+
+void DisplayMgr::Subscribe(void* pvParameters)
+{
+    DisplayMgr* self = static_cast<DisplayMgr*>(pvParameters);
+    SystemAPI* system = SystemAPI::getInstance();
+    DisplayEventSubscriber& subscriber = system->displaySubscriber;
+    StorageEventSubscriber& storage = system->storageSubscriber;
+
+    while(true)
+    {
+        if(subscriber.IsEventPending())
+        {
+            int eventType = subscriber.GetEventType();
+            switch(eventType)
+            {
+                case DISPLAY_EVENT_TYPE::DIPLAY_EVENT_NONE:
+                {
+                    break;
+                }
+                case DISPLAY_EVENT_TYPE::DISPLAY_SHOW_SPLASH:
+                {
+                    static bool load = false;
+                    if(not load)
+                    {
+                        Serial.println("[DisplayMgr] Subscribe : Show splash");
+                        storage.SetEvent(STORAGE_LOAD_TO_PSRAM, subscriber.GetEventData());
+                        load = true;
+                    }
+
+                    if(system->isGifLoaded)
+                    {
+                        Serial.println("[DisplayMgr] Subscribe : Gif loaded to PSRAM");
+                        GIFMemory* gifObj = system->GetPsramObjPtr();
+                        if(gifObj->size > 0) {
+                            self->_pendingGifData = gifObj->data;
+                            self->_pendingGifSize = gifObj->size;
+                        }
+                        if(not self->_gifPlaying)
+                        {
+                        Serial.println("[DisplayMgr] Subscribe : Gif is not playing. Create PlayGifTask");
+                            xTaskCreatePinnedToCore(DisplayMgr::PlayGifTask, "GifPlayTask", 16384, self, 2, nullptr, 1);
+                        }
+                        break;
+                    }
+
+                    else continue; // Wait for loading gif
+                }
+                case DISPLAY_EVENT_TYPE::DISPLAY_UPDATE_OBD_STATUS:
+                {
+
+                    break;
+                }
+                case DISPLAY_EVENT_TYPE::DISPLAY_UPDATE_VOLTAGE:
+                {
+
+
+                    break;
+                }
+                case DISPLAY_EVENT_TYPE::DISPLAY_UPDATE_COOLANT:
+                {
+
+
+                    break;
+                }
+                case DISPLAY_EVENT_TYPE::DISPLAY_UPDATE_CPU_USAGE:
+                {
+
+                    break;
+                }
+                case DISPLAY_EVENT_TYPE::DISPLAY_UPDATE_RAM_USAGE:
+                {
+                    break;
+                }
+                default:
+                    Serial.printf("[DisplayMgr] Subscribe: Wrong Event type : %d\n", eventType);
+                    break;
+            }
+
+            subscriber.ClearEvent();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
 }
 
 void DisplayMgr::BacklightOn()
@@ -390,7 +466,7 @@ bool DisplayMgr::PlayGifFromMemory(uint8_t* pData, size_t iSize, bool loop)
             if (delayMs > 0) {
                 // delayMs를 speed로 나누어 대기 시간을 조절합니다.
                 // 예: speed가 2.0이면 delay는 절반이 되어 2배 빠르게 재생됩니다.
-                int adjustedDelay = (int)(delayMs / 6);
+                int adjustedDelay = (int)(delayMs / 15);
                 if (adjustedDelay > 0) {
                     delay(adjustedDelay);
                 } else {

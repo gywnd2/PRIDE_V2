@@ -2,11 +2,9 @@
 #define __DISPLAY__
 
 #include <Arduino.h>
-#include <ui.h>
 #include <AnimatedGIF.h>
 #include <Arduino_GFX_Library.h>
 #include <vector>
-#include <StorageMgr.h>
 
 #define SCREEN_WIDTH 800
 #define SCREEN_HEIGHT 480
@@ -24,7 +22,6 @@ class DisplayMgr
         std::vector<String> _lines;
         int _cursor;
 
-        // Animated GIF instance (reused)
         AnimatedGIF _gif;
         bool _gifPlaying = false;
 
@@ -32,19 +29,25 @@ class DisplayMgr
         uint16_t* _fb_buf[2] = {nullptr, nullptr};
         uint8_t _fb_active = 0; // index of buffer currently used by panel
         size_t _fb_pixels = 0;
+        uint8_t* _pendingGifData = nullptr;
+        size_t _pendingGifSize = 0;
 
         // Internal draw callback used by AnimatedGIF
         static void GifDrawStatic(GIFDRAW *pDraw);
         static void PlayGifTask(void* pvParameters);
+        static void Subscribe(void* pvParameters);
 
-        TaskHandle_t _gifTaskHandle = nullptr;
-
-        // PSRAM 데이터를 가리킬 포인터와 사이즈
-
+        TaskHandle_t taskHandler = nullptr;
 
     public:
-        DisplayMgr();
-        ~DisplayMgr();
+        DisplayMgr()
+        {
+            Serial.println("====DisplayMgr");
+        }
+        ~DisplayMgr()
+        {
+            Serial.println("~~~~DisplayMgr");
+        }
         void Init();
         void BacklightOn();
         void BacklightOff();
@@ -61,8 +64,6 @@ class DisplayMgr
 
         bool PlayGifFromMemory(uint8_t* pData, size_t iSize, bool loop);
 
-        uint8_t* _pendingGifData = nullptr;
-        size_t _pendingGifSize = 0;
 };
 
 #endif

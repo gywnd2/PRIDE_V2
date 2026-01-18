@@ -1,14 +1,5 @@
 #include <StorageMgr.h>
-
-StorageMgr::StorageMgr()
-{
-    Serial.println("====StorageMgr");
-}
-
-StorageMgr::~StorageMgr()
-{
-    Serial.println("~~~~StorageMgr");
-}
+#include <CommonApi.h>
 
 void StorageMgr::Init()
 {
@@ -19,8 +10,104 @@ void StorageMgr::Init()
     else
     {
         Serial.println("[StorageMgr] SD Card Mounted Successfully");
+        this->ScanDirectory("/", 0);
+
+        if (taskHandler != NULL) {
+            vTaskDelete(taskHandler);
+            taskHandler = NULL;
+        }
+
+        xTaskCreate(
+            StorageMgr::Subscribe,
+            "StorageEventSubscriber",
+            8192,
+            this,
+            1,
+            &taskHandler
+        );
     }
 }
+
+void StorageMgr::Subscribe(void* pvParameters)
+{
+    StorageMgr* self = static_cast<StorageMgr*>(pvParameters);
+    SystemAPI* system = SystemAPI::getInstance();
+    StorageEventSubscriber& subscriber = system->storageSubscriber;
+
+    while (true)
+    {
+        if(subscriber.IsEventPending())
+        {
+            int eventType = subscriber.GetEventType();
+            Serial.printf("[StorageMgr] Subscribe: %d\n", eventType);
+            switch(eventType)
+            {
+                case STORAGE_EVENT_TYPE::STORAGE_EVENT_NONE:
+                {
+                    break;
+                }
+                case STORAGE_EVENT_TYPE:: STORAGE_SCAN:
+                {
+                    self->ScanDirectory("/", 0);
+                    break;
+                }
+                case STORAGE_EVENT_TYPE::STORAGE_READ:
+                {
+                    break;
+                }
+                case STORAGE_EVENT_TYPE::STORAGE_WRITE:
+                {
+                    break;
+                }
+                case STORAGE_EVENT_TYPE::STORAGE_LOAD_TO_PSRAM:
+                {
+                    const String* filePath = subscriber.GetFilePath();
+                    GIFMemory* objPtr = system->GetPsramObjPtr();
+
+                    if(objPtr == nullptr)
+                    {
+                        Serial.println("[StorageMgr] Critical Error: gifObj pointer is NULL");
+                        break;
+                    }
+
+                    if(objPtr->data != nullptr)
+                    {
+                        heap_caps_free(objPtr->data);
+                        objPtr->data = nullptr;
+                    }
+
+                    *objPtr = self->LoadGifToPSRAM(filePath->c_str());
+                    system->isGifLoaded = (objPtr->data != nullptr);
+
+                    Serial.println("[StorageMgr] Successfully loaded gif to PSRAM");
+                    break;
+                }
+                case STORAGE_EVENT_TYPE::STORAGE_CLEAR_LOADED_PSRAM:
+                {
+                    GIFMemory* objPtr = system->GetPsramObjPtr();
+                    if(objPtr->data != nullptr)
+                    {
+                        heap_caps_free(objPtr->data);
+
+                        objPtr->data = nullptr;
+                        objPtr->size = 0;
+                    }
+                    system->isGifLoaded = false;
+                    Serial.println("[StorageMgr] Cleared gif in PSRAM");
+                    break;
+                }
+                default:
+                    Serial.printf("[StorageMgr] Subscribe: Wrong Event type : %d\n", eventType);
+                    break;
+            }
+
+            subscriber.ClearEvent();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
 
 void StorageMgr::ScanDirectory(const char* path, uint8_t depth)
 {
