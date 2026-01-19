@@ -118,10 +118,11 @@ void BluetoothMgr::Subscribe(void* pvParameters)
 {
     BluetoothMgr* self = static_cast<BluetoothMgr*>(pvParameters);
     SystemAPI* sys = SystemAPI::getInstance();
+    BtEventData event;
 
     while (true) {
-        if (sys->btSubscriber.IsEventPending()) {
-            switch (sys->btSubscriber.GetEventType()) {
+        if (sys->btSubscriber.ReceiveEvent(&event, portMAX_DELAY)) {
+            switch (event.type) {
                 case BT_REQUEST_CONNECT_OBD:
                     Serial.println("[BluetoothMgr] Create connect OBD task.");
                     xTaskCreate(
@@ -136,11 +137,11 @@ void BluetoothMgr::Subscribe(void* pvParameters)
                 case BT_REQUEST_DISCONNECT:
                     self->Disconnect();
                     break;
+                case BT_REQUEST_RESET_CONNECTION:
+                    break;
                 default: break;
             }
-            sys->btSubscriber.ClearEvent();
         }
-        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 

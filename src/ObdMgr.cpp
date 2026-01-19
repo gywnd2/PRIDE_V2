@@ -13,7 +13,7 @@ String ObdStatusStr[8] =
     "OBD Disconnected"
 };
 
-void ObdMgr::InitOBD(void)
+void ObdMgr::Init(void)
 {
     Serial.println("[ObdMgr] S3 BLE OBD task started");
     SetOBDStatus(BT_INIT_SUCCESS);
@@ -82,7 +82,6 @@ void ObdMgr::ConnectBTTask(void *param)
 #endif
 
     self->SetOBDStatus(OBD_CONNECTED);
-    // 데이터 쿼리 태스크는 Core 1에서 실행 (UI와 분리 고려)
     xTaskCreatePinnedToCore(QueryOBDData, "QueryOBDData", 4096, self, 3, &(self->query_obd_data_task), 1);
     vTaskDelete(NULL);
 }
@@ -165,8 +164,6 @@ void ObdMgr::QueryRPM(uint16_t &rpm_value)
 #endif
 }
 
-// ... (QueryDistAfterErrorClear, QueryMaf도 동일한 패턴으로 수정) ...
-
 void ObdMgr::QueryOBDData(void *param)
 {
     ObdMgr* self = static_cast<ObdMgr*>(param);
@@ -218,6 +215,8 @@ void ObdMgr::QueryOBDData(void *param)
         if (self->GetOBDStatus() == OBD_DISCONNECTED)
         {
             Serial.println("[ObdMgr] OBD Disconnected. Terminating Task.");
+            SystemAPI* system = SystemAPI::getInstance();
+            system->soundSubscriber.SetEvent(SOUND_PLAY_TRACK, 1);
             vTaskDelete(NULL);
             return;
         }

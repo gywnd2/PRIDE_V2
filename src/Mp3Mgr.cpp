@@ -1,4 +1,5 @@
 #include "Mp3Mgr.h"
+#include "CommonApi.h"
 
 bool Mp3Mgr::Init(void)
 {
@@ -40,16 +41,19 @@ bool Mp3Mgr::Init(void)
 void Mp3Mgr::Subscribe(void* pvParameters)
 {
     Mp3Mgr* self = static_cast<Mp3Mgr*>(pvParameters);
+    SystemAPI* system = SystemAPI::getInstance();
+    SoundEventData event;
 
-    int track = self->_pendingTrack;
-    Serial.printf("[Mp3Mgr] Task: Starting track %d\n", track);
+    while(true)
+    {
+        if(system->soundSubscriber.ReceiveEvent(&event, portMAX_DELAY))
+        {
+            if(event.type == SOUND_PLAY_TRACK)
+            {
+                Serial.printf("[Mp3Mgr] Task: Starting track %d\n", event.track);
+                self->dfPlayer.play(event.track);
+            }
+        }
+    }
 
-    self->dfPlayer.play(track);
-
-    vTaskDelay(pdMS_TO_TICKS(6000));
-
-    Serial.println("[Mp3Mgr] Task: Sequence finished");
-
-    self->taskHandler = NULL;
-    vTaskDelete(NULL);
 }

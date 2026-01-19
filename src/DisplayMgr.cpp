@@ -8,6 +8,7 @@ void DisplayMgr::Init()
     #ifdef GPIO_BCKL
         pinMode(GPIO_BCKL, OUTPUT);
     #endif
+    this->gifTaskHandler = nullptr;
 
     this->rgbPanel = new Arduino_ESP32RGBPanel(
         ST7262_PANEL_CONFIG_DE_GPIO_NUM,
@@ -90,14 +91,15 @@ void DisplayMgr::Init()
         "DisplayEventSubscriber",
         4096,
         this,
-        1,
-        &taskHandler
+        4,
+        &this->gifTaskHandler
     );
 }
 
 void DisplayMgr::PlayGifTask(void* pvParameters)
 {
     DisplayMgr* self = static_cast<DisplayMgr*>(pvParameters);
+    SystemAPI* system = SystemAPI::getInstance();
 
     Serial.println("[DisplayMgr] Task: Waiting for PSRAM data...");
 
@@ -110,7 +112,17 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
     if (self->_pendingGifData != nullptr) {
         Serial.println("[DisplayMgr] Task: PSRAM data found. Starting play.");
         self->Clear();
-        self->PlayGifFromMemory(self->_pendingGifData, self->_pendingGifSize, false);
+
+        // 재생 중 메모리 해제 방지를 위해 Lock
+        if (system->LockGif()) {
+            self->PlayGifFromMemory(self->_pendingGifData, self->_pendingGifSize, false);
+            system->UnlockGif();
+        } else {
+            Serial.println("[DisplayMgr] Task: Failed to lock GIF memory");
+        }
+
+        // GIF 재생 종료 후 화면 복구 (Deadlock 방지를 위해 Unlock 후 호출)
+        self->Redraw();
     } else {
         Serial.println("[DisplayMgr] Task: Timeout waiting for data.");
     }
@@ -126,12 +138,14 @@ void DisplayMgr::Subscribe(void* pvParameters)
     DisplayEventSubscriber& subscriber = system->displaySubscriber;
     StorageEventSubscriber& storage = system->storageSubscriber;
 
+    DisplayEventData event;
+
     while(true)
     {
-        if(subscriber.IsEventPending())
+        // 큐에서 이벤트를 기다림 (Blocking)
+        if(subscriber.ReceiveEvent(&event, portMAX_DELAY))
         {
-            int eventType = subscriber.GetEventType();
-            switch(eventType)
+            switch(event.type)
             {
                 case DISPLAY_EVENT_TYPE::DIPLAY_EVENT_NONE:
                 {
@@ -139,31 +153,40 @@ void DisplayMgr::Subscribe(void* pvParameters)
                 }
                 case DISPLAY_EVENT_TYPE::DISPLAY_SHOW_SPLASH:
                 {
-                    static bool load = false;
-                    if(not load)
-                    {
-                        Serial.println("[DisplayMgr] Subscribe : Show splash");
-                        storage.SetEvent(STORAGE_LOAD_TO_PSRAM, subscriber.GetEventData());
-                        load = true;
+                    Serial.println("[DisplayMgr] Subscribe : Show splash");
+                    // 1. StorageMgr에 로드 요청
+                    storage.SetEvent(STORAGE_LOAD_TO_PSRAM, event.data);
+
+                    // 2. 로드 완료 대기 (Polling loop within task)
+                    // 주의: 여기서 대기하는 동안 다른 디스플레이 이벤트는 처리되지 않음 (Splash 로딩 중이므로 허용)
+                    int waitCount = 0;
+                    while (!system->isGifLoaded && waitCount++ < 100) { // 최대 10초 대기
+                        vTaskDelay(pdMS_TO_TICKS(100));
                     }
 
                     if(system->isGifLoaded)
                     {
                         Serial.println("[DisplayMgr] Subscribe : Gif loaded to PSRAM");
-                        GIFMemory* gifObj = system->GetPsramObjPtr();
-                        if(gifObj->size > 0) {
-                            self->_pendingGifData = gifObj->data;
-                            self->_pendingGifSize = gifObj->size;
-                        }
-                        if(not self->_gifPlaying)
-                        {
-                        Serial.println("[DisplayMgr] Subscribe : Gif is not playing. Create PlayGifTask");
-                            xTaskCreatePinnedToCore(DisplayMgr::PlayGifTask, "GifPlayTask", 16384, self, 2, nullptr, 1);
-                        }
-                        break;
-                    }
 
-                    else continue; // Wait for loading gif
+                        // 포인터 복사 시점에도 안전하게 Lock
+                        if (system->LockGif()) {
+                            GIFMemory* gifObj = system->GetPsramObjPtr();
+                            if(gifObj->size > 0) {
+                                self->_pendingGifData = gifObj->data;
+                                self->_pendingGifSize = gifObj->size;
+                            }
+                            system->UnlockGif();
+                        }
+
+                        // Lock을 시도하여 재생 중인지 확인 (Non-blocking)
+                        if (system->LockGif(0))
+                        {
+                            system->UnlockGif(); // 확인했으니 즉시 반환
+                            Serial.println("[DisplayMgr] Subscribe : Gif is not playing. Create PlayGifTask");
+                            xTaskCreatePinnedToCore(DisplayMgr::PlayGifTask, "GifPlayTask", 16384, self, 5, &self->gifTaskHandler, 1);
+                        }
+                    }
+                    break;
                 }
                 case DISPLAY_EVENT_TYPE::DISPLAY_UPDATE_OBD_STATUS:
                 {
@@ -192,14 +215,10 @@ void DisplayMgr::Subscribe(void* pvParameters)
                     break;
                 }
                 default:
-                    Serial.printf("[DisplayMgr] Subscribe: Wrong Event type : %d\n", eventType);
+                    Serial.printf("[DisplayMgr] Subscribe: Wrong Event type : %d\n", event.type);
                     break;
             }
-
-            subscriber.ClearEvent();
         }
-
-        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -274,8 +293,9 @@ void DisplayMgr::AppendToLastLine(const String& text)
 
 void DisplayMgr::Redraw()
 {
-    while(_gifPlaying) {
-        delay(10); // GIF 재생 중이면 잠시 대기
+    // GIF 재생 중이라면 Lock이 걸려있으므로, 풀릴 때까지 대기 (Blocking)
+    if (SystemAPI::getInstance()->LockGif(portMAX_DELAY)) {
+        SystemAPI::getInstance()->UnlockGif();
     }
 
     if (!_gfxInitialized) {
@@ -292,11 +312,15 @@ void DisplayMgr::Redraw()
     if (_fb_buf[0]) memset(_fb_buf[0], 0, bufferSize);
     if (_fb_buf[1]) memset(_fb_buf[1], 0, bufferSize);
 
-    // 3. 텍스트 설정
+    // 3. 화면 명시적으로 검은색으로 채우기
+    gfx->fillScreen(RGB565_BLACK);
+    gfx->flush();
+
+    // 4. 텍스트 설정
     gfx->setTextColor(RGB565_WHITE);
     gfx->setTextSize(2);
 
-    // 4. 저장된 로그 라인 출력 전 디버깅 (로그 유실 확인용)
+    // 5. 저장된 로그 라인 출력 전 디버깅 (로그 유실 확인용)
     if (_lines.empty()) {
         Serial.println("[DisplayMgr] Warning: No lines to redraw (Vector is empty)");
     }
@@ -309,7 +333,7 @@ void DisplayMgr::Redraw()
         y += 20;
     }
 
-    // 5. 하드웨어에 즉시 반영
+    // 6. 하드웨어에 즉시 반영
     gfx->flush();
     Serial.println("[DisplayMgr] Redraw completed and buffer flushed");
 }
@@ -334,10 +358,10 @@ bool DisplayMgr::PlayGifFromSD(const char* path, bool loop)
 
     _gif.begin(GIF_PALETTE_RGB565_LE);
     int initOk = _gif.open(path, StorageMgr::GIFOpen, StorageMgr::GIFClose, StorageMgr::GIFRead, StorageMgr::GIFSeek, DisplayMgr::GifDrawStatic);
-
     if (!initOk) return false;
 
-    _gifPlaying = true;
+    this->gifTaskHandler = xTaskGetCurrentTaskHandle();
+
     do {
         int r = 1;
         while (r > 0) {
@@ -356,17 +380,23 @@ bool DisplayMgr::PlayGifFromSD(const char* path, bool loop)
                 memcpy(_fb_buf[_fb_active ^ 1], _fb_buf[_fb_active], _fb_pixels * sizeof(uint16_t));
             }
 
-            if (!_gifPlaying) break;
+            // StopGif()에서 보낸 알림 확인 (종료 요청)
+            if (ulTaskNotifyTake(pdTRUE, 0)) {
+                r = 0; // 루프 탈출 조건
+                loop = false;
+                break;
+            }
+
             if (delayMs > 0) delay(delayMs);
             else delay(1);
         }
 
-        if (loop && _gifPlaying) _gif.reset();
+        if (loop && r != 0) _gif.reset();
         else break;
-    } while (loop && _gifPlaying);
+    } while (loop);
 
     _gif.close();
-    _gifPlaying = false;
+    this->gifTaskHandler = nullptr;
 
     Serial.println("[DisplayMgr] SD GIF finished. Restoring log screen...");
     this->Redraw();
@@ -376,7 +406,9 @@ bool DisplayMgr::PlayGifFromSD(const char* path, bool loop)
 
 void DisplayMgr::StopGif()
 {
-    _gifPlaying = false;
+    if (this->gifTaskHandler != nullptr) {
+        xTaskNotifyGive(this->gifTaskHandler);
+    }
 }
 
 void DisplayMgr::GifDrawStatic(GIFDRAW *pDraw)
@@ -438,7 +470,7 @@ bool DisplayMgr::PlayGifFromMemory(uint8_t* pData, size_t iSize, bool loop)
     _gif.begin(GIF_PALETTE_RGB565_LE);
     if (!_gif.open(pData, (int)iSize, DisplayMgr::GifDrawStatic)) return false;
 
-    _gifPlaying = true;
+    this->gifTaskHandler = xTaskGetCurrentTaskHandle();
     Serial.printf("[DisplayMgr] GIF playing started from Memory\n");
 
     // 재생 전 버퍼 초기화 (이전 텍스트 잔상 제거)
@@ -460,13 +492,17 @@ bool DisplayMgr::PlayGifFromMemory(uint8_t* pData, size_t iSize, bool loop)
                 memcpy(_fb_buf[_fb_active ^ 1], _fb_buf[_fb_active], bufferSize);
             }
 
-            if (!_gifPlaying) break;
+            // StopGif()에서 보낸 알림 확인 (종료 요청)
+            if (ulTaskNotifyTake(pdTRUE, 0)) {
+                loop = false; // 외부 루프 탈출
+                break;        // 내부 루프 탈출
+            }
 
             // --- 속도 조절 로직 ---
             if (delayMs > 0) {
                 // delayMs를 speed로 나누어 대기 시간을 조절합니다.
                 // 예: speed가 2.0이면 delay는 절반이 되어 2배 빠르게 재생됩니다.
-                int adjustedDelay = (int)(delayMs / 15);
+                int adjustedDelay = (int)(delayMs / 30);
                 if (adjustedDelay > 0) {
                     delay(adjustedDelay);
                 } else {
@@ -478,18 +514,17 @@ bool DisplayMgr::PlayGifFromMemory(uint8_t* pData, size_t iSize, bool loop)
             }
         }
 
-        if (loop && _gifPlaying) {
+        if (loop) {
             _gif.reset();
         } else {
             break;
         }
-    } while (loop && _gifPlaying);
+    } while (loop);
 
     _gif.close();
-    _gifPlaying = false;
+    this->gifTaskHandler = nullptr;
 
     Serial.println("[DisplayMgr] Memory GIF finished. Restoring log screen...");
-    this->Redraw();
 
     return true;
 }

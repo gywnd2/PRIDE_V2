@@ -50,7 +50,7 @@ void setup()
     // 5. OBD 서비스 시작
     obdMgr = new ObdMgr();
     system->registerObd(obdMgr);
-    obdMgr->InitOBD();
+    obdMgr->Init();
 
 }
 

@@ -34,13 +34,15 @@ void StorageMgr::Subscribe(void* pvParameters)
     SystemAPI* system = SystemAPI::getInstance();
     StorageEventSubscriber& subscriber = system->storageSubscriber;
 
+    StorageEventData event;
+
     while (true)
     {
-        if(subscriber.IsEventPending())
+        // 큐에서 이벤트를 기다림 (Blocking)
+        if(subscriber.ReceiveEvent(&event, portMAX_DELAY))
         {
-            int eventType = subscriber.GetEventType();
-            Serial.printf("[StorageMgr] Subscribe: %d\n", eventType);
-            switch(eventType)
+            Serial.printf("[StorageMgr] Subscribe: %d\n", event.type);
+            switch(event.type)
             {
                 case STORAGE_EVENT_TYPE::STORAGE_EVENT_NONE:
                 {
@@ -61,7 +63,7 @@ void StorageMgr::Subscribe(void* pvParameters)
                 }
                 case STORAGE_EVENT_TYPE::STORAGE_LOAD_TO_PSRAM:
                 {
-                    const String* filePath = subscriber.GetFilePath();
+                    String filePath = String(event.filePath);
                     GIFMemory* objPtr = system->GetPsramObjPtr();
 
                     if(objPtr == nullptr)
@@ -70,41 +72,48 @@ void StorageMgr::Subscribe(void* pvParameters)
                         break;
                     }
 
-                    if(objPtr->data != nullptr)
-                    {
-                        heap_caps_free(objPtr->data);
-                        objPtr->data = nullptr;
+                    // Mutex 획득 시도 (DisplayMgr가 사용 중이면 대기)
+                    if (system->LockGif()) {
+                        if(objPtr->data != nullptr)
+                        {
+                            heap_caps_free(objPtr->data);
+                            objPtr->data = nullptr;
+                        }
+
+                        *objPtr = self->LoadGifToPSRAM(filePath.c_str());
+                        system->isGifLoaded = (objPtr->data != nullptr);
+
+                        system->UnlockGif();
+                        Serial.println("[StorageMgr] Successfully loaded gif to PSRAM");
+                    } else {
+                        Serial.println("[StorageMgr] Failed to acquire GIF lock for loading");
                     }
-
-                    *objPtr = self->LoadGifToPSRAM(filePath->c_str());
-                    system->isGifLoaded = (objPtr->data != nullptr);
-
-                    Serial.println("[StorageMgr] Successfully loaded gif to PSRAM");
                     break;
                 }
                 case STORAGE_EVENT_TYPE::STORAGE_CLEAR_LOADED_PSRAM:
                 {
                     GIFMemory* objPtr = system->GetPsramObjPtr();
-                    if(objPtr->data != nullptr)
-                    {
-                        heap_caps_free(objPtr->data);
+                    if (system->LockGif()) {
+                        if(objPtr->data != nullptr)
+                        {
+                            heap_caps_free(objPtr->data);
 
-                        objPtr->data = nullptr;
-                        objPtr->size = 0;
+                            objPtr->data = nullptr;
+                            objPtr->size = 0;
+                        }
+                        system->isGifLoaded = false;
+                        system->UnlockGif();
+                        Serial.println("[StorageMgr] Cleared gif in PSRAM");
+                    } else {
+                        Serial.println("[StorageMgr] Failed to acquire GIF lock for clearing");
                     }
-                    system->isGifLoaded = false;
-                    Serial.println("[StorageMgr] Cleared gif in PSRAM");
                     break;
                 }
                 default:
-                    Serial.printf("[StorageMgr] Subscribe: Wrong Event type : %d\n", eventType);
+                    Serial.printf("[StorageMgr] Subscribe: Wrong Event type : %d\n", event.type);
                     break;
             }
-
-            subscriber.ClearEvent();
         }
-
-        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
