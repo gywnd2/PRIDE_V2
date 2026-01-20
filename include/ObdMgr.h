@@ -66,7 +66,7 @@ public:
         Serial.println("~~~~ObdMgr");
     }
 
-    void InitOBD(void);
+    void Init(void);
     static void ConnectBTTask(void *param);
     static void QueryOBDData(void *param);
 

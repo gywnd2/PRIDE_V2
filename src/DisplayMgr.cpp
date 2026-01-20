@@ -8,7 +8,7 @@ void DisplayMgr::Init()
     #ifdef GPIO_BCKL
         pinMode(GPIO_BCKL, OUTPUT);
     #endif
-    this->gifTaskHandler = nullptr;
+    this->taskHandler = nullptr;
 
     this->rgbPanel = new Arduino_ESP32RGBPanel(
         ST7262_PANEL_CONFIG_DE_GPIO_NUM,
@@ -92,7 +92,7 @@ void DisplayMgr::Init()
         4096,
         this,
         4,
-        &this->gifTaskHandler
+        &this->taskHandler
     );
 }
 
@@ -183,35 +183,44 @@ void DisplayMgr::Subscribe(void* pvParameters)
                         {
                             system->UnlockGif(); // 확인했으니 즉시 반환
                             Serial.println("[DisplayMgr] Subscribe : Gif is not playing. Create PlayGifTask");
-                            xTaskCreatePinnedToCore(DisplayMgr::PlayGifTask, "GifPlayTask", 16384, self, 5, &self->gifTaskHandler, 1);
+                            xTaskCreatePinnedToCore(DisplayMgr::PlayGifTask, "GifPlayTask", 16384, self, 5, &self->taskHandler, 1);
                         }
                     }
                     break;
                 }
                 case DISPLAY_EVENT_TYPE::DISPLAY_UPDATE_OBD_STATUS:
                 {
-
+                    String status = "OBD Status: ";
+                    status += event.data;
+                    self->Println(status);
                     break;
                 }
                 case DISPLAY_EVENT_TYPE::DISPLAY_UPDATE_VOLTAGE:
                 {
-
-
+                    String status = "Voltage: ";
+                    status += event.data;
+                    self->Println(status);
                     break;
                 }
                 case DISPLAY_EVENT_TYPE::DISPLAY_UPDATE_COOLANT:
                 {
-
-
+                    String status = "Coolant: ";
+                    status += event.data;
+                    self->Println(status);
                     break;
                 }
                 case DISPLAY_EVENT_TYPE::DISPLAY_UPDATE_CPU_USAGE:
                 {
-
+                    String status = "CPU Usage: ";
+                    status += event.data;
+                    self->Println(status);
                     break;
                 }
                 case DISPLAY_EVENT_TYPE::DISPLAY_UPDATE_RAM_USAGE:
                 {
+                    String status = "RAM Usage: ";
+                    status += event.data;
+                    self->Println(status);
                     break;
                 }
                 default:
@@ -360,7 +369,7 @@ bool DisplayMgr::PlayGifFromSD(const char* path, bool loop)
     int initOk = _gif.open(path, StorageMgr::GIFOpen, StorageMgr::GIFClose, StorageMgr::GIFRead, StorageMgr::GIFSeek, DisplayMgr::GifDrawStatic);
     if (!initOk) return false;
 
-    this->gifTaskHandler = xTaskGetCurrentTaskHandle();
+    this->taskHandler = xTaskGetCurrentTaskHandle();
 
     do {
         int r = 1;
@@ -396,7 +405,7 @@ bool DisplayMgr::PlayGifFromSD(const char* path, bool loop)
     } while (loop);
 
     _gif.close();
-    this->gifTaskHandler = nullptr;
+    this->taskHandler = nullptr;
 
     Serial.println("[DisplayMgr] SD GIF finished. Restoring log screen...");
     this->Redraw();
@@ -406,8 +415,8 @@ bool DisplayMgr::PlayGifFromSD(const char* path, bool loop)
 
 void DisplayMgr::StopGif()
 {
-    if (this->gifTaskHandler != nullptr) {
-        xTaskNotifyGive(this->gifTaskHandler);
+    if (this->taskHandler != nullptr) {
+        xTaskNotifyGive(this->taskHandler);
     }
 }
 
@@ -470,7 +479,7 @@ bool DisplayMgr::PlayGifFromMemory(uint8_t* pData, size_t iSize, bool loop)
     _gif.begin(GIF_PALETTE_RGB565_LE);
     if (!_gif.open(pData, (int)iSize, DisplayMgr::GifDrawStatic)) return false;
 
-    this->gifTaskHandler = xTaskGetCurrentTaskHandle();
+    this->taskHandler = xTaskGetCurrentTaskHandle();
     Serial.printf("[DisplayMgr] GIF playing started from Memory\n");
 
     // 재생 전 버퍼 초기화 (이전 텍스트 잔상 제거)
@@ -522,7 +531,7 @@ bool DisplayMgr::PlayGifFromMemory(uint8_t* pData, size_t iSize, bool loop)
     } while (loop);
 
     _gif.close();
-    this->gifTaskHandler = nullptr;
+    this->taskHandler = nullptr;
 
     Serial.println("[DisplayMgr] Memory GIF finished. Restoring log screen...");
 

@@ -3,13 +3,13 @@
 
 #include <Arduino.h>
 #include <deque>
+#include <NimBLEDevice.h>
 
 // DFRobot 라이브러리와 NimBLE 라이브러리 간의 Advertise 매크로 충돌 방지
 #ifdef Advertise
     #undef Advertise
 #endif
 
-#include <NimBLEDevice.h>
 
 class NimBLEStream : public Stream
 {

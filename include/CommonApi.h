@@ -4,6 +4,7 @@
 #include <Arduino.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "esp_system.h"
 #include "StorageMgr.h"
 
@@ -23,11 +24,21 @@ typedef enum
     BT_REQUEST_RESET_CONNECTION
 } BT_EVENT_TYPE;
 
+typedef struct {
+    BT_EVENT_TYPE type;
+    uint8_t address[6];
+} BtEventData;
+
 typedef enum
 {
     SOUND_EVENT_NONE = 0,
     SOUND_PLAY_TRACK
 } SOUND_EVENT_TYPE;
+
+typedef struct {
+    SOUND_EVENT_TYPE type;
+    int track;
+} SoundEventData;
 
 typedef enum
 {
@@ -40,6 +51,11 @@ typedef enum
     DISPLAY_UPDATE_RAM_USAGE
 } DISPLAY_EVENT_TYPE;
 
+typedef struct {
+    DISPLAY_EVENT_TYPE type;
+    char data[256];
+} DisplayEventData;
+
 typedef enum
 {
     STORAGE_EVENT_NONE = 0,
@@ -50,6 +66,11 @@ typedef enum
     STORAGE_CLEAR_LOADED_PSRAM
 } STORAGE_EVENT_TYPE;
 
+typedef struct {
+    STORAGE_EVENT_TYPE type;
+    char filePath[256];
+} StorageEventData;
+
 // ----------------------------------------------------------------
 // Event Subscriber Classes
 // ----------------------------------------------------------------
@@ -57,93 +78,49 @@ typedef enum
 class BtEventSubscriber
 {
 private:
-    BT_EVENT_TYPE eventType;
-    bool eventPending = false;
-    uint8_t reqAddress[6];
+    QueueHandle_t _queue;
 
 public:
-    BtEventSubscriber()
-    {
-        Serial.println("====BtEventSubscriber");
-    }
-    ~BtEventSubscriber()
-    {
-        Serial.println("~~~~BtEventSubscriber");
-    }
-
+    BtEventSubscriber();
+    ~BtEventSubscriber();
     void SetEvent(BT_EVENT_TYPE type, uint8_t address[6] = nullptr);
-    void ClearEvent();
-    bool IsEventPending();
-    BT_EVENT_TYPE GetEventType();
+    bool ReceiveEvent(BtEventData* event, TickType_t waitTime);
 };
 
 class SoundEventSubscriber
 {
 private:
-    SOUND_EVENT_TYPE eventType;
-    bool eventPending = false;
-    int trackNum = 0;
+    QueueHandle_t _queue;
 
 public:
-    SoundEventSubscriber()
-    {
-        Serial.println("====SoundEventSubscriber");
-    }
-    ~SoundEventSubscriber()
-    {
-        Serial.println("~~~~SoundEventSubscriber");
-    }
+    SoundEventSubscriber();
+    ~SoundEventSubscriber();
     void SetEvent(SOUND_EVENT_TYPE type, int track = 0);
-    void ClearEvent();
-    bool IsEventPending();
-    int GetTrackNum();
+    bool ReceiveEvent(SoundEventData* event, TickType_t waitTime);
 };
 
 class DisplayEventSubscriber
 {
 private:
-    DISPLAY_EVENT_TYPE eventType;
-    bool eventPending = false;
-    String eventData;
+    QueueHandle_t _queue;
 
 public:
-    DisplayEventSubscriber()
-    {
-        Serial.println("====DisplayEventSubscriber");
-    }
-    ~DisplayEventSubscriber()
-    {
-        Serial.println("~~~~DisplayEventSubscriber");
-    }
+    DisplayEventSubscriber();
+    ~DisplayEventSubscriber();
     void SetEvent(DISPLAY_EVENT_TYPE type, const String& data = "");
-    void ClearEvent();
-    bool IsEventPending();
-    String GetEventData();
-    DISPLAY_EVENT_TYPE GetEventType();
+    bool ReceiveEvent(DisplayEventData* event, TickType_t waitTime);
 };
 
 class StorageEventSubscriber
 {
 private:
-    STORAGE_EVENT_TYPE eventType;
-    bool eventPending = false;
-    String filePath;
-    bool gifLoadToPSRAM = false;
+    QueueHandle_t _queue;
 
 public:
-    StorageEventSubscriber()
-    {
-        Serial.println("====StorageEventSubscriber");
-    }
-    ~StorageEventSubscriber()
-    {
-        Serial.println("~~~~StorageEventSubscriber");
-    }
+    StorageEventSubscriber();
+    ~StorageEventSubscriber();
     void SetEvent(STORAGE_EVENT_TYPE type, const String& path = "");
-    void ClearEvent();
-    bool IsEventPending();
-    const String* GetFilePath();
-    STORAGE_EVENT_TYPE GetEventType();
+    bool ReceiveEvent(StorageEventData* event, TickType_t waitTime);
 };
 
 // ----------------------------------------------------------------
@@ -155,6 +132,7 @@ class SystemAPI
 private:
     SystemAPI();
     static SystemAPI* _instance;
+    SemaphoreHandle_t _gifMutex = nullptr;
 
     DisplayMgr* displayMgr = nullptr;
     StorageMgr* storageMgr = nullptr;
@@ -195,6 +173,9 @@ public:
 
     Stream* GetBtStream();
     GIFMemory* GetPsramObjPtr();
+    
+    bool LockGif(TickType_t waitTime = portMAX_DELAY);
+    void UnlockGif();
 };
 
 #endif
