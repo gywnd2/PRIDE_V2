@@ -2,12 +2,13 @@
 #include <BluetoothMgr.h>
 #include <ObdMgr.h>
 #include <StorageMgr.h>
+#include <DisplayMgr.h>
 
 SystemAPI* SystemAPI::_instance = nullptr;
 
 SystemAPI::SystemAPI()
 {
-    this->Init();
+    // Mutex 초기화는 Init에서 수행
 }
 
 void SystemAPI::Init()
@@ -16,37 +17,34 @@ void SystemAPI::Init()
     this->gifObj.size = 0;
     this->isGifLoaded = false;
 
+    // GIF 메모리 보호용 뮤텍스
     if (_gifMutex == NULL) {
         _gifMutex = xSemaphoreCreateMutex();
     }
 
-    // 큐는 생성자에서 초기화되므로 별도 Clear 불필요
+    // LVGL 스레드 동기화용 뮤텍스
+    if (_lvglMutex == NULL) {
+        _lvglMutex = xSemaphoreCreateMutex();
+    }
 }
 
 // ----------------------------------------------------------------
-// BtEventSubscriber 구현
+// BtEventSubscriber Implementation
 // ----------------------------------------------------------------
 
 BtEventSubscriber::BtEventSubscriber() {
-    Serial.println("====BtEventSubscriber");
-    _queue = xQueueCreate(10, sizeof(BtEventData)); // 큐 크기 10
+    _queue = xQueueCreate(10, sizeof(BtEventData));
 }
 
 BtEventSubscriber::~BtEventSubscriber() {
-    Serial.println("~~~~BtEventSubscriber");
     if (_queue) vQueueDelete(_queue);
 }
 
-void BtEventSubscriber::SetEvent(BT_EVENT_TYPE type, uint8_t address[6])
-{
+void BtEventSubscriber::SetEvent(BT_EVENT_TYPE type, uint8_t address[6]) {
     BtEventData data;
     data.type = type;
-    if (address != nullptr) {
-        memcpy(data.address, address, 6);
-    } else {
-        memset(data.address, 0, 6);
-    }
-
+    if (address != nullptr) memcpy(data.address, address, 6);
+    else memset(data.address, 0, 6);
     xQueueSend(_queue, &data, 0);
 }
 
@@ -55,21 +53,18 @@ bool BtEventSubscriber::ReceiveEvent(BtEventData* event, TickType_t waitTime) {
 }
 
 // ----------------------------------------------------------------
-// SoundEventSubscriber 구현
+// SoundEventSubscriber Implementation
 // ----------------------------------------------------------------
 
 SoundEventSubscriber::SoundEventSubscriber() {
-    Serial.println("====SoundEventSubscriber");
     _queue = xQueueCreate(10, sizeof(SoundEventData));
 }
 
 SoundEventSubscriber::~SoundEventSubscriber() {
-    Serial.println("~~~~SoundEventSubscriber");
     if (_queue) vQueueDelete(_queue);
 }
 
-void SoundEventSubscriber::SetEvent(SOUND_EVENT_TYPE type, int track)
-{
+void SoundEventSubscriber::SetEvent(SOUND_EVENT_TYPE type, int track) {
     SoundEventData data;
     data.type = type;
     data.track = track;
@@ -81,27 +76,22 @@ bool SoundEventSubscriber::ReceiveEvent(SoundEventData* event, TickType_t waitTi
 }
 
 // ----------------------------------------------------------------
-// DisplayEventSubscriber 구현
+// DisplayEventSubscriber Implementation
 // ----------------------------------------------------------------
 
 DisplayEventSubscriber::DisplayEventSubscriber() {
-    Serial.println("====DisplayEventSubscriber");
     _queue = xQueueCreate(10, sizeof(DisplayEventData));
 }
 
 DisplayEventSubscriber::~DisplayEventSubscriber() {
-    Serial.println("~~~~DisplayEventSubscriber");
     if (_queue) vQueueDelete(_queue);
 }
 
-void DisplayEventSubscriber::SetEvent(DISPLAY_EVENT_TYPE type, const String& data)
-{
+void DisplayEventSubscriber::SetEvent(DISPLAY_EVENT_TYPE type, const String& data) {
     DisplayEventData evt;
     evt.type = type;
-    // String 데이터를 고정 길이 char 배열로 복사 (Overflow 방지)
     strncpy(evt.data, data.c_str(), sizeof(evt.data) - 1);
     evt.data[sizeof(evt.data) - 1] = '\0';
-
     xQueueSend(_queue, &evt, 0);
 }
 
@@ -110,26 +100,22 @@ bool DisplayEventSubscriber::ReceiveEvent(DisplayEventData* event, TickType_t wa
 }
 
 // ----------------------------------------------------------------
-// StorageEventSubscriber 구현
+// StorageEventSubscriber Implementation
 // ----------------------------------------------------------------
 
 StorageEventSubscriber::StorageEventSubscriber() {
-    Serial.println("====StorageEventSubscriber");
     _queue = xQueueCreate(10, sizeof(StorageEventData));
 }
 
 StorageEventSubscriber::~StorageEventSubscriber() {
-    Serial.println("~~~~StorageEventSubscriber");
     if (_queue) vQueueDelete(_queue);
 }
 
-void StorageEventSubscriber::SetEvent(STORAGE_EVENT_TYPE type, const String& path)
-{
+void StorageEventSubscriber::SetEvent(STORAGE_EVENT_TYPE type, const String& path) {
     StorageEventData evt;
     evt.type = type;
     strncpy(evt.filePath, path.c_str(), sizeof(evt.filePath) - 1);
     evt.filePath[sizeof(evt.filePath) - 1] = '\0';
-
     xQueueSend(_queue, &evt, 0);
 }
 
@@ -138,60 +124,48 @@ bool StorageEventSubscriber::ReceiveEvent(StorageEventData* event, TickType_t wa
 }
 
 // ----------------------------------------------------------------
-// SystemAPI 구현
+// SystemAPI Implementation
 // ----------------------------------------------------------------
 
-void SystemAPI::PlaySplash()
-{
-    if (displayMgr)
-    {
+void SystemAPI::PlaySplash() {
+    if (displayMgr) {
         displaySubscriber.SetEvent(DISPLAY_SHOW_SPLASH, "/anim/splash.gif");
     }
 }
 
-void SystemAPI::ConnectOBD()
-{
-    if (obdMgr)
-    {
+void SystemAPI::ConnectOBD() {
+    if (obdMgr) {
         btSubscriber.SetEvent(BT_REQUEST_CONNECT_OBD);
     }
 }
 
-bool SystemAPI::GetOBDConnected()
-{
-    if (btMgr)
-    {
-        return btMgr->GetConnected();
-    }
+bool SystemAPI::GetOBDConnected() {
+    if (btMgr) return btMgr->GetConnected();
     return false;
 }
 
-Stream* SystemAPI::GetBtStream()
-{
-    if (btMgr)
-    {
-        // BluetoothMgr에서 정의한 NimBLEStream의 주소를 Stream 포인터로 반환
-        return btMgr->GetBleStream();
-    }
+Stream* SystemAPI::GetBtStream() {
+    if (btMgr) return btMgr->GetBleStream();
     return nullptr;
 }
 
-GIFMemory* SystemAPI::GetPsramObjPtr()
-{
+GIFMemory* SystemAPI::GetPsramObjPtr() {
     return &this->gifObj;
 }
 
-bool SystemAPI::LockGif(TickType_t waitTime)
-{
-    if (_gifMutex) {
-        return xSemaphoreTake(_gifMutex, waitTime) == pdTRUE;
-    }
-    return false;
+// Mutex Methods
+bool SystemAPI::LockGif(TickType_t waitTime) {
+    return (_gifMutex) ? (xSemaphoreTake(_gifMutex, waitTime) == pdTRUE) : false;
 }
 
-void SystemAPI::UnlockGif()
-{
-    if (_gifMutex) {
-        xSemaphoreGive(_gifMutex);
-    }
+void SystemAPI::UnlockGif() {
+    if (_gifMutex) xSemaphoreGive(_gifMutex);
+}
+
+bool SystemAPI::LockLvgl(TickType_t waitTime) {
+    return (_lvglMutex) ? (xSemaphoreTake(_lvglMutex, waitTime) == pdTRUE) : false;
+}
+
+void SystemAPI::UnlockLvgl() {
+    if (_lvglMutex) xSemaphoreGive(_lvglMutex);
 }

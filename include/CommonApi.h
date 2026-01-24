@@ -5,6 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "esp_system.h"
 #include "StorageMgr.h"
 
@@ -14,6 +15,10 @@ class ObdMgr;
 class Mp3Mgr;
 class BluetoothMgr;
 class StorageMgr;
+
+// ----------------------------------------------------------------
+// Event Types & Data Structures
+// ----------------------------------------------------------------
 
 typedef enum
 {
@@ -79,7 +84,6 @@ class BtEventSubscriber
 {
 private:
     QueueHandle_t _queue;
-
 public:
     BtEventSubscriber();
     ~BtEventSubscriber();
@@ -91,7 +95,6 @@ class SoundEventSubscriber
 {
 private:
     QueueHandle_t _queue;
-
 public:
     SoundEventSubscriber();
     ~SoundEventSubscriber();
@@ -103,7 +106,6 @@ class DisplayEventSubscriber
 {
 private:
     QueueHandle_t _queue;
-
 public:
     DisplayEventSubscriber();
     ~DisplayEventSubscriber();
@@ -115,7 +117,6 @@ class StorageEventSubscriber
 {
 private:
     QueueHandle_t _queue;
-
 public:
     StorageEventSubscriber();
     ~StorageEventSubscriber();
@@ -132,7 +133,10 @@ class SystemAPI
 private:
     SystemAPI();
     static SystemAPI* _instance;
+
+    // Mutex Handles
     SemaphoreHandle_t _gifMutex = nullptr;
+    SemaphoreHandle_t _lvglMutex = nullptr;
 
     DisplayMgr* displayMgr = nullptr;
     StorageMgr* storageMgr = nullptr;
@@ -154,28 +158,32 @@ public:
 
     void Init();
 
-    DisplayEventSubscriber displaySubscriber;
-    SoundEventSubscriber   soundSubscriber;
     BtEventSubscriber      btSubscriber;
+    SoundEventSubscriber   soundSubscriber;
+    DisplayEventSubscriber displaySubscriber;
     StorageEventSubscriber storageSubscriber;
 
     bool isGifLoaded = false;
 
+    // Manager Registration
     void registerDisplay(DisplayMgr* mgr) { displayMgr = mgr; }
     void registerStorage(StorageMgr* mgr) { storageMgr = mgr; }
     void registerMp3(Mp3Mgr* mgr) { mp3Mgr = mgr; }
     void registerBt(BluetoothMgr* mgr) { btMgr = mgr; }
     void registerObd(ObdMgr* mgr) { obdMgr = mgr; }
 
+    // API Methods
     void PlaySplash();
     void ConnectOBD();
     bool GetOBDConnected();
-
     Stream* GetBtStream();
     GIFMemory* GetPsramObjPtr();
-    
+
+    // Resource Locking (Thread Safety)
     bool LockGif(TickType_t waitTime = portMAX_DELAY);
     void UnlockGif();
+    bool LockLvgl(TickType_t waitTime = portMAX_DELAY);
+    void UnlockLvgl();
 };
 
 #endif
