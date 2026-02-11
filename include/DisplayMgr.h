@@ -7,9 +7,6 @@
 #include <lvgl.h>
 #include <vector>
 
-#define SCREEN_WIDTH 800
-#define SCREEN_HEIGHT 480
-
 #define CONSOLE_ROWS 30
 
 class DisplayMgr
@@ -19,6 +16,7 @@ class DisplayMgr
         Arduino_RGB_Display *gfx = nullptr;
         bool _gfxInitialized = false;
         bool _lvglInitialized = false;
+        bool _splashFinished = false;
 
         std::vector<String> _lines;
         AnimatedGIF _gif;
@@ -36,6 +34,7 @@ class DisplayMgr
         lv_disp_drv_t _disp_drv;
 
         // 내부 콜백 및 태스크
+        static void HandleLvglTask(void *pvParameters);
         static void GifDrawStatic(GIFDRAW *pDraw);
         static void PlayGifTask(void* pvParameters);
         static void Subscribe(void* pvParameters);
@@ -66,6 +65,9 @@ class DisplayMgr
         void StopGif();
 
         bool IsLvglInitialized() { return _lvglInitialized; }
+        bool IsSplashFinished() { return _splashFinished; }
+
+        void CreateMainBackground();
 };
 
 #endif
