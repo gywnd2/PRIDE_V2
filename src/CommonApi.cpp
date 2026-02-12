@@ -8,21 +8,19 @@ SystemAPI* SystemAPI::_instance = nullptr;
 
 SystemAPI::SystemAPI()
 {
-    // Mutex 초기화는 Init에서 수행
+    // Mutex initialization is done in Init()
 }
 
 void SystemAPI::Init()
 {
-    this->gifObj.data = nullptr;
-    this->gifObj.size = 0;
-    this->isGifLoaded = false;
+    gifObj.data = nullptr;
+    gifObj.size = 0;
+    isGifLoaded = false;
 
-    // GIF 메모리 보호용 뮤텍스
     if (_gifMutex == NULL) {
         _gifMutex = xSemaphoreCreateMutex();
     }
 
-    // LVGL 스레드 동기화용 뮤텍스
     if (_lvglMutex == NULL) {
         _lvglMutex = xSemaphoreCreateMutex();
     }
@@ -150,10 +148,9 @@ Stream* SystemAPI::GetBtStream() {
 }
 
 GIFMemory* SystemAPI::GetPsramObjPtr() {
-    return &this->gifObj;
+    return &gifObj;
 }
 
-// Mutex Methods
 bool SystemAPI::LockGif(TickType_t waitTime) {
     return (_gifMutex) ? (xSemaphoreTake(_gifMutex, waitTime) == pdTRUE) : false;
 }

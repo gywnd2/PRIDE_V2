@@ -143,7 +143,6 @@ private:
     ObdMgr* obdMgr = nullptr;
     Mp3Mgr* mp3Mgr = nullptr;
     BluetoothMgr* btMgr = nullptr;
-
     GIFMemory gifObj;
 
 public:
@@ -162,7 +161,6 @@ public:
     SoundEventSubscriber   soundSubscriber;
     DisplayEventSubscriber displaySubscriber;
     StorageEventSubscriber storageSubscriber;
-
     bool isGifLoaded = false;
 
     // Manager Registration

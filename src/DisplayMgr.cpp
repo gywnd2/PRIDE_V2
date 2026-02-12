@@ -1,41 +1,32 @@
 #include "DisplayMgr.h"
 #include <CommonApi.h>
-#include <StorageMgr.h>
 #include <lvgl.h>
 #include <SD.h>
 #include <ui.h>
 #include "esp_heap_caps.h"
-// #include "esp_lcd_panel_rgb.h"
-// #include "esp_lcd_panel_io.h"
-// #include "esp_lcd_panel_ops.h"
-// #include "esp_lcd_panel_interface.h"
-// #include "freertos/semphr.h"
-
-// SemaphoreHandle_t vsync_sem;
-
-// static bool IRAM_ATTR on_vsync_callback(esp_lcd_panel_handle_t panel, const esp_lcd_rgb_panel_event_data_t *edata, void *user_ctx) {
-//     BaseType_t high_task_wakeup;
-//     xSemaphoreGiveFromISR(vsync_sem, &high_task_wakeup);
-//     return high_task_wakeup == pdTRUE;
-// }
+#if LV_USE_GIF
+#include <src/extra/libs/gif/lv_gif.h>
+#endif
 
 static void* sd_fs_open(lv_fs_drv_t * drv, const char * path, lv_fs_mode_t mode) {
+    LV_UNUSED(drv);
+    LV_UNUSED(mode);
+
     String fullPath = path;
     if (!fullPath.startsWith("/")) fullPath = "/" + fullPath;
 
-    // 읽기 전용 모드로 고정 (PNG 로드용)
     File f = SD.open(fullPath.c_str(), FILE_READ);
     if (!f || f.isDirectory()) {
         Serial.printf("[FS] Open Failed: %s\n", fullPath.c_str());
         return NULL;
     }
 
-    // File 객체는 복사되면 핸들이 꼬일 수 있으므로 동적 할당
     File* fp = new File(f);
     return (void*)fp;
 }
 
 static lv_fs_res_t sd_fs_close(lv_fs_drv_t * drv, void * file_p) {
+    LV_UNUSED(drv);
     File* fp = (File*)file_p;
     fp->close();
     delete fp;
@@ -43,18 +34,18 @@ static lv_fs_res_t sd_fs_close(lv_fs_drv_t * drv, void * file_p) {
 }
 
 static lv_fs_res_t sd_fs_read(lv_fs_drv_t * drv, void * file_p, void * buf, uint32_t btr, uint32_t * br) {
+    LV_UNUSED(drv);
     File* fp = (File*)file_p;
-    // SD 라이브러리의 read는 실제로 읽은 바이트 수를 반환합니다.
     size_t read_size = fp->read((uint8_t*)buf, btr);
     if (br) *br = (uint32_t)read_size;
 
-    return (read_size >= 0) ? LV_FS_RES_OK : LV_FS_RES_UNKNOWN;
+    return LV_FS_RES_OK;
 }
 
 static lv_fs_res_t sd_fs_seek(lv_fs_drv_t * drv, void * file_p, uint32_t pos, lv_fs_whence_t whence) {
+    LV_UNUSED(drv);
     File* fp = (File*)file_p;
 
-    // 버전에 맞게 수정된 열거형 명칭: LV_FS_SEEK_...
     if (whence == LV_FS_SEEK_SET) {
         fp->seek(pos);
     }
@@ -69,6 +60,7 @@ static lv_fs_res_t sd_fs_seek(lv_fs_drv_t * drv, void * file_p, uint32_t pos, lv
 }
 
 static lv_fs_res_t sd_fs_tell(lv_fs_drv_t * drv, void * file_p, uint32_t * pos_p) {
+    LV_UNUSED(drv);
     File* fp = (File*)file_p;
     *pos_p = fp->position();
     return LV_FS_RES_OK;
@@ -76,12 +68,9 @@ static lv_fs_res_t sd_fs_tell(lv_fs_drv_t * drv, void * file_p, uint32_t * pos_p
 
 void DisplayMgr::Init()
 {
-    // vsync_sem = xSemaphoreCreateBinary();
-
     #ifdef GPIO_BCKL
         pinMode(GPIO_BCKL, OUTPUT);
     #endif
-    this->taskHandler = nullptr;
 
     this->rgbPanel = new Arduino_ESP32RGBPanel(
         ST7262_PANEL_CONFIG_DE_GPIO_NUM,
@@ -113,7 +102,7 @@ void DisplayMgr::Init()
         ST7262_PANEL_CONFIG_TIMINGS_VSYNC_PULSE_WIDTH,
         ST7262_PANEL_CONFIG_TIMINGS_VSYNC_BACK_PORCH,
         ST7262_PANEL_CONFIG_TIMINGS_FLAGS_PCLK_ACTIVE_NEG,
-        ST7262_PANEL_CONFIG_TIMINGS_PCLK_HZ, // 수정
+        ST7262_PANEL_CONFIG_TIMINGS_PCLK_HZ,
         false,
         ST7262_PANEL_CONFIG_TIMINGS_FLAGS_DE_IDLE_HIGH,
         ST7262_PANEL_CONFIG_TIMINGS_FLAGS_PCLK_IDLE_HIGH,
@@ -124,32 +113,26 @@ void DisplayMgr::Init()
         SCREEN_WIDTH, SCREEN_HEIGHT, rgbPanel, 0, false
     );
 
-    // 1. 반드시 기존처럼 PCLK 주파수를 명시해서 begin 호출
     bool ok = gfx->begin(ST7262_PANEL_CONFIG_TIMINGS_PCLK_HZ);
     _gfxInitialized = ok;
 
     if(ok) {
-
         _fb_pixels = SCREEN_WIDTH * SCREEN_HEIGHT;
         size_t bufferSize = _fb_pixels * sizeof(uint16_t);
 
-        // 2. 중요: 라이브러리가 이미 생성한 내부 버퍼 주소를 0번으로 사용
         _fb_buf[0] = (uint16_t*)gfx->getFramebuffer();
-
-        // 3. 1번 버퍼만 추가로 PSRAM 할당 (더블 버퍼링용)
         _fb_buf[1] = (uint16_t*)heap_caps_aligned_alloc(64, bufferSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
         if(_fb_buf[0] && _fb_buf[1]) {
             memset(_fb_buf[0], 0, bufferSize);
             memset(_fb_buf[1], 0, bufferSize);
-            // 라이브러리에게 현재 버퍼 위치 확인 사격
             gfx->setFrameBuffer(_fb_buf[0]);
             Serial.println("[DisplayMgr] Double-buffering initialized with Hardware FB");
         }
         this->BacklightOn();
     }
 
-    xTaskCreate(DisplayMgr::Subscribe, "DisplaySub", 4096, this, 4, &this->taskHandler);
+    xTaskCreate(DisplayMgr::Subscribe, "DisplaySub", 4096, this, 4, &this->_eventTaskHandler);
 }
 
 void DisplayMgr::StartLVGL() {
@@ -157,7 +140,7 @@ void DisplayMgr::StartLVGL() {
 
     lv_init();
 
-    uint32_t sram_lines = 60;
+    uint32_t sram_lines = 200;
     size_t sram_buf_size = SCREEN_WIDTH * sram_lines * sizeof(lv_color_t);
 
     static lv_color_t* sram_work_buf1 = (lv_color_t*)heap_caps_malloc(
@@ -167,31 +150,23 @@ void DisplayMgr::StartLVGL() {
         sram_buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA
     );
 
-    // 실패 시 PSRAM으로 Fallback (SRAM 부족 대비)
     if (!sram_work_buf1) sram_work_buf1 = (lv_color_t*)heap_caps_malloc(sram_buf_size, MALLOC_CAP_SPIRAM);
     if (!sram_work_buf2) sram_work_buf2 = (lv_color_t*)heap_caps_malloc(sram_buf_size, MALLOC_CAP_SPIRAM);
 
-    // 3. LVGL 드로잉 버퍼 설정 (SRAM 더블 버퍼링)
     lv_disp_draw_buf_init(&_draw_buf, sram_work_buf1, sram_work_buf2, SCREEN_WIDTH * sram_lines);
 
-    // 4. 디스플레이 드라이버 설정
     lv_disp_drv_init(&_disp_drv);
     _disp_drv.hor_res = SCREEN_WIDTH;
     _disp_drv.ver_res = SCREEN_HEIGHT;
-    _disp_drv.flush_cb = DisplayMgr::lvgl_flush_cb; // 앞서 작성한 부분 복사 콜백
+    _disp_drv.flush_cb = DisplayMgr::lvgl_flush_cb;
     _disp_drv.draw_buf = &_draw_buf;
     _disp_drv.user_data = this;
-
-    // 중요: 0(부분 업데이트)으로 설정해야 SRAM 버퍼를 활용해 필요한 곳만 복사함
     _disp_drv.full_refresh = 0;
     _disp_drv.direct_mode = 0;
-
-    // 안티앨리어싱 비활성화 (CPU 부하 감소)
     _disp_drv.antialiasing = 0;
 
     lv_disp_drv_register(&_disp_drv);
 
-    // 4. 파일 시스템 드라이버 설정
     static lv_fs_drv_t fs_drv;
     lv_fs_drv_init(&fs_drv);
     fs_drv.letter = 'S';
@@ -203,13 +178,13 @@ void DisplayMgr::StartLVGL() {
     fs_drv.user_data = this;
     lv_fs_drv_register(&fs_drv);
 
-    // 5. PNG 디코더 초기화
+    #if LV_USE_PNG
     lv_png_init();
+    #endif
 
     _lvglInitialized = true;
     Serial.println("[DisplayMgr] LVGL Started with SRAM Draw Buffer");
 
-    // PSRAM 사용량 로그
     size_t total_psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
     size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     Serial.printf("[PSRAM] Total: %d, Free: %d, Used: %d bytes\n",
@@ -220,37 +195,96 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
 {
     DisplayMgr* self = (DisplayMgr*)drv->user_data;
 
-    // drv->user_data가 정상적으로 전달되었는지 확인
     if (self && self->gfx) {
-        /* * [핵심] SRAM 작업 버퍼(color_p)에 그려진 사각형 영역만
-         * PSRAM 프레임버퍼(현재 출력 중인 버퍼)로 복사합니다.
-         * Arduino_GFX의 draw16bitRGBBitmap은 내부적으로 최적화된 복사를 수행합니다.
-         */
         uint32_t w = lv_area_get_width(area);
         uint32_t h = lv_area_get_height(area);
 
         self->gfx->draw16bitRGBBitmap(
-            area->x1,       // 시작 X 좌표
-            area->y1,       // 시작 Y 좌표
+            area->x1,
+            area->y1,
             (uint16_t*)color_p,
             w,
             h
         );
 
-        #if CONFIG_IDF_TARGET_ESP32S3
-        uint32_t size = w * h * sizeof(uint16_t);
-        #endif
-
-        // 하드웨어에 전송 완료(V-Sync 동기화 등) 알림
         if(lv_disp_flush_is_last(drv))
         {
             self->gfx->flush();
-            delay(8);
         }
     }
 
-    // LVGL에 플러시 완료를 알려 다음 렌더링을 진행하게 함
     lv_disp_flush_ready(drv);
+}
+
+bool DisplayMgr::PlayGifFromSD(const char* path)
+{
+    if (!_lvglInitialized || path == nullptr || path[0] == '\0') return false;
+
+    String lvPath(path);
+    String sdPath = lvPath;
+    if (sdPath.startsWith("S:")) {
+        sdPath = sdPath.substring(2);
+    }
+    if (!sdPath.startsWith("/")) {
+        sdPath = "/" + sdPath;
+    }
+
+    if (!SD.exists(sdPath.c_str())) {
+        Serial.printf("[DisplayMgr] GIF not found on SD: %s\n", sdPath.c_str());
+        return false;
+    }
+
+    lv_obj_t* screen = lv_scr_act();
+    if (_splashGif != nullptr) {
+        lv_obj_del(_splashGif);
+        _splashGif = nullptr;
+    }
+
+    _splashGif = lv_gif_create(screen);
+    if (_splashGif == nullptr) {
+        Serial.println("[DisplayMgr] lv_gif_create failed");
+        return false;
+    }
+
+    lv_gif_set_src(_splashGif, lvPath.c_str());
+#if LV_USE_GIF
+    lv_timer_set_period(((lv_gif_t*)_splashGif)->timer, 1);
+#endif
+    lv_obj_center(_splashGif);
+    Serial.printf("[DisplayMgr] GIF started: %s\n", lvPath.c_str());
+    return true;
+}
+
+bool DisplayMgr::PlayGifFromMemory(const GIFMemory& gifMem)
+{
+    if (!_lvglInitialized || gifMem.data == nullptr || gifMem.size == 0) return false;
+
+    lv_obj_t* screen = lv_scr_act();
+    if (_splashGif != nullptr) {
+        lv_obj_del(_splashGif);
+        _splashGif = nullptr;
+    }
+
+    _splashGif = lv_gif_create(screen);
+    if (_splashGif == nullptr) {
+        Serial.println("[DisplayMgr] lv_gif_create failed");
+        return false;
+    }
+
+    _splashGifDsc.header.always_zero = 0;
+    _splashGifDsc.header.cf = LV_IMG_CF_RAW;
+    _splashGifDsc.header.w = 1;
+    _splashGifDsc.header.h = 1;
+    _splashGifDsc.data_size = gifMem.size;
+    _splashGifDsc.data = gifMem.data;
+
+    lv_gif_set_src(_splashGif, &_splashGifDsc);
+#if LV_USE_GIF
+    lv_timer_set_period(((lv_gif_t*)_splashGif)->timer, 1);
+#endif
+    lv_obj_center(_splashGif);
+    Serial.printf("[DisplayMgr] GIF started from PSRAM: %u bytes\n", (unsigned int)gifMem.size);
+    return true;
 }
 
 void DisplayMgr::PlayGifTask(void* pvParameters)
@@ -258,46 +292,92 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
     DisplayMgr* self = static_cast<DisplayMgr*>(pvParameters);
     SystemAPI* system = SystemAPI::getInstance();
 
-    if (self->_pendingGifData != nullptr) {
-        if (system->LockGif()) {
-            Serial.println("[DisplayMgr] === GIF Playback Start ===");
-            self->PlayGifFromMemory(self->_pendingGifData, self->_pendingGifSize, false);
-            system->UnlockGif();
-            Serial.println("[DisplayMgr] === GIF Playback End ===\n");
-        }
-    }
-
-    // --- 추가 및 수정된 로직 시작 ---
-
-    // 1. GIF가 사용하던 더블 버퍼링 상태를 정리하고 LVGL이 쓸 기본 버퍼로 고정
-    // LVGL 드라이버는 보통 _fb_buf[0]을 베이스로 복사하므로 0번으로 맞춥니다.
     self->gfx->setFrameBuffer(self->_fb_buf[0]);
-    self->gfx->fillScreen(0x0000); // 검은색으로 밀기
+    self->gfx->fillScreen(0x0000);
     self->gfx->flush();
 
-    Serial.println("[DisplayMgr] Transitioning to LVGL...");
     self->StartLVGL();
 
-    if(system->LockLvgl(pdMS_TO_TICKS(100))) {
-        GaugeInit(); // UI 생성
+    bool splashStarted = false;
+    if (system->LockLvgl(pdMS_TO_TICKS(100))) {
+        lv_obj_t* screen = lv_scr_act();
+        lv_obj_clean(screen);
+        lv_obj_set_style_bg_color(screen, lv_color_black(), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
 
-        // 2. 중요: UI가 생성된 직후에 LVGL에게 "전체 화면이 더러워졌으니 다시 그려라"라고 명령
-        // 이 명령이 있어야 LVGL이 flush_cb를 즉시 호출하여 화면을 업데이트합니다.
-        lv_obj_invalidate(lv_scr_act());
+        GIFMemory gifMem;
+        if (system->LockGif(pdMS_TO_TICKS(100))) {
+            GIFMemory* shared = system->GetPsramObjPtr();
+            if (shared && shared->data && shared->size) {
+                gifMem = *shared;
+            }
+            system->UnlockGif();
+        }
+
+        if (gifMem.data && gifMem.size) {
+            splashStarted = self->PlayGifFromMemory(gifMem);
+        } else {
+            splashStarted = self->PlayGifFromSD(self->_pendingGifPath.c_str());
+        }
+        lv_obj_invalidate(screen);
 
         system->UnlockLvgl();
-        Serial.println("[DisplayMgr] LVGL UI Created & Invalidated");
     }
 
-    // 3. LVGL 핸들러 실행
-    xTaskCreatePinnedToCore(DisplayMgr::HandleLvglTask, "LvglTask", 8192, self, 10, nullptr, 1);
+    if (!splashStarted) {
+        Serial.printf("[DisplayMgr] GIF start failed: %s\n", self->_pendingGifPath.c_str());
+    }
 
-    // --- 로직 끝 ---
+    TickType_t startTick = xTaskGetTickCount();
+    const TickType_t splashDuration = pdMS_TO_TICKS(12000);
+    const uint32_t gifSpeedupMsPerLoop = 80;
+    const int gifBurstPerLoop = 4;
+    while ((xTaskGetTickCount() - startTick) < splashDuration) {
+        if (ulTaskNotifyTake(pdTRUE, 0)) break;
+        if (system->LockLvgl(pdMS_TO_TICKS(20))) {
+            for (int i = 0; i < gifBurstPerLoop; ++i) {
+                lv_timer_handler();
+#if LV_USE_GIF
+                if (self->_splashGif) {
+                    lv_gif_t* gifObj = (lv_gif_t*)self->_splashGif;
+                    gifObj->last_call -= gifSpeedupMsPerLoop;
+                }
+#endif
+            }
+            system->UnlockLvgl();
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
 
-    vTaskDelay(pdMS_TO_TICKS(500));
-    system->storageSubscriber.SetEvent(STORAGE_CLEAR_LOADED_PSRAM);
+    bool uiReady = false;
+    for (int i = 0; i < 30; ++i) {
+        if(system->LockLvgl(pdMS_TO_TICKS(100))) {
+            lv_obj_t* screen = lv_scr_act();
+            if (self->_splashGif) {
+                lv_obj_del(self->_splashGif);
+                self->_splashGif = nullptr;
+            }
+            lv_obj_clean(screen);
+            GaugeInit();
+            lv_obj_invalidate(screen);
+            system->UnlockLvgl();
+            Serial.println("[DisplayMgr] LVGL UI Created");
+            uiReady = true;
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    if (!uiReady) {
+        Serial.println("[DisplayMgr] LVGL UI transition timeout");
+    }
+
+    if (self->_lvglTaskHandler == nullptr) {
+        xTaskCreatePinnedToCore(DisplayMgr::HandleLvglTask, "LvglTask", 8192, self, 4, &self->_lvglTaskHandler, 1);
+    }
 
     self->_splashFinished = true;
+    self->_gifTaskHandler = nullptr;
     vTaskDelete(NULL);
 }
 
@@ -312,18 +392,11 @@ void DisplayMgr::Subscribe(void* pvParameters)
             switch(event.type) {
                 case DISPLAY_SHOW_SPLASH:
                 {
-                    system->storageSubscriber.SetEvent(STORAGE_LOAD_TO_PSRAM, event.data);
-                    int wait = 0;
-                    while (!system->isGifLoaded && wait++ < 100) vTaskDelay(pdMS_TO_TICKS(100));
-                    if(system->isGifLoaded) {
-                        if (system->LockGif()) {
-                            GIFMemory* gifObj = system->GetPsramObjPtr();
-                            self->_pendingGifData = gifObj->data;
-                            self->_pendingGifSize = gifObj->size;
-                            system->UnlockGif();
-                        }
-                        Serial.println("[DisplayMgr] Starting GIF Task");
-                        xTaskCreatePinnedToCore(DisplayMgr::PlayGifTask, "GifTask", 16384, self, 5, &self->taskHandler, 1);
+                    self->_pendingGifPath = String("S:") + String(event.data);
+
+                    if (self->_gifTaskHandler == nullptr) {
+                        Serial.printf("[DisplayMgr] Starting LVGL GIF Task: %s\n", self->_pendingGifPath.c_str());
+                        xTaskCreatePinnedToCore(DisplayMgr::PlayGifTask, "GifTask", 8192, self, 5, &self->_gifTaskHandler, 1);
                     }
                     break;
                 }
@@ -357,90 +430,12 @@ void DisplayMgr::HandleLvglTask(void *pvParameters)
 
     while (true) {
         if (system->LockLvgl(pdMS_TO_TICKS(5))) {
-            // LV_TICK_CUSTOM이 켜져 있으면 내부에서 알아서 millis()를 참조합니다.
             lv_timer_handler();
             system->UnlockLvgl();
         }
 
-        // 60fps (1000ms / 60 = 16.6ms)를 위한 정밀 대기
-        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(16));
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(41));
     }
-}
-
-void DisplayMgr::GifDrawStatic(GIFDRAW *pDraw)
-{
-    DisplayMgr* self = static_cast<DisplayMgr*>(pDraw->pUser);
-    // 현재 하드웨어가 출력 중이지 않은 'Back Buffer'에 그립니다.
-    uint16_t* backBuf = self->_fb_buf[self->_fb_active ^ 1];
-    if (!backBuf) return;
-
-    // 중앙 정렬 계산 (iCanvasWidth/Height 대신 메서드 활용)
-    int canvasW = self->_gif.getCanvasWidth();
-    int canvasH = self->_gif.getCanvasHeight();
-    int offsetX = (SCREEN_WIDTH - canvasW) / 2;
-    int offsetY = (SCREEN_HEIGHT - canvasH) / 2;
-
-    int dstY = pDraw->iY + pDraw->y + offsetY;
-    int dstX = pDraw->iX + offsetX;
-
-    if (dstY < 0 || dstY >= SCREEN_HEIGHT) return;
-
-    uint16_t* pDest = &backBuf[dstY * SCREEN_WIDTH + dstX];
-    uint8_t* pSrc = pDraw->pPixels;
-    uint16_t* pPalette = pDraw->pPalette;
-
-    for (int i = 0; i < pDraw->iWidth; i++) {
-        uint8_t idx = pSrc[i];
-        if (pDraw->ucHasTransparency && idx == pDraw->ucTransparent) {
-            pDest++;
-        } else {
-            *pDest++ = pPalette[idx];
-        }
-    }
-}
-
-bool DisplayMgr::PlayGifFromMemory(uint8_t* pData, size_t iSize, bool loop)
-{
-    if (!_gfxInitialized || !pData) return false;
-
-    _gif.begin(GIF_PALETTE_RGB565_LE);
-    if (!_gif.open(pData, (int)iSize, DisplayMgr::GifDrawStatic)) {
-        Serial.println("[DisplayMgr] GIF Open Failed!");
-        return false;
-    }
-
-    Serial.printf("[DisplayMgr] GIF Started: %dx%d (Speed: %.1fx)\n",
-                  _gif.getCanvasWidth(), _gif.getCanvasHeight(), 30.0f);
-
-    int frameCount = 0;
-    do {
-        int delayMs = 0;
-        while (_gif.playFrame(true, &delayMs, this) > 0) {
-            _fb_active ^= 1;
-            gfx->setFrameBuffer(_fb_buf[_fb_active]);
-            gfx->flush();
-
-            memcpy(_fb_buf[_fb_active ^ 1], _fb_buf[_fb_active], _fb_pixels * sizeof(uint16_t));
-
-            frameCount++;
-            if (ulTaskNotifyTake(pdTRUE, 0)) { loop = false; break; }
-
-            // --- 속도 조절 핵심 로직 ---
-            int adjustedDelay = (int)(delayMs / 45);
-
-            // 1ms 이하면 yield()만 수행하여 CPU 점유를 방지하고 즉시 다음 프레임 진행
-            if (adjustedDelay > 0) {
-                vTaskDelay(pdMS_TO_TICKS(adjustedDelay));
-            } else {
-                yield();
-            }
-        }
-        if (loop) _gif.reset();
-    } while (loop);
-
-    _gif.close();
-    Serial.printf("[DisplayMgr] GIF Finished. Total Frames: %d\n", frameCount);
-    return true;
 }
 
 void DisplayMgr::BacklightOn() { digitalWrite(GPIO_BCKL, HIGH); }
@@ -451,7 +446,7 @@ void DisplayMgr::PushLine(const String& line) { _lines.push_back(line); if (_lin
 void DisplayMgr::AppendToLastLine(const String& text) { if (_lines.empty()) _lines.push_back(text); else _lines.back() += text; }
 
 void DisplayMgr::Redraw() {
-    if (_lvglInitialized) return; // LVGL 시작 후에는 기존 Redraw 사용 안함
+    if (_lvglInitialized) return;
     if (!_gfxInitialized) return;
     gfx->fillScreen(RGB565_BLACK);
     gfx->setTextColor(RGB565_WHITE);
@@ -466,28 +461,8 @@ void DisplayMgr::Redraw() {
 }
 
 void DisplayMgr::Clear() { _lines.clear(); if (_gfxInitialized) gfx->fillScreen(RGB565_BLACK); }
-void DisplayMgr::StopGif() { if (this->taskHandler) xTaskNotifyGive(this->taskHandler); }
+void DisplayMgr::StopGif() { if (this->_gifTaskHandler) xTaskNotifyGive(this->_gifTaskHandler); }
 
 void DisplayMgr::CreateMainBackground()
 {
-    // lv_obj_t* battGauge = lv_img_create(lv_scr_act());
-    // lv_img_set_src(battGauge, "S:/assets/batteryGauge.png");
-    // lv_obj_center(battGauge);
-    // lv_obj_set_size(battGauge, 100, 200);
-
-    // // 2. 바늘 (C-Array 방식)
-    // lv_obj_t* ui_needle = lv_img_create(lv_scr_act());
-    // lv_img_set_src(ui_needle, &needle);
-
-    // // 게이지 중앙에 바늘 정렬
-    // lv_obj_align_to(ui_needle, battGauge, LV_ALIGN_CENTER, 0, 0);
-
-    // // 피벗 설정 (이미지 원본 크기에 따라 조정 필요)
-    // // 예: 바늘 이미지 폭이 20, 높이가 100이라면 중앙 하단은 (10, 90)
-    // lv_img_set_pivot(ui_needle, 10, 50);
-
-    // // 각도 (0.1도 단위, 50도는 500)
-    // lv_img_set_angle(ui_needle, 500);
-
-    // Serial.println("[DisplayMgr] Main Background Created");
 }

@@ -5,12 +5,12 @@
 #include <SD.h>
 #include <vector>
 #include <SPI.h>
-#include <AnimatedGIF.h>
+#include "esp_heap_caps.h"
 
 struct GIFMemory
 {
-    uint8_t* data;
-    size_t size;
+    uint8_t* data = nullptr;
+    size_t size = 0;
 };
 
 struct FileNode
@@ -49,11 +49,6 @@ class StorageMgr
         File SDOpen(const char* path, const char* mode = "r");
         size_t SDReadAll(const char* path, uint8_t* buffer, size_t maxLen);
         bool SDRemove(const char* path);
-
-        static void* GIFOpen(const char* szFilename, int32_t *pFileSize);
-        static void GIFClose(void *pHandle);
-        static int32_t GIFRead(GIFFILE *pFile, uint8_t *pBuf, int32_t iLen);
-        static int32_t GIFSeek(GIFFILE *pFile, int32_t iPosition);
 
         GIFMemory LoadGifToPSRAM(const char* path);
         void FreeGifFromPSRAM(GIFMemory& mem);

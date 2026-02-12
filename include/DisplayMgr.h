@@ -2,12 +2,12 @@
 #define __DISPLAY__
 
 #include <Arduino.h>
-#include <AnimatedGIF.h>
 #include <Arduino_GFX_Library.h>
 #include <lvgl.h>
 #include <vector>
 
 #define CONSOLE_ROWS 30
+struct GIFMemory;
 
 class DisplayMgr
 {
@@ -19,35 +19,34 @@ class DisplayMgr
         bool _splashFinished = false;
 
         std::vector<String> _lines;
-        AnimatedGIF _gif;
 
-        // Double-buffering 및 LVGL 관련 멤버
+        // Double-buffering and LVGL memory
         uint16_t* _fb_buf[2] = {nullptr, nullptr};
         uint8_t _fb_active = 0;
         size_t _fb_pixels = 0;
 
-        uint8_t* _pendingGifData = nullptr;
-        size_t _pendingGifSize = 0;
+        String _pendingGifPath;
+        lv_obj_t* _splashGif = nullptr;
+        lv_img_dsc_t _splashGifDsc = {};
 
-        // LVGL 드라이버 구조체
         lv_disp_draw_buf_t _draw_buf;
         lv_disp_drv_t _disp_drv;
 
-        // 내부 콜백 및 태스크
         static void HandleLvglTask(void *pvParameters);
-        static void GifDrawStatic(GIFDRAW *pDraw);
         static void PlayGifTask(void* pvParameters);
         static void Subscribe(void* pvParameters);
         static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_p);
 
-        TaskHandle_t taskHandler = nullptr;
+        TaskHandle_t _gifTaskHandler = nullptr;
+        TaskHandle_t _eventTaskHandler = nullptr;
+        TaskHandle_t _lvglTaskHandler = nullptr;
 
     public:
         DisplayMgr() { Serial.println("====DisplayMgr Instance Created"); }
         ~DisplayMgr() { Serial.println("~~~~DisplayMgr Instance Deleted"); }
 
         void Init();
-        void StartLVGL(); // GIF 종료 후 LVGL 엔진 시동
+        void StartLVGL();
 
         void BacklightOn();
         void BacklightOff();
@@ -60,8 +59,8 @@ class DisplayMgr
         void Redraw();
         void Clear();
 
-        bool PlayGifFromSD(const char* path, bool loop = true);
-        bool PlayGifFromMemory(uint8_t* pData, size_t iSize, bool loop);
+        bool PlayGifFromSD(const char* path);
+        bool PlayGifFromMemory(const GIFMemory& gifMem);
         void StopGif();
 
         bool IsLvglInitialized() { return _lvglInitialized; }
