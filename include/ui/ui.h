@@ -71,6 +71,7 @@ void create_clock();
 void create_gauge();
 void create_sys_monitor_panel();
 void update_monitor_ui(monitor_item_t * item, int32_t usage);
+void update_system_monitor(int32_t ram_percent, int32_t core1_percent, int32_t core2_percent);
 void update_coolant_gauge(int32_t val);
 void update_battery_gauge(int32_t val);
 

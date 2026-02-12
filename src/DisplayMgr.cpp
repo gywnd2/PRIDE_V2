@@ -4,9 +4,94 @@
 #include <SD.h>
 #include <ui.h>
 #include "esp_heap_caps.h"
+#include "freertos/task.h"
+#include "esp_lcd_panel_rgb.h"
+#include "freertos/semphr.h"
+#include "esp_freertos_hooks.h"
 #if LV_USE_GIF
 #include <src/extra/libs/gif/lv_gif.h>
 #endif
+
+static SemaphoreHandle_t s_vsyncSem = nullptr;
+static bool s_flushFrameStarted = false;
+static volatile uint32_t s_idleLoopCount[2] = {0, 0};
+static bool s_idleHooksRegistered = false;
+
+static bool IRAM_ATTR idle_hook_cpu0(void)
+{
+    s_idleLoopCount[0]++;
+    return false;
+}
+
+static bool IRAM_ATTR idle_hook_cpu1(void)
+{
+    s_idleLoopCount[1]++;
+    return false;
+}
+
+static void register_idle_hooks_once()
+{
+    if (s_idleHooksRegistered) return;
+
+    esp_err_t e0 = esp_register_freertos_idle_hook_for_cpu(idle_hook_cpu0, 0);
+    esp_err_t e1 = esp_register_freertos_idle_hook_for_cpu(idle_hook_cpu1, 1);
+    if (e0 == ESP_OK && e1 == ESP_OK) {
+        s_idleHooksRegistered = true;
+        Serial.println("[DisplayMgr] Idle hooks registered for CPU monitor");
+    } else {
+        Serial.printf("[DisplayMgr] Idle hook register failed: e0=%d e1=%d\n", (int)e0, (int)e1);
+    }
+}
+
+static bool sample_cpu_usage(uint8_t* core0_usage, uint8_t* core1_usage)
+{
+    if (!core0_usage || !core1_usage || !s_idleHooksRegistered) return false;
+
+    static uint32_t prevIdle0 = 0;
+    static uint32_t prevIdle1 = 0;
+    static uint32_t peakIdle0 = 1;
+    static uint32_t peakIdle1 = 1;
+
+    uint32_t nowIdle0 = s_idleLoopCount[0];
+    uint32_t nowIdle1 = s_idleLoopCount[1];
+
+    if (prevIdle0 == 0 && prevIdle1 == 0) {
+        prevIdle0 = nowIdle0;
+        prevIdle1 = nowIdle1;
+        return false;
+    }
+
+    uint32_t dIdle0 = nowIdle0 - prevIdle0;
+    uint32_t dIdle1 = nowIdle1 - prevIdle1;
+    prevIdle0 = nowIdle0;
+    prevIdle1 = nowIdle1;
+
+    if (dIdle0 > peakIdle0) peakIdle0 = dIdle0;
+    if (dIdle1 > peakIdle1) peakIdle1 = dIdle1;
+
+    uint32_t u0 = 100U - ((dIdle0 * 100U) / peakIdle0);
+    uint32_t u1 = 100U - ((dIdle1 * 100U) / peakIdle1);
+    if (u0 > 100U) u0 = 100U;
+    if (u1 > 100U) u1 = 100U;
+
+    *core0_usage = (uint8_t)u0;
+    *core1_usage = (uint8_t)u1;
+    return true;
+}
+
+static bool IRAM_ATTR on_vsync_callback(
+    esp_lcd_panel_handle_t panel,
+    esp_lcd_rgb_panel_event_data_t* edata,
+    void* user_ctx
+) {
+    LV_UNUSED(panel);
+    LV_UNUSED(edata);
+    SemaphoreHandle_t sem = (SemaphoreHandle_t)user_ctx;
+    if (!sem) return false;
+    BaseType_t high_task_wakeup = pdFALSE;
+    xSemaphoreGiveFromISR(sem, &high_task_wakeup);
+    return high_task_wakeup == pdTRUE;
+}
 
 static void* sd_fs_open(lv_fs_drv_t * drv, const char * path, lv_fs_mode_t mode) {
     LV_UNUSED(drv);
@@ -129,6 +214,34 @@ void DisplayMgr::Init()
             gfx->setFrameBuffer(_fb_buf[0]);
             Serial.println("[DisplayMgr] Double-buffering initialized with Hardware FB");
         }
+
+        if (!s_vsyncSem) {
+            s_vsyncSem = xSemaphoreCreateBinary();
+        }
+        if (s_vsyncSem && rgbPanel && rgbPanel->getPanelHandle()) {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+            esp_lcd_rgb_panel_event_callbacks_t cbs = {};
+            cbs.on_vsync = on_vsync_callback;
+            esp_err_t err = esp_lcd_rgb_panel_register_event_callbacks(
+                rgbPanel->getPanelHandle(), &cbs, s_vsyncSem
+            );
+            if (err == ESP_OK) {
+                Serial.println("[DisplayMgr] VSYNC callback registered (IDF5 API)");
+            } else {
+                Serial.printf("[DisplayMgr] VSYNC callback register failed: %d\n", (int)err);
+            }
+#else
+            esp_rgb_panel_t* panel = __containerof(rgbPanel->getPanelHandle(), esp_rgb_panel_t, base);
+            if (panel) {
+                panel->on_frame_trans_done = on_vsync_callback;
+                panel->user_ctx = s_vsyncSem;
+                Serial.println("[DisplayMgr] VSYNC callback registered (IDF4 internal)");
+            } else {
+                Serial.println("[DisplayMgr] VSYNC callback register failed: panel null");
+            }
+#endif
+        }
+
         this->BacklightOn();
     }
 
@@ -137,6 +250,8 @@ void DisplayMgr::Init()
 
 void DisplayMgr::StartLVGL() {
     if (_lvglInitialized) return;
+
+    register_idle_hooks_once();
 
     lv_init();
 
@@ -183,7 +298,7 @@ void DisplayMgr::StartLVGL() {
     #endif
 
     _lvglInitialized = true;
-    Serial.println("[DisplayMgr] LVGL Started with SRAM Draw Buffer");
+    Serial.println("[DisplayMgr] LVGL Started with SRAM Partial Draw Buffer + VSYNC sync");
 
     size_t total_psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
     size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
@@ -196,20 +311,26 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
     DisplayMgr* self = (DisplayMgr*)drv->user_data;
 
     if (self && self->gfx) {
-        uint32_t w = lv_area_get_width(area);
-        uint32_t h = lv_area_get_height(area);
+        if (!s_flushFrameStarted && s_vsyncSem) {
+            xSemaphoreTake(s_vsyncSem, 0);
+            xSemaphoreTake(s_vsyncSem, pdMS_TO_TICKS(20));
+            s_flushFrameStarted = true;
+        }
 
-        self->gfx->draw16bitRGBBitmap(
-            area->x1,
-            area->y1,
-            (uint16_t*)color_p,
-            w,
-            h
-        );
+        uint16_t* fb = self->gfx->getFramebuffer();
+        if (fb) {
+            uint32_t w = lv_area_get_width(area);
+            uint32_t h = lv_area_get_height(area);
+            uint16_t* src = (uint16_t*)color_p;
+            for (uint32_t y = 0; y < h; ++y) {
+                size_t dstOff = (size_t)(area->y1 + y) * SCREEN_WIDTH + (size_t)area->x1;
+                memcpy(&fb[dstOff], &src[y * w], w * sizeof(uint16_t));
+            }
+        }
 
-        if(lv_disp_flush_is_last(drv))
-        {
+        if (lv_disp_flush_is_last(drv)) {
             self->gfx->flush();
+            s_flushFrameStarted = false;
         }
     }
 
@@ -248,7 +369,7 @@ bool DisplayMgr::PlayGifFromSD(const char* path)
 
     lv_gif_set_src(_splashGif, lvPath.c_str());
 #if LV_USE_GIF
-    lv_timer_set_period(((lv_gif_t*)_splashGif)->timer, 1);
+    lv_timer_set_period(((lv_gif_t*)_splashGif)->timer, 10);
 #endif
     lv_obj_center(_splashGif);
     Serial.printf("[DisplayMgr] GIF started: %s\n", lvPath.c_str());
@@ -280,7 +401,7 @@ bool DisplayMgr::PlayGifFromMemory(const GIFMemory& gifMem)
 
     lv_gif_set_src(_splashGif, &_splashGifDsc);
 #if LV_USE_GIF
-    lv_timer_set_period(((lv_gif_t*)_splashGif)->timer, 1);
+    lv_timer_set_period(((lv_gif_t*)_splashGif)->timer, 10);
 #endif
     lv_obj_center(_splashGif);
     Serial.printf("[DisplayMgr] GIF started from PSRAM: %u bytes\n", (unsigned int)gifMem.size);
@@ -330,23 +451,13 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
 
     TickType_t startTick = xTaskGetTickCount();
     const TickType_t splashDuration = pdMS_TO_TICKS(12000);
-    const uint32_t gifSpeedupMsPerLoop = 80;
-    const int gifBurstPerLoop = 4;
     while ((xTaskGetTickCount() - startTick) < splashDuration) {
         if (ulTaskNotifyTake(pdTRUE, 0)) break;
         if (system->LockLvgl(pdMS_TO_TICKS(20))) {
-            for (int i = 0; i < gifBurstPerLoop; ++i) {
-                lv_timer_handler();
-#if LV_USE_GIF
-                if (self->_splashGif) {
-                    lv_gif_t* gifObj = (lv_gif_t*)self->_splashGif;
-                    gifObj->last_call -= gifSpeedupMsPerLoop;
-                }
-#endif
-            }
+            lv_timer_handler();
             system->UnlockLvgl();
         }
-        vTaskDelay(pdMS_TO_TICKS(1));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 
     bool uiReady = false;
@@ -371,6 +482,9 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
     if (!uiReady) {
         Serial.println("[DisplayMgr] LVGL UI transition timeout");
     }
+
+    // Reclaim PSRAM used by splash GIF as soon as splash phase is done.
+    system->storageSubscriber.SetEvent(STORAGE_CLEAR_LOADED_PSRAM);
 
     if (self->_lvglTaskHandler == nullptr) {
         xTaskCreatePinnedToCore(DisplayMgr::HandleLvglTask, "LvglTask", 8192, self, 4, &self->_lvglTaskHandler, 1);
@@ -427,10 +541,28 @@ void DisplayMgr::HandleLvglTask(void *pvParameters)
     DisplayMgr* self = static_cast<DisplayMgr*>(pvParameters);
     SystemAPI* system = SystemAPI::getInstance();
     TickType_t xLastWakeTime = xTaskGetTickCount();
+    TickType_t lastMonTick = xLastWakeTime;
 
     while (true) {
         if (system->LockLvgl(pdMS_TO_TICKS(5))) {
             lv_timer_handler();
+
+            TickType_t now = xTaskGetTickCount();
+            if ((now - lastMonTick) >= pdMS_TO_TICKS(5000)) {
+                size_t total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                size_t free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                int32_t ram = (total > 0) ? (int32_t)(((total - free) * 100U) / total) : 0;
+
+                uint8_t core0 = 0;
+                uint8_t core1 = 0;
+                if (sample_cpu_usage(&core0, &core1)) {
+                    update_system_monitor(ram, core0, core1);
+                } else {
+                    update_system_monitor(ram, 0, 0);
+                }
+                lastMonTick = now;
+            }
+
             system->UnlockLvgl();
         }
 
