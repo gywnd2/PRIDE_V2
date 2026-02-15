@@ -14,6 +14,10 @@
 
 static SemaphoreHandle_t s_vsyncSem = nullptr;
 static bool s_flushFrameStarted = false;
+static bool s_backBufferSynced = true;
+static bool s_frameHasFullRefreshArea = false;
+static lv_area_t s_dirtyAreas[64];
+static uint8_t s_dirtyAreaCount = 0;
 static volatile uint32_t s_idleLoopCount[2] = {0, 0};
 static bool s_idleHooksRegistered = false;
 
@@ -204,6 +208,8 @@ void DisplayMgr::Init()
     if(ok) {
         _fb_pixels = SCREEN_WIDTH * SCREEN_HEIGHT;
         size_t bufferSize = _fb_pixels * sizeof(uint16_t);
+        _frontFbIndex = 0;
+        _backFbIndex = 1;
 
         _fb_buf[0] = (uint16_t*)gfx->getFramebuffer();
         _fb_buf[1] = (uint16_t*)heap_caps_aligned_alloc(64, bufferSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -211,7 +217,7 @@ void DisplayMgr::Init()
         if(_fb_buf[0] && _fb_buf[1]) {
             memset(_fb_buf[0], 0, bufferSize);
             memset(_fb_buf[1], 0, bufferSize);
-            gfx->setFrameBuffer(_fb_buf[0]);
+            gfx->setFrameBuffer(_fb_buf[_frontFbIndex]);
             Serial.println("[DisplayMgr] Double-buffering initialized with Hardware FB");
         }
 
@@ -311,13 +317,41 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
     DisplayMgr* self = (DisplayMgr*)drv->user_data;
 
     if (self && self->gfx) {
-        if (!s_flushFrameStarted && s_vsyncSem) {
-            xSemaphoreTake(s_vsyncSem, 0);
-            xSemaphoreTake(s_vsyncSem, pdMS_TO_TICKS(20));
+        if (!s_flushFrameStarted) {
             s_flushFrameStarted = true;
+            s_frameHasFullRefreshArea = false;
+            s_dirtyAreaCount = 0;
         }
 
-        uint16_t* fb = self->gfx->getFramebuffer();
+        bool isFullFrame =
+            (area->x1 == 0) &&
+            (area->y1 == 0) &&
+            (area->x2 == (SCREEN_WIDTH - 1)) &&
+            (area->y2 == (SCREEN_HEIGHT - 1));
+
+        if (isFullFrame) {
+            s_frameHasFullRefreshArea = true;
+            // No need to keep dirty list for full-frame redraw.
+            s_dirtyAreaCount = 0;
+        } else {
+            // If the back buffer is stale and we render only partial areas,
+            // recover once by mirroring front->back.
+            if (!s_backBufferSynced) {
+                uint16_t* front = self->_fb_buf[self->_frontFbIndex];
+                uint16_t* back = self->_fb_buf[self->_backFbIndex];
+                if (front && back) {
+                    memcpy(back, front, self->_fb_pixels * sizeof(uint16_t));
+                }
+                s_backBufferSynced = true;
+            }
+
+            // Store dirty area to replay onto the next back buffer after swap.
+            if (s_dirtyAreaCount < (uint8_t)(sizeof(s_dirtyAreas) / sizeof(s_dirtyAreas[0]))) {
+                s_dirtyAreas[s_dirtyAreaCount++] = *area;
+            }
+        }
+
+        uint16_t* fb = self->_fb_buf[self->_backFbIndex];
         if (fb) {
             uint32_t w = lv_area_get_width(area);
             uint32_t h = lv_area_get_height(area);
@@ -329,7 +363,42 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
         }
 
         if (lv_disp_flush_is_last(drv)) {
+            // Swap only on VSYNC boundary.
+            if (s_vsyncSem) {
+                xSemaphoreTake(s_vsyncSem, 0);
+                xSemaphoreTake(s_vsyncSem, pdMS_TO_TICKS(20));
+            }
+
+            self->gfx->setFrameBuffer(self->_fb_buf[self->_backFbIndex]);
             self->gfx->flush();
+
+            uint8_t oldFront = self->_frontFbIndex;
+            self->_frontFbIndex = self->_backFbIndex;
+            self->_backFbIndex = oldFront;
+
+            if (s_frameHasFullRefreshArea) {
+                // Keep stale back buffer during continuous full-frame streams (e.g. GIF),
+                // and resync only when partial update appears later.
+                s_backBufferSynced = false;
+            } else {
+                // Replay this frame's dirty regions into the new back buffer so
+                // next partial frame starts from identical content without full copy.
+                uint16_t* front = self->_fb_buf[self->_frontFbIndex];
+                uint16_t* back = self->_fb_buf[self->_backFbIndex];
+                if (front && back) {
+                    for (uint8_t i = 0; i < s_dirtyAreaCount; ++i) {
+                        const lv_area_t* a = &s_dirtyAreas[i];
+                        uint32_t w = lv_area_get_width(a);
+                        uint32_t h = lv_area_get_height(a);
+                        for (uint32_t y = 0; y < h; ++y) {
+                            size_t off = (size_t)(a->y1 + y) * SCREEN_WIDTH + (size_t)a->x1;
+                            memcpy(&back[off], &front[off], w * sizeof(uint16_t));
+                        }
+                    }
+                }
+                s_backBufferSynced = true;
+            }
+
             s_flushFrameStarted = false;
         }
     }
@@ -369,7 +438,7 @@ bool DisplayMgr::PlayGifFromSD(const char* path)
 
     lv_gif_set_src(_splashGif, lvPath.c_str());
 #if LV_USE_GIF
-    lv_timer_set_period(((lv_gif_t*)_splashGif)->timer, 10);
+    lv_timer_set_period(((lv_gif_t*)_splashGif)->timer, 5);
 #endif
     lv_obj_center(_splashGif);
     Serial.printf("[DisplayMgr] GIF started: %s\n", lvPath.c_str());
@@ -401,7 +470,7 @@ bool DisplayMgr::PlayGifFromMemory(const GIFMemory& gifMem)
 
     lv_gif_set_src(_splashGif, &_splashGifDsc);
 #if LV_USE_GIF
-    lv_timer_set_period(((lv_gif_t*)_splashGif)->timer, 10);
+    lv_timer_set_period(((lv_gif_t*)_splashGif)->timer, 5);
 #endif
     lv_obj_center(_splashGif);
     Serial.printf("[DisplayMgr] GIF started from PSRAM: %u bytes\n", (unsigned int)gifMem.size);
@@ -413,7 +482,7 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
     DisplayMgr* self = static_cast<DisplayMgr*>(pvParameters);
     SystemAPI* system = SystemAPI::getInstance();
 
-    self->gfx->setFrameBuffer(self->_fb_buf[0]);
+    self->gfx->setFrameBuffer(self->_fb_buf[self->_frontFbIndex]);
     self->gfx->fillScreen(0x0000);
     self->gfx->flush();
 
@@ -457,7 +526,7 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
             lv_timer_handler();
             system->UnlockLvgl();
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 
     bool uiReady = false;
@@ -548,7 +617,7 @@ void DisplayMgr::HandleLvglTask(void *pvParameters)
             lv_timer_handler();
 
             TickType_t now = xTaskGetTickCount();
-            if ((now - lastMonTick) >= pdMS_TO_TICKS(5000)) {
+            if ((now - lastMonTick) >= pdMS_TO_TICKS(1000)) {
                 size_t total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
                 size_t free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
                 int32_t ram = (total > 0) ? (int32_t)(((total - free) * 100U) / total) : 0;

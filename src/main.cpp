@@ -47,47 +47,48 @@ void loop()
     static SystemAPI* system = SystemAPI::getInstance();
 
     static uint32_t startTime = 0;
-    static int step = 0; // 진행 단계를 기록
+    static int step = 0; // 진행 ?�계�?기록
 
     if (Serial.available() > 0) {
-        // 시리얼 버퍼에서 문자열 읽기
+        // ?�리??버퍼?�서 문자???�기
         String input = Serial.readStringUntil('\n');
-        input.trim(); // 공백이나 줄바꿈 제거
+        input.trim(); // 공백?�나 줄바�??�거
 
         if (input == "reset") {
             Serial.println("[System] Reset command received. Rebooting...");
-            delay(500); // 메시지가 전송될 시간을 잠시 벌어줌
-            ESP.restart(); // ESP32 소프트웨어 리셋
+            delay(500); // 메시지가 ?�송???�간???�시 벌어�?
+            ESP.restart(); // ESP32 ?�프?�웨??리셋
         }
     }
 
     if(displayMgr->IsSplashFinished())
     {
         if(startTime == 0) {
-            startTime = millis(); // 시작 시간 기록
+            startTime = millis(); // ?�작 ?�간 기록
         }
         uint32_t elapsed = millis() - startTime;
 
-        // 2. 단 한 번씩만 순차적으로 실행되도록 구조 변경
+        // 2. ????번씩�??�차?�으�??�행?�도�?구조 변�?
         if (system->LockLvgl(pdMS_TO_TICKS(10))) {
             if (step == 0 && elapsed >= 1000) {
                 update_coolant_gauge(150);
                 update_battery_gauge(20);
                 step = 1;
             }
-            else if (step == 1 && elapsed >= 2000) {
+            else if (step == 1 && elapsed >= 2500) {
                 update_coolant_gauge(0);
                 update_battery_gauge(0);
                 step = 2;
             }
-            else if (step == 2 && elapsed >= 3000) {
+            else if (step == 2 && elapsed >= 4000) {
                 update_coolant_gauge(90);
                 update_battery_gauge(18);
-                step = 3; // 이제 더 이상 실행 안 됨
+                step = 3; // ?�제 ???�상 ?�행 ????
             }
             system->UnlockLvgl();
         }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(50));
 }
+

@@ -23,6 +23,8 @@ class DisplayMgr
         // Double-buffering and LVGL memory
         uint16_t* _fb_buf[2] = {nullptr, nullptr};
         size_t _fb_pixels = 0;
+        uint8_t _frontFbIndex = 0;
+        uint8_t _backFbIndex = 1;
 
         String _pendingGifPath;
         lv_obj_t* _splashGif = nullptr;
