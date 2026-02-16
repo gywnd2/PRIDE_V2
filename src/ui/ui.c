@@ -19,10 +19,10 @@ void update_coolant_gauge(int32_t val)
 {
     if (!target_needle) return;
 
-    // 1. 값 범위 제한
+    // 1. �?범위 ?�한
     val = (val < 0) ? 0 : (val > 150 ? 150 : val);
 
-    // 2. [최적화] 이전 값과 같으면 즉시 리턴 (불필요한 애니메이션 생성 방지)
+    // 2. [최적?? ?�전 값과 같으�?즉시 리턴 (불필?�한 ?�니메이???�성 방�?)
     static int32_t last_batt_val = -1;
     if (val == last_batt_val) return;
     last_batt_val = val;
@@ -31,26 +31,26 @@ void update_coolant_gauge(int32_t val)
     int32_t target_angle = GAUGE_START_ANGLE + (val * GAUGE_MOVE_RANGE / 150) + GAUGE_MIN_ROT;
     int32_t start_angle = lv_img_get_angle(target_needle);
 
-    // 4. 회전 방향 최단 거리 계산
+    // 4. ?�전 방향 최단 거리 계산
     int32_t diff = (target_angle % 3600) - (start_angle % 3600);
     if (diff > 1800) diff -= 3600;
     else if (diff < -1800) diff += 3600;
 
     //lv_img_set_angle(target_batt_needle, target_angle);
 
-    // 5. [중요] 기존 애니메이션 삭제 (리셋 방지 핵심)
-    // target_batt_needle에 걸려있는 needle_anim_exec_cb 콜백 애니메이션만 정밀 타격해서 삭제
+    // 5. [중요] 기존 ?�니메이????�� (리셋 방�? ?�심)
+    // target_batt_needle??걸려?�는 needle_anim_exec_cb 콜백 ?�니메이?�만 ?��? ?�격해????��
     lv_anim_del(target_needle, (lv_anim_exec_xcb_t)needle_anim_exec_cb);
-    // 6. 애니메이션 설정
+    // 6. ?�니메이???�정
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, target_needle);
     lv_anim_set_exec_cb(&a, (lv_anim_exec_xcb_t)needle_anim_exec_cb);
     lv_anim_set_values(&a, start_angle, start_angle + diff);
-    lv_anim_set_time(&a, 400); // 600ms보다 조금 짧게 하여 반응성 향상
+    lv_anim_set_time(&a, 400); // 600ms보다 조금 짧게 ?�여 반응???�상
     lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
 
-    // 7. 시작
+    // 7. ?�작
     lv_anim_start(&a);
 }
 
@@ -58,10 +58,10 @@ void update_battery_gauge(int32_t val)
 {
     if (!target_batt_needle) return;
 
-    // 1. 값 범위 제한
+    // 1. �?범위 ?�한
     val = (val < 0) ? 0 : (val > 20 ? 20 : val);
 
-    // 2. [최적화] 이전 값과 같으면 즉시 리턴 (불필요한 애니메이션 생성 방지)
+    // 2. [최적?? ?�전 값과 같으�?즉시 리턴 (불필?�한 ?�니메이???�성 방�?)
     static int32_t last_batt_val = -1;
     if (val == last_batt_val) return;
     last_batt_val = val;
@@ -70,26 +70,26 @@ void update_battery_gauge(int32_t val)
     int32_t target_angle = GAUGE_START_ANGLE + (val * GAUGE_MOVE_RANGE / 20) + GAUGE_MIN_ROT;
     int32_t start_angle = lv_img_get_angle(target_batt_needle);
 
-    // 4. 회전 방향 최단 거리 계산
+    // 4. ?�전 방향 최단 거리 계산
     int32_t diff = (target_angle % 3600) - (start_angle % 3600);
     if (diff > 1800) diff -= 3600;
     else if (diff < -1800) diff += 3600;
 
     //lv_img_set_angle(target_batt_needle, target_angle);
 
-    // 5. [중요] 기존 애니메이션 삭제 (리셋 방지 핵심)
-    // target_batt_needle에 걸려있는 needle_anim_exec_cb 콜백 애니메이션만 정밀 타격해서 삭제
+    // 5. [중요] 기존 ?�니메이????�� (리셋 방�? ?�심)
+    // target_batt_needle??걸려?�는 needle_anim_exec_cb 콜백 ?�니메이?�만 ?��? ?�격해????��
     lv_anim_del(target_batt_needle, (lv_anim_exec_xcb_t)needle_anim_exec_cb);
-    // 6. 애니메이션 설정
+    // 6. ?�니메이???�정
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, target_batt_needle);
     lv_anim_set_exec_cb(&a, (lv_anim_exec_xcb_t)needle_anim_exec_cb);
     lv_anim_set_values(&a, start_angle, start_angle + diff);
-    lv_anim_set_time(&a, 400); // 600ms보다 조금 짧게 하여 반응성 향상
+    lv_anim_set_time(&a, 400); // 600ms보다 조금 짧게 ?�여 반응???�상
     lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
 
-    // 7. 시작
+    // 7. ?�작
     lv_anim_start(&a);
 }
 
@@ -158,14 +158,14 @@ void create_gauge_set(lv_obj_t* parent, bool is_coolant, int32_t x, int32_t y)
     lv_obj_update_layout(bg);
     lv_obj_align_to(needle_obj, bg, LV_ALIGN_CENTER, 0, 0);
 
-    // 4. ?�전�?Pivot) ?�정
-    // ?��?지 ?�체 ?�기??맞는 Pivot 좌표 (?? 바늘 ?��?지 가�?2, ?�로/2 ?��? ?�정 ?�전 중심)
+    // 4. ?�전�?Pivot) ?�정
+    // ?��?지 ?�체 ?�기??맞는 Pivot 좌표 (?? 바늘 ?��?지 가�?2, ?�로/2 ?��? ?�정 ?�전 중심)
     lv_img_set_pivot(needle_obj, GAUGE_PIVOT_X, GAUGE_PIVOT_Y);
 
     // Layout engine ?�향 최소??    lv_obj_clear_flag(needle_obj, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(needle_obj, LV_OBJ_FLAG_IGNORE_LAYOUT);
 
-    // 5. ?�역 ?�인???�당 �?초기??
+    // 5. ?�역 ?�인???�당 �?초기??
     if(is_coolant) {
         target_needle = needle_obj;
         update_coolant_gauge(0);
@@ -206,34 +206,23 @@ void create_monitor_item(lv_obj_t * parent, monitor_item_t * item, const char * 
     item->bar = lv_bar_create(row);
     lv_obj_set_size(item->bar, 120, 15);
 
-    lv_obj_set_style_bg_color(item->bar, lv_color_hex(0x000000), LV_PART_MAIN);
-    lv_obj_set_style_bg_grad_color(item->bar, lv_color_hex(0x222222), LV_PART_MAIN);
-    lv_obj_set_style_bg_grad_dir(item->bar, LV_GRAD_DIR_VER, LV_PART_MAIN);
-    lv_obj_set_style_radius(item->bar, 4, LV_PART_MAIN);
-    lv_obj_set_style_shadow_width(item->bar, 8, LV_PART_MAIN);
-    lv_obj_set_style_shadow_ofs_y(item->bar, 2, LV_PART_MAIN);
-    lv_obj_set_style_shadow_spread(item->bar, 1, LV_PART_MAIN);
-    lv_obj_set_style_shadow_color(item->bar, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(item->bar, lv_color_hex(0x101010), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(item->bar, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_grad_dir(item->bar, LV_GRAD_DIR_NONE, LV_PART_MAIN);
+    lv_obj_set_style_radius(item->bar, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_width(item->bar, 0, LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(item->bar, 0, LV_PART_MAIN);
 
-    lv_obj_set_style_radius(item->bar, 3, LV_PART_INDICATOR);
-    lv_color_t color_mid = lv_color_lighten(color, LV_OPA_60);
-    lv_color_t color_bottom = lv_color_darken(color, LV_OPA_60);
-    lv_obj_set_style_bg_color(item->bar, color_mid, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_grad_color(item->bar, color_bottom, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_grad_dir(item->bar, LV_GRAD_DIR_VER, LV_PART_INDICATOR);
-    lv_obj_set_style_border_side(item->bar, LV_BORDER_SIDE_TOP, LV_PART_INDICATOR);
-    lv_obj_set_style_border_width(item->bar, 2, LV_PART_INDICATOR);
-    lv_obj_set_style_border_color(item->bar, lv_color_white(), LV_PART_INDICATOR);
-    lv_obj_set_style_border_opa(item->bar, LV_OPA_40, LV_PART_INDICATOR);
-    lv_obj_set_style_outline_width(item->bar, 1, LV_PART_INDICATOR);
-    lv_obj_set_style_outline_color(item->bar, lv_color_black(), LV_PART_INDICATOR);
-    lv_obj_set_style_outline_pad(item->bar, -1, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(item->bar, 2, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(item->bar, color, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(item->bar, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_grad_dir(item->bar, LV_GRAD_DIR_NONE, LV_PART_INDICATOR);
+    lv_obj_set_style_border_width(item->bar, 0, LV_PART_INDICATOR);
+    lv_obj_set_style_outline_width(item->bar, 0, LV_PART_INDICATOR);
 
-    lv_obj_set_style_bg_grad_dir(item->bar, LV_GRAD_DIR_VER, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_main_stop(item->bar, 0, LV_PART_INDICATOR);     // ?�작??
-    lv_obj_set_style_bg_grad_stop(item->bar, 255, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_grad_dir(item->bar, LV_GRAD_DIR_NONE, LV_PART_INDICATOR);
 
-    lv_obj_set_style_anim_time(item->bar, 600, 0);
+    lv_obj_set_style_anim_time(item->bar, 0, 0);
 
     item->label_val = lv_label_create(row);
     lv_label_set_text(item->label_val, "0%");
@@ -284,7 +273,7 @@ void create_gauge()
 
 void update_monitor_ui(monitor_item_t * item, int32_t usage)
 {
-    lv_bar_set_value(item->bar, usage, LV_ANIM_ON);
+    lv_bar_set_value(item->bar, usage, LV_ANIM_OFF);
     lv_label_set_text_fmt(item->label_val, "%d%%", usage);
 }
 
@@ -323,7 +312,7 @@ void DisplayColorTest() {
 
         lv_obj_t * label = lv_label_create(obj);
         lv_label_set_text(label, color_names[i]);
-        // 글?�색 ?�정: 배경???�색???�만 검?�??글??
+        // 글?�색 ?�정: 배경???�색???�만 검?�??글??
         lv_obj_set_style_text_color(label, (i == 3) ? lv_color_black() : lv_color_white(), 0);
         lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
     }
@@ -361,5 +350,8 @@ void update_system_monitor(int32_t ram_percent, int32_t core1_percent, int32_t c
     update_monitor_ui(&cpu_core1, core1_percent);
     update_monitor_ui(&cpu_core2, core2_percent);
 }
+
+
+
 
 
