@@ -1,5 +1,9 @@
 #include <ObdMgr.h>
 #include <CommonApi.h>
+#include <string.h>
+
+#define TEST_LOG(fmt, ...) Serial.printf("[ObdMgr] " fmt "\n", ##__VA_ARGS__)
+#define TEST_LINE() Serial.printf("[ObdMgr] %s\n", __func__)
 
 String ObdStatusStr[8] =
 {
@@ -13,23 +17,191 @@ String ObdStatusStr[8] =
     "OBD Disconnected"
 };
 
+bool ObdMgr::LockData(TickType_t waitTime)
+{
+    return (_dataMutex != nullptr) && (xSemaphoreTake(_dataMutex, waitTime) == pdTRUE);
+}
+
+void ObdMgr::UnlockData()
+{
+    if (_dataMutex) xSemaphoreGive(_dataMutex);
+}
+
+void ObdMgr::PostEvent(ObdMgrEventType type)
+{
+    if (!_eventQueue) return;
+    ObdMgrEventData evt = {};
+    evt.type = type;
+    if (xQueueSend(_eventQueue, &evt, 0) != pdTRUE) {
+        TEST_LOG("event queue full, drop type=%d", (int)type);
+    }
+}
+
+bool ObdMgr::StartConnectTask()
+{
+    if (_connectTaskRunning) return true;
+    BaseType_t ret = xTaskCreatePinnedToCore(
+        ConnectBTTask,
+        "ConnectBTTask",
+        8192,
+        this,
+        2,
+        &_connectTask,
+        0
+    );
+    if (ret != pdPASS) {
+        _connectTask = NULL;
+        Serial.println("[ObdMgr] Critical: ConnectBTTask create failed");
+        return false;
+    }
+    _connectTaskRunning = true;
+    TEST_LOG("ConnectBTTask created");
+    return true;
+}
+
+bool ObdMgr::StartQueryTask()
+{
+    if (_queryTaskRunning) return true;
+    BaseType_t ret = xTaskCreatePinnedToCore(
+        QueryOBDData,
+        "QueryOBDData",
+        4096,
+        this,
+        3,
+        &query_obd_data_task,
+        1
+    );
+    if (ret != pdPASS) {
+        query_obd_data_task = NULL;
+        Serial.println("[ObdMgr] Critical: QueryOBDData task create failed");
+        return false;
+    }
+    _queryTaskRunning = true;
+    TEST_LOG("QueryOBDData task created");
+    return true;
+}
+
 void ObdMgr::Init(void)
 {
+    TEST_LINE();
+    if (_dataMutex == nullptr) {
+        _dataMutex = xSemaphoreCreateMutex();
+    }
+    TEST_LOG("data mutex=%p", _dataMutex);
+    if (_eventQueue == nullptr) {
+        _eventQueue = xQueueCreate(16, sizeof(ObdMgrEventData));
+    }
+    TEST_LOG("event queue=%p", _eventQueue);
+
+    if (LockData(pdMS_TO_TICKS(20))) {
+        memset(&obd_data, 0, sizeof(obd_data));
+        obd_status = BT_INIT_FAILED;
+        UnlockData();
+    }
+    _connectTask = NULL;
+    query_obd_data_task = NULL;
+    _connectTaskRunning = false;
+    _queryTaskRunning = false;
+    _hadPidSuccess = false;
+    _awaitingRpmRecovery = false;
+    _goodbyeScreenActive = false;
+
     Serial.println("[ObdMgr] S3 BLE OBD task started");
     SetOBDStatus(BT_INIT_SUCCESS);
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    // Core 0에서 연결 태스크 실행
-    xTaskCreatePinnedToCore(ConnectBTTask, "ConnectBTTask", 8192, this, 2, NULL, 0);
+    if (_eventTask != NULL) {
+        vTaskDelete(_eventTask);
+        _eventTask = NULL;
+    }
+
+    BaseType_t ret = xTaskCreatePinnedToCore(EventTask, "ObdEventTask", 4096, this, 2, &_eventTask, 0);
+    if (ret != pdPASS) {
+        Serial.println("[ObdMgr] Critical: ObdEventTask create failed");
+    } else {
+        TEST_LOG("ObdEventTask created");
+        PostEvent(OBD_MGR_EVENT_START_CONNECT);
+    }
+}
+
+void ObdMgr::EventTask(void *param)
+{
+    TEST_LINE();
+    ObdMgr* self = static_cast<ObdMgr*>(param);
+    SystemAPI* system = SystemAPI::getInstance();
+    if (self == NULL || system == NULL || self->_eventQueue == NULL) {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ObdMgrEventData event = {};
+    while (true) {
+        if (xQueueReceive(self->_eventQueue, &event, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        switch (event.type) {
+            case OBD_MGR_EVENT_START_CONNECT:
+            {
+                if (self->GetOBDStatus() == OBD_CONNECTED || self->_connectTaskRunning) {
+                    break;
+                }
+                if (!self->StartConnectTask()) {
+                    vTaskDelay(pdMS_TO_TICKS(OBD_RECONNECT_INTERVAL_MS));
+                    self->PostEvent(OBD_MGR_EVENT_START_CONNECT);
+                }
+                break;
+            }
+
+            case OBD_MGR_EVENT_LINK_LOST:
+            {
+                bool wasStableSession = self->_hadPidSuccess;
+                self->SetOBDStatus(OBD_DISCONNECTED);
+                self->_awaitingRpmRecovery = wasStableSession;
+                system->btSubscriber.SetEvent(BT_REQUEST_DISCONNECT);
+
+                if (wasStableSession) {
+                    system->displaySubscriber.SetEvent(DISPLAY_SHOW_GOODBYE);
+                    system->soundSubscriber.SetEvent(SOUND_PLAY_TRACK, 2);
+                    self->_goodbyeScreenActive = true;
+                }
+
+                vTaskDelay(pdMS_TO_TICKS(OBD_RECONNECT_INTERVAL_MS));
+                self->PostEvent(OBD_MGR_EVENT_START_CONNECT);
+                break;
+            }
+
+            case OBD_MGR_EVENT_RPM_SUCCESS:
+            {
+                self->_hadPidSuccess = true;
+                if (self->_awaitingRpmRecovery) {
+                    self->_awaitingRpmRecovery = false;
+                    if (self->_goodbyeScreenActive) {
+                        system->displaySubscriber.SetEvent(DISPLAY_SHOW_GAUGE_REBOOT);
+                        self->_goodbyeScreenActive = false;
+                    }
+                }
+                break;
+            }
+
+            default:
+                break;
+        }
+    }
 }
 
 void ObdMgr::ConnectBTTask(void *param)
 {
+    TEST_LINE();
     ObdMgr* self = static_cast<ObdMgr*>(param);
     SystemAPI* system = SystemAPI::getInstance();
 
-    if (self == NULL)
+    if (self == NULL || system == NULL)
     {
+        if (self) {
+            self->_connectTaskRunning = false;
+            self->_connectTask = NULL;
+        }
         vTaskDelete(NULL);
         return;
     }
@@ -38,10 +210,8 @@ void ObdMgr::ConnectBTTask(void *param)
     self->SetOBDStatus(BT_CONNECTING);
 
 #ifndef OBD_SIMUL_MODE
-    // BluetoothMgr에게 연결 요청
     system->ConnectOBD();
 
-    // 연결 대기 (최대 20초)
     int timeout = 0;
     while (!system->GetOBDConnected() && timeout < 20)
     {
@@ -54,13 +224,16 @@ void ObdMgr::ConnectBTTask(void *param)
     {
         Serial.println("\n[ObdMgr] BLE Connect Failed");
         self->SetOBDStatus(BT_CONNECT_FAILED);
+        self->_connectTaskRunning = false;
+        self->_connectTask = NULL;
+        vTaskDelay(pdMS_TO_TICKS(OBD_RECONNECT_INTERVAL_MS));
+        self->PostEvent(OBD_MGR_EVENT_START_CONNECT);
         vTaskDelete(NULL);
         return;
     }
 
     Serial.println("\n[ObdMgr] BLE Connected. Initializing ELM327...");
 
-    // SystemAPI에서 래핑된 Stream(NimBLEStream)을 가져옴
     Stream* bleStream = system->GetBtStream();
     if (bleStream != nullptr)
     {
@@ -74,6 +247,11 @@ void ObdMgr::ConnectBTTask(void *param)
         if (retry_count > 10)
         {
             self->SetOBDStatus(OBD_INIT_FAILED);
+            system->btSubscriber.SetEvent(BT_REQUEST_DISCONNECT);
+            self->_connectTaskRunning = false;
+            self->_connectTask = NULL;
+            vTaskDelay(pdMS_TO_TICKS(OBD_RECONNECT_INTERVAL_MS));
+            self->PostEvent(OBD_MGR_EVENT_START_CONNECT);
             vTaskDelete(NULL);
             return;
         }
@@ -82,7 +260,18 @@ void ObdMgr::ConnectBTTask(void *param)
 #endif
 
     self->SetOBDStatus(OBD_CONNECTED);
-    xTaskCreatePinnedToCore(QueryOBDData, "QueryOBDData", 4096, self, 3, &(self->query_obd_data_task), 1);
+    if (!self->StartQueryTask()) {
+        self->SetOBDStatus(OBD_DISCONNECTED);
+        system->btSubscriber.SetEvent(BT_REQUEST_DISCONNECT);
+        self->_connectTaskRunning = false;
+        self->_connectTask = NULL;
+        vTaskDelay(pdMS_TO_TICKS(OBD_RECONNECT_INTERVAL_MS));
+        self->PostEvent(OBD_MGR_EVENT_START_CONNECT);
+        vTaskDelete(NULL);
+        return;
+    }
+    self->_connectTaskRunning = false;
+    self->_connectTask = NULL;
     vTaskDelete(NULL);
 }
 
@@ -166,6 +355,7 @@ void ObdMgr::QueryRPM(uint16_t &rpm_value)
 
 void ObdMgr::QueryOBDData(void *param)
 {
+    TEST_LINE();
     ObdMgr* self = static_cast<ObdMgr*>(param);
     if (self == NULL)
     {
@@ -174,28 +364,35 @@ void ObdMgr::QueryOBDData(void *param)
     }
 
     ObdData data;
-    unsigned long last_rpm_time = millis();
-    unsigned long last_30sec_time = millis();
+    unsigned long now = millis();
+    unsigned long last_rpm_time = now;
+    // Run non-RPM query once immediately after OBD task starts.
+    unsigned long last_query_time = now - 60000;
+    bool sessionRpmSuccess = false;
 
     while (true)
     {
         unsigned long current_time = millis();
 
-        // 1. RPM 쿼리 (1초 주기)
-        if (current_time - last_rpm_time >= 1000)
+        if (current_time - last_rpm_time >= 500)
         {
             if (!self->obd_busy)
             {
                 self->obd_busy = true;
                 self->QueryRPM(data.rpm);
-                self->SetRPM(data.rpm);
+                if (data.rpm != OBD_QUERY_INVALID_RESPONSE) {
+                    self->SetRPM(data.rpm);
+                    if (!sessionRpmSuccess) {
+                        sessionRpmSuccess = true;
+                        self->PostEvent(OBD_MGR_EVENT_RPM_SUCCESS);
+                    }
+                }
                 self->obd_busy = false;
             }
             last_rpm_time = current_time;
         }
 
-        // 2. 기타 정보 쿼리 (60초 주기 - 요청하신 60000ms 기준)
-        if (current_time - last_30sec_time >= 60000)
+        if (current_time - last_query_time >= 30000)
         {
             if (!self->obd_busy)
             {
@@ -208,15 +405,15 @@ void ObdMgr::QueryOBDData(void *param)
                 self->SetDistance(data.distance);
                 self->obd_busy = false;
             }
-            last_30sec_time = current_time;
+            last_query_time = current_time;
         }
 
-        // 연결 끊김 체크
         if (self->GetOBDStatus() == OBD_DISCONNECTED)
         {
             Serial.println("[ObdMgr] OBD Disconnected. Terminating Task.");
-            SystemAPI* system = SystemAPI::getInstance();
-            system->soundSubscriber.SetEvent(SOUND_PLAY_TRACK, 1);
+            self->_queryTaskRunning = false;
+            self->query_obd_data_task = NULL;
+            self->PostEvent(OBD_MGR_EVENT_LINK_LOST);
             vTaskDelete(NULL);
             return;
         }
@@ -227,32 +424,101 @@ void ObdMgr::QueryOBDData(void *param)
 
 void ObdMgr::SetOBDStatus(int status)
 {
-    this->obd_status = status;
+    if (LockData(pdMS_TO_TICKS(20))) {
+        this->obd_status = status;
+        UnlockData();
+    } else {
+        this->obd_status = status;
+    }
+
+    SystemAPI* system = SystemAPI::getInstance();
+    if (system) {
+        system->PublishObdStatus(status);
+    }
 }
 
 int ObdMgr::GetOBDStatus()
 {
-    return this->obd_status;
+    int status = BT_INIT_FAILED;
+    if (LockData(pdMS_TO_TICKS(20))) {
+        status = this->obd_status;
+        UnlockData();
+    } else {
+        status = this->obd_status;
+    }
+    return status;
 }
 
 void ObdMgr::SetRPM(unsigned short rpmValue)
 {
-    this->obd_data.rpm = rpmValue;
+    if (LockData(pdMS_TO_TICKS(20))) {
+        this->obd_data.rpm = rpmValue;
+        UnlockData();
+    } else {
+        this->obd_data.rpm = rpmValue;
+    }
 }
 
 void ObdMgr::SetVoltageLevel(unsigned short volt)
 {
-    this->obd_data.voltage = volt;
+    if (LockData(pdMS_TO_TICKS(20))) {
+        this->obd_data.voltage = volt;
+        UnlockData();
+    } else {
+        this->obd_data.voltage = volt;
+    }
+
+    SystemAPI* system = SystemAPI::getInstance();
+    if (system) {
+        system->PublishObdBatteryVoltage(volt);
+    }
 }
 
 void ObdMgr::SetCoolantTemp(unsigned short temp)
 {
-    this->obd_data.coolant = temp;
+    if (LockData(pdMS_TO_TICKS(20))) {
+        this->obd_data.coolant = temp;
+        UnlockData();
+    } else {
+        this->obd_data.coolant = temp;
+    }
+
+    SystemAPI* system = SystemAPI::getInstance();
+    if (system) {
+        system->PublishObdCoolant(temp);
+    }
 }
 
 void ObdMgr::SetDistance(unsigned short dist)
 {
-    this->obd_data.distance = dist;
+    if (LockData(pdMS_TO_TICKS(20))) {
+        this->obd_data.distance = dist;
+        UnlockData();
+    } else {
+        this->obd_data.distance = dist;
+    }
+}
+
+void ObdMgr::SetMafRate(float val)
+{
+    if (LockData(pdMS_TO_TICKS(20))) {
+        this->obd_data.maf_rate = val;
+        UnlockData();
+    } else {
+        this->obd_data.maf_rate = val;
+    }
+}
+
+ObdData ObdMgr::GetObdData(void)
+{
+    ObdData snapshot = {};
+    if (LockData(pdMS_TO_TICKS(20))) {
+        snapshot = this->obd_data;
+        UnlockData();
+    } else {
+        snapshot = this->obd_data;
+    }
+    return snapshot;
 }
 
 void ObdMgr::QueryDistAfterErrorClear(uint16_t &dist_value)

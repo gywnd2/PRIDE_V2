@@ -1,11 +1,13 @@
 #include "DisplayMgr.h"
 #include <CommonApi.h>
+#include <ObdMgr.h>
 #include <lvgl.h>
 #include <SD.h>
 #include <ui.h>
 #include "esp_heap_caps.h"
 #include "freertos/task.h"
 #include "esp_lcd_panel_rgb.h"
+#include "esp_timer.h"
 #include "freertos/semphr.h"
 #include "esp_freertos_hooks.h"
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
@@ -16,6 +18,9 @@ extern "C" int Cache_WriteBack_Addr(uint32_t addr, uint32_t size);
 #include <src/extra/libs/gif/lv_gif.h>
 #endif
 
+#define TEST_LOG(fmt, ...) Serial.printf("[DisplayMgr] " fmt "\n", ##__VA_ARGS__)
+#define TEST_LINE() Serial.printf("[DisplayMgr] %s\n", __func__)
+
 static constexpr uint32_t GIF_TASK_STACK_WORDS = 6144;
 
 static SemaphoreHandle_t s_vsyncSem = nullptr;
@@ -25,19 +30,30 @@ static volatile uint32_t s_swapDoneCount = 0;
 static volatile uint32_t s_swapSkipTimeoutCount = 0;
 static volatile uint32_t s_replayBypassCount = 0;
 static volatile uint32_t s_swapForcedOnTimeoutCount = 0;
+static volatile uint32_t s_singleFlushAreaCount = 0;
+static volatile uint32_t s_singleFlushFrameCount = 0;
+static volatile uint32_t s_singleFlushPixelCount = 0;
+static volatile uint64_t s_singleFlushCopyTimeUs = 0;
+static volatile uint32_t s_singleFlushMaxCopyUs = 0;
 static bool s_flushFrameStarted = false;
 static bool s_usePseudoDoubleBuffer = false;
 static bool s_backBufferSynced = true;
 static bool s_frameHasFullRefreshArea = false;
-static uintptr_t s_cacheWbStart = UINTPTR_MAX;
-static uintptr_t s_cacheWbEnd = 0;
 static lv_area_t s_dirtyAreas[64];
 static uint8_t s_dirtyAreaCount = 0;
 static volatile uint32_t s_idleLoopCount[2] = {0, 0};
 static bool s_idleHooksRegistered = false;
 static volatile bool s_splashActive = false;
+static volatile bool s_splashGifReady = false;
+static volatile bool s_goodbyeScreenActive = false;
 static bool s_strictVsyncSync = false;
 static TickType_t s_monitorResumeTick = 0;
+static bool s_loggedNullFrontFb = false;
+static bool s_loggedNullBackFb = false;
+
+static constexpr TickType_t MONITOR_UPDATE_PERIOD_TICKS = pdMS_TO_TICKS(200);
+static constexpr TickType_t UI_SHARED_UPDATE_PERIOD_TICKS = pdMS_TO_TICKS(100);
+static constexpr bool DISPLAY_ROTATE_180 = true;
 
 static inline uint32_t area_pixels(const lv_area_t* a)
 {
@@ -45,6 +61,16 @@ static inline uint32_t area_pixels(const lv_area_t* a)
     uint32_t w = lv_area_get_width(a);
     uint32_t h = lv_area_get_height(a);
     return w * h;
+}
+
+static inline lv_area_t rotate_area_180(const lv_area_t* a)
+{
+    lv_area_t out = *a;
+    out.x1 = SCREEN_WIDTH - 1 - a->x2;
+    out.x2 = SCREEN_WIDTH - 1 - a->x1;
+    out.y1 = SCREEN_HEIGHT - 1 - a->y2;
+    out.y2 = SCREEN_HEIGHT - 1 - a->y1;
+    return out;
 }
 
 static inline void cache_writeback_span(const void* ptr, size_t bytes)
@@ -138,7 +164,7 @@ static void register_idle_hooks_once()
         s_idleHooksRegistered = true;
         Serial.println("[DisplayMgr] Idle hooks registered for CPU monitor");
     } else {
-        Serial.printf("[DisplayMgr] Idle hook register failed: e0=%d e1=%d\n", (int)e0, (int)e1);
+        TEST_LOG("Idle hook register failed: e0=%d e1=%d", (int)e0, (int)e1);
     }
 }
 
@@ -178,13 +204,77 @@ static bool sample_cpu_usage(uint8_t* core0_usage, uint8_t* core1_usage)
     return true;
 }
 
-static bool IRAM_ATTR on_vsync_callback(
+static void apply_shared_ui_state(const UiSharedState& s)
+{
+    if (s.wifiConnected) update_wifi_icon_connected(s.wifiRssi);
+    else update_wifi_icon_disconnected();
+
+    if (s.clockValid && s.clockText[0] != '\0') {
+        update_clock_text(s.clockText);
+    }
+
+    if (s.obdStatus == OBD_DISCONNECTED) {
+        update_bt_icon_disconnected();
+        update_obd_icon_disconnected();
+    } else {
+        if (s.btConnected) update_bt_icon_connected();
+        else update_bt_icon_disconnected();
+
+        if (s.obdStatus == OBD_CONNECTED) update_obd_icon_connected();
+        else update_obd_icon_disconnected();
+    }
+
+    update_obd_gauges(
+        s.obdStatus == OBD_CONNECTED,
+        s.coolantValid, (int32_t)s.coolant,
+        s.batteryValid, (int32_t)s.batteryVoltage
+    );
+}
+
+static void show_goodbye_screen_locked()
+{
+    lv_obj_t* screen = lv_scr_act();
+    if (!screen) return;
+
+    lv_obj_clean(screen);
+    UiResetRuntimeState();
+    lv_obj_set_style_bg_color(screen, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
+    DrawGoodbyeScreenDummy();
+    lv_obj_invalidate(screen);
+    s_goodbyeScreenActive = true;
+}
+
+static void show_gauge_screen_locked(SystemAPI* system)
+{
+    lv_obj_t* screen = lv_scr_act();
+    if (!screen) return;
+
+    lv_obj_clean(screen);
+    GaugeInit();
+    if (system) {
+        UiSharedState snap = {};
+        if (system->GetUiSharedSnapshot(&snap, 0)) {
+            apply_shared_ui_state(snap);
+        }
+    }
+    lv_obj_invalidate(screen);
+    s_goodbyeScreenActive = false;
+}
+
+static void splash_gif_event_cb(lv_event_t* e)
+{
+    if (!e) return;
+    if (lv_event_get_code(e) == LV_EVENT_READY) {
+        s_splashGifReady = true;
+    }
+}
+
+static bool IRAM_ATTR on_vsync_callback_common(
     esp_lcd_panel_handle_t panel,
-    esp_lcd_rgb_panel_event_data_t* edata,
     void* user_ctx
 ) {
     LV_UNUSED(panel);
-    LV_UNUSED(edata);
     SemaphoreHandle_t sem = (SemaphoreHandle_t)user_ctx;
     if (!sem) return false;
     s_vsyncCount++;
@@ -192,6 +282,26 @@ static bool IRAM_ATTR on_vsync_callback(
     xSemaphoreGiveFromISR(sem, &high_task_wakeup);
     return high_task_wakeup == pdTRUE;
 }
+
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+static bool IRAM_ATTR on_vsync_callback(
+    esp_lcd_panel_handle_t panel,
+    const esp_lcd_rgb_panel_event_data_t* edata,
+    void* user_ctx
+) {
+    LV_UNUSED(edata);
+    return on_vsync_callback_common(panel, user_ctx);
+}
+#else
+static bool IRAM_ATTR on_vsync_callback(
+    esp_lcd_panel_handle_t panel,
+    esp_lcd_rgb_panel_event_data_t* edata,
+    void* user_ctx
+) {
+    LV_UNUSED(edata);
+    return on_vsync_callback_common(panel, user_ctx);
+}
+#endif
 
 static void* sd_fs_open(lv_fs_drv_t * drv, const char * path, lv_fs_mode_t mode) {
     LV_UNUSED(drv);
@@ -202,7 +312,7 @@ static void* sd_fs_open(lv_fs_drv_t * drv, const char * path, lv_fs_mode_t mode)
 
     File f = SD.open(fullPath.c_str(), FILE_READ);
     if (!f || f.isDirectory()) {
-        Serial.printf("[FS] Open Failed: %s\n", fullPath.c_str());
+        TEST_LOG("[FS] Open Failed: %s", fullPath.c_str());
         return NULL;
     }
 
@@ -253,9 +363,17 @@ static lv_fs_res_t sd_fs_tell(lv_fs_drv_t * drv, void * file_p, uint32_t * pos_p
 
 void DisplayMgr::Init()
 {
-    #ifdef GPIO_BCKL
-        pinMode(GPIO_BCKL, OUTPUT);
-    #endif
+    TEST_LINE();
+#ifdef GPIO_BCKL
+    pinMode(GPIO_BCKL, OUTPUT);
+    TEST_LOG("GPIO_BCKL configured");
+#endif
+
+#if defined(DISPLAY_RGB_BOUNCE_BUFFER_PIXELS)
+    constexpr size_t bouncePixels = (size_t)DISPLAY_RGB_BOUNCE_BUFFER_PIXELS;
+#else
+    constexpr size_t bouncePixels = 0;
+#endif
 
     this->rgbPanel = new Arduino_ESP32RGBPanel(
         ST7262_PANEL_CONFIG_DE_GPIO_NUM,
@@ -291,36 +409,75 @@ void DisplayMgr::Init()
         false,
         ST7262_PANEL_CONFIG_TIMINGS_FLAGS_DE_IDLE_HIGH,
         ST7262_PANEL_CONFIG_TIMINGS_FLAGS_PCLK_IDLE_HIGH,
-        0
+        bouncePixels
     );
 
-    gfx = new Arduino_RGB_Display(
-        SCREEN_WIDTH, SCREEN_HEIGHT, rgbPanel, 0, false
-    );
+    if (!this->rgbPanel) {
+        Serial.println("[DisplayMgr] Critical: rgbPanel allocation failed");
+        return;
+    }
+    TEST_LOG("rgbPanel allocated: %p", this->rgbPanel);
+
+    gfx = new Arduino_RGB_Display(SCREEN_WIDTH, SCREEN_HEIGHT, rgbPanel, 0, false);
+    if (!gfx) {
+        Serial.println("[DisplayMgr] Critical: gfx allocation failed");
+        return;
+    }
+    TEST_LOG("gfx allocated: %p", gfx);
 
     bool ok = gfx->begin(ST7262_PANEL_CONFIG_TIMINGS_PCLK_HZ);
     _gfxInitialized = ok;
+    TEST_LOG("gfx->begin result=%d", ok ? 1 : 0);
 
-    if(ok) {
+    if (ok) {
         _fb_pixels = SCREEN_WIDTH * SCREEN_HEIGHT;
         size_t bufferSize = _fb_pixels * sizeof(uint16_t);
         _frontFbIndex = 0;
         _backFbIndex = 1;
+        TEST_LOG("framebuffer pixels=%u bytes=%u",
+                 (unsigned int)_fb_pixels, (unsigned int)bufferSize);
 
         _fb_buf[0] = (uint16_t*)gfx->getFramebuffer();
-        _fb_buf[1] = (uint16_t*)heap_caps_aligned_alloc(64, bufferSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        _fb_buf[1] = nullptr;
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+        if (rgbPanel && rgbPanel->getPanelHandle()) {
+            void* hwFb0 = nullptr;
+            void* hwFb1 = nullptr;
+            esp_err_t fbErr = esp_lcd_rgb_panel_get_frame_buffer(
+                rgbPanel->getPanelHandle(), 2, &hwFb0, &hwFb1
+            );
+            if (fbErr == ESP_OK && hwFb0 && hwFb1 && hwFb0 != hwFb1) {
+                _fb_buf[0] = (uint16_t*)hwFb0;
+                _fb_buf[1] = (uint16_t*)hwFb1;
+                Serial.println("[DisplayMgr] Hardware double-FB detected from RGB panel");
+            } else {
+                TEST_LOG("Hardware double-FB unavailable (err=%d, fb0=%p, fb1=%p)",
+                         (int)fbErr, hwFb0, hwFb1);
+            }
+        }
+#endif
 
-        if(_fb_buf[0] && _fb_buf[1]) {
+        if (!_fb_buf[0]) {
+            Serial.println("[DisplayMgr] Critical: front framebuffer is null");
+            _gfxInitialized = false;
+        } else {
             memset(_fb_buf[0], 0, bufferSize);
-            memset(_fb_buf[1], 0, bufferSize);
+            if (_fb_buf[1]) {
+                memset(_fb_buf[1], 0, bufferSize);
+            }
+        }
+
+        if (_fb_buf[0]) {
             gfx->setFrameBuffer(_fb_buf[_frontFbIndex]);
-            Serial.println("[DisplayMgr] Double-buffering initialized with Hardware FB");
         }
 
         if (!s_vsyncSem) {
             s_vsyncSem = xSemaphoreCreateBinary();
         }
-        if (s_vsyncSem && rgbPanel && rgbPanel->getPanelHandle()) {
+
+        if (!s_vsyncSem) {
+            Serial.println("[DisplayMgr] Warning: VSYNC semaphore creation failed");
+        } else if (rgbPanel && rgbPanel->getPanelHandle()) {
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
             esp_lcd_rgb_panel_event_callbacks_t cbs = {};
             cbs.on_vsync = on_vsync_callback;
@@ -331,7 +488,7 @@ void DisplayMgr::Init()
                 s_strictVsyncSync = true;
                 Serial.println("[DisplayMgr] VSYNC callback registered (IDF5 API)");
             } else {
-                Serial.printf("[DisplayMgr] VSYNC callback register failed: %d\n", (int)err);
+                TEST_LOG("VSYNC callback register failed: %d", (int)err);
             }
 #else
             esp_rgb_panel_t* panel = __containerof(rgbPanel->getPanelHandle(), esp_rgb_panel_t, base);
@@ -346,42 +503,89 @@ void DisplayMgr::Init()
 #endif
         }
 
-        // On IDF4 RGB path the panel is effectively single-FB; avoid pseudo page-flip artifacts.
-        s_usePseudoDoubleBuffer = s_strictVsyncSync;
-        Serial.printf("[DisplayMgr] Pseudo double-buffer: %s\n", s_usePseudoDoubleBuffer ? "ON" : "OFF");
-        if (!s_usePseudoDoubleBuffer && _fb_buf[1]) {
-            heap_caps_free(_fb_buf[1]);
-            _fb_buf[1] = nullptr;
-        }
+        // Enable pseudo path only when the RGB driver actually provided two hardware frame buffers.
+        s_usePseudoDoubleBuffer = (_fb_buf[1] != nullptr);
+        s_backBufferSynced = true;
+        TEST_LOG("Pseudo double-buffer: %s", s_usePseudoDoubleBuffer ? "ON" : "OFF");
 
-        this->BacklightOn();
+        if (_gfxInitialized) {
+            this->BacklightOn();
+            TEST_LOG("backlight enabled");
+        }
+    } else {
+        Serial.println("[DisplayMgr] Critical: gfx->begin failed");
     }
 
-    xTaskCreate(DisplayMgr::Subscribe, "DisplaySub", 4096, this, 4, &this->_eventTaskHandler);
+    BaseType_t taskRet = xTaskCreatePinnedToCore(
+        DisplayMgr::Subscribe,
+        "DisplaySub",
+        4096,
+        this,
+        4,
+        &this->_eventTaskHandler,
+        1
+    );
+    if (taskRet != pdPASS) {
+        Serial.println("[DisplayMgr] Critical: DisplaySub task create failed");
+    } else {
+        TEST_LOG("DisplaySub task started");
+    }
 }
 
 void DisplayMgr::StartLVGL() {
-    if (_lvglInitialized) return;
+    TEST_LINE();
+    if (_lvglInitialized) {
+        TEST_LOG("already initialized");
+        return;
+    }
+    if (!_gfxInitialized || !gfx) {
+        Serial.println("[DisplayMgr] StartLVGL skipped: gfx is not initialized");
+        return;
+    }
 
     register_idle_hooks_once();
 
     lv_init();
+    TEST_LOG("lv_init done");
 
-    // Reduce burst copy size to smooth bus contention with RGB scan/DMA.
-    uint32_t sram_lines = 112;
-    size_t sram_buf_size = SCREEN_WIDTH * sram_lines * sizeof(lv_color_t);
+    // Use a larger draw chunk first, then fallback to smaller chunks if allocation fails.
+    static lv_color_t* sram_work_buf1 = nullptr;
+    static lv_color_t* sram_work_buf2 = nullptr;
+    static uint32_t sram_lines = 0;
+    if (!sram_work_buf1 || !sram_work_buf2) {
+        const uint32_t lineOptions[] = {180, 160, 140, 112};
+        for (size_t i = 0; i < (sizeof(lineOptions) / sizeof(lineOptions[0])); ++i) {
+            uint32_t lines = lineOptions[i];
+            size_t bufSize = SCREEN_WIDTH * lines * sizeof(lv_color_t);
 
-    static lv_color_t* sram_work_buf1 = (lv_color_t*)heap_caps_malloc(
-        sram_buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA
-    );
-    static lv_color_t* sram_work_buf2 = (lv_color_t*)heap_caps_malloc(
-        sram_buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA
-    );
+            lv_color_t* b1 = (lv_color_t*)heap_caps_malloc(
+                bufSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA
+            );
+            lv_color_t* b2 = (lv_color_t*)heap_caps_malloc(
+                bufSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA
+            );
+            if (!b1) b1 = (lv_color_t*)heap_caps_malloc(bufSize, MALLOC_CAP_SPIRAM);
+            if (!b2) b2 = (lv_color_t*)heap_caps_malloc(bufSize, MALLOC_CAP_SPIRAM);
 
-    if (!sram_work_buf1) sram_work_buf1 = (lv_color_t*)heap_caps_malloc(sram_buf_size, MALLOC_CAP_SPIRAM);
-    if (!sram_work_buf2) sram_work_buf2 = (lv_color_t*)heap_caps_malloc(sram_buf_size, MALLOC_CAP_SPIRAM);
+            if (b1 && b2) {
+                sram_work_buf1 = b1;
+                sram_work_buf2 = b2;
+                sram_lines = lines;
+                break;
+            }
 
+            if (b1) heap_caps_free(b1);
+            if (b2) heap_caps_free(b2);
+        }
+    }
+
+    if (!sram_work_buf1 || !sram_work_buf2 || sram_lines == 0) {
+        TEST_LOG("Critical: LVGL draw buffer alloc failed (%p, %p)",
+                 sram_work_buf1, sram_work_buf2);
+        return;
+    }
     lv_disp_draw_buf_init(&_draw_buf, sram_work_buf1, sram_work_buf2, SCREEN_WIDTH * sram_lines);
+    TEST_LOG("lv_disp_draw_buf_init done, lines=%u", (unsigned int)sram_lines);
 
     lv_disp_drv_init(&_disp_drv);
     _disp_drv.hor_res = SCREEN_WIDTH;
@@ -391,9 +595,10 @@ void DisplayMgr::StartLVGL() {
     _disp_drv.user_data = this;
     _disp_drv.full_refresh = 0;
     _disp_drv.direct_mode = 0;
-    _disp_drv.antialiasing = 0;
+    _disp_drv.antialiasing = 1;
 
     lv_disp_drv_register(&_disp_drv);
+    TEST_LOG("lv_disp_drv_register done");
 
     static lv_fs_drv_t fs_drv;
     lv_fs_drv_init(&fs_drv);
@@ -405,6 +610,7 @@ void DisplayMgr::StartLVGL() {
     fs_drv.tell_cb = sd_fs_tell;
     fs_drv.user_data = this;
     lv_fs_drv_register(&fs_drv);
+    TEST_LOG("lv_fs_drv_register done");
 
     #if LV_USE_PNG
     lv_png_init();
@@ -415,13 +621,18 @@ void DisplayMgr::StartLVGL() {
 
     size_t total_psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
     size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    Serial.printf("[PSRAM] Total: %d, Free: %d, Used: %d bytes\n",
-                  total_psram, free_psram, total_psram - free_psram);
+    TEST_LOG("[PSRAM] Total: %d, Free: %d, Used: %d bytes",
+             total_psram, free_psram, total_psram - free_psram);
 }
 
 void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_p)
 {
     DisplayMgr* self = (DisplayMgr*)drv->user_data;
+
+    if (!self || !self->gfx) {
+        lv_disp_flush_ready(drv);
+        return;
+    }
 
     if (self && self->gfx) {
         if (!s_usePseudoDoubleBuffer) {
@@ -435,8 +646,6 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
                     xSemaphoreTake(s_vsyncSem, pdMS_TO_TICKS(2));
                 }
                 s_flushFrameStarted = true;
-                s_cacheWbStart = UINTPTR_MAX;
-                s_cacheWbEnd = 0;
             }
 
             uint16_t* fb = self->_fb_buf[0];
@@ -444,24 +653,58 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
                 uint32_t w = lv_area_get_width(area);
                 uint32_t h = lv_area_get_height(area);
                 uint16_t* src = (uint16_t*)color_p;
-                for (uint32_t y = 0; y < h; ++y) {
-                    size_t dstOff = (size_t)(area->y1 + y) * SCREEN_WIDTH + (size_t)area->x1;
-                    uint16_t* dst = &fb[dstOff];
-                    size_t rowBytes = w * sizeof(uint16_t);
-                    memcpy(dst, &src[y * w], rowBytes);
-                    uintptr_t rowStart = (uintptr_t)dst;
-                    uintptr_t rowEnd = rowStart + rowBytes;
-                    if (rowStart < s_cacheWbStart) s_cacheWbStart = rowStart;
-                    if (rowEnd > s_cacheWbEnd) s_cacheWbEnd = rowEnd;
+                size_t rowBytes = w * sizeof(uint16_t);
+                uint32_t copyStartUs = (uint32_t)esp_timer_get_time();
+                if (!DISPLAY_ROTATE_180) {
+                    bool fullWidth = (area->x1 == 0) && (w == SCREEN_WIDTH);
+                    uintptr_t firstRow = 0;
+                    if (fullWidth && h > 0) {
+                        size_t firstOff = (size_t)area->y1 * SCREEN_WIDTH;
+                        firstRow = (uintptr_t)(&fb[firstOff]);
+                    }
+
+                    for (uint32_t y = 0; y < h; ++y) {
+                        size_t dstOff = (size_t)(area->y1 + y) * SCREEN_WIDTH + (size_t)area->x1;
+                        uint16_t* dst = &fb[dstOff];
+                        memcpy(dst, &src[y * w], rowBytes);
+                        if (!fullWidth) {
+                            cache_writeback_span(dst, rowBytes);
+                        }
+                    }
+
+                    if (fullWidth && firstRow) {
+                        cache_writeback_span((const void*)firstRow, rowBytes * h);
+                    }
+                } else {
+                    lv_area_t dstArea = rotate_area_180(area);
+                    for (uint32_t sy = 0; sy < h; ++sy) {
+                        uint32_t dy = (uint32_t)dstArea.y1 + (h - 1 - sy);
+                        uint16_t* dst = &fb[(size_t)dy * SCREEN_WIDTH + (size_t)dstArea.x1];
+                        uint16_t* d = dst + (w - 1);
+                        const uint16_t* s = &src[sy * w];
+                        for (uint32_t sx = 0; sx < w; ++sx) {
+                            *d-- = *s++;
+                        }
+                        cache_writeback_span(dst, rowBytes);
+                    }
                 }
+
+                uint32_t copyUs = (uint32_t)((uint64_t)esp_timer_get_time() - (uint64_t)copyStartUs);
+                s_singleFlushAreaCount++;
+                s_singleFlushPixelCount += (w * h);
+                s_singleFlushCopyTimeUs += copyUs;
+                if (copyUs > s_singleFlushMaxCopyUs) {
+                    s_singleFlushMaxCopyUs = copyUs;
+                }
+            } else if (!s_loggedNullFrontFb) {
+                s_loggedNullFrontFb = true;
+                Serial.println("[DisplayMgr] Warning: front FB is null in flush");
             }
 
             if (lv_disp_flush_is_last(drv)) {
                 s_swapReqCount++;
-                if (s_cacheWbStart < s_cacheWbEnd) {
-                    cache_writeback_span((const void*)s_cacheWbStart, (size_t)(s_cacheWbEnd - s_cacheWbStart));
-                }
                 s_swapDoneCount++;
+                s_singleFlushFrameCount++;
                 s_flushFrameStarted = false;
             }
 
@@ -480,6 +723,7 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
             (area->y1 == 0) &&
             (area->x2 == (SCREEN_WIDTH - 1)) &&
             (area->y2 == (SCREEN_HEIGHT - 1));
+        lv_area_t writeArea = DISPLAY_ROTATE_180 ? rotate_area_180(area) : *area;
 
         if (isFullFrame) {
             s_frameHasFullRefreshArea = true;
@@ -498,7 +742,7 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
             }
 
             // Store dirty area for replay; merge fragments to reduce copy cost.
-            add_dirty_area_merged(area);
+            add_dirty_area_merged(&writeArea);
         }
 
         uint16_t* fb = self->_fb_buf[self->_backFbIndex];
@@ -506,10 +750,25 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
             uint32_t w = lv_area_get_width(area);
             uint32_t h = lv_area_get_height(area);
             uint16_t* src = (uint16_t*)color_p;
-            for (uint32_t y = 0; y < h; ++y) {
-                size_t dstOff = (size_t)(area->y1 + y) * SCREEN_WIDTH + (size_t)area->x1;
-                memcpy(&fb[dstOff], &src[y * w], w * sizeof(uint16_t));
+            if (!DISPLAY_ROTATE_180) {
+                for (uint32_t y = 0; y < h; ++y) {
+                    size_t dstOff = (size_t)(area->y1 + y) * SCREEN_WIDTH + (size_t)area->x1;
+                    memcpy(&fb[dstOff], &src[y * w], w * sizeof(uint16_t));
+                }
+            } else {
+                for (uint32_t sy = 0; sy < h; ++sy) {
+                    uint32_t dy = (uint32_t)writeArea.y1 + (h - 1 - sy);
+                    uint16_t* dst = &fb[(size_t)dy * SCREEN_WIDTH + (size_t)writeArea.x1];
+                    uint16_t* d = dst + (w - 1);
+                    const uint16_t* s = &src[sy * w];
+                    for (uint32_t sx = 0; sx < w; ++sx) {
+                        *d-- = *s++;
+                    }
+                }
             }
+        } else if (!s_loggedNullBackFb) {
+            s_loggedNullBackFb = true;
+            Serial.println("[DisplayMgr] Warning: back FB is null in flush");
         }
 
         if (lv_disp_flush_is_last(drv)) {
@@ -564,7 +823,16 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
                 }
             }
 
-            self->gfx->setFrameBuffer(self->_fb_buf[self->_backFbIndex]);
+            uint16_t* swapFb = self->_fb_buf[self->_backFbIndex];
+            if (!swapFb) {
+                swapFb = self->_fb_buf[self->_frontFbIndex];
+            }
+            if (!swapFb) {
+                lv_disp_flush_ready(drv);
+                return;
+            }
+
+            self->gfx->setFrameBuffer(swapFb);
             self->gfx->flush();
             s_swapDoneCount++;
 
@@ -618,6 +886,7 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
 
 bool DisplayMgr::PlayGifFromSD(const char* path)
 {
+    TEST_LOG("PlayGifFromSD path=%s", path ? path : "(null)");
     if (!_lvglInitialized || path == nullptr || path[0] == '\0') return false;
 
     String lvPath(path);
@@ -630,7 +899,7 @@ bool DisplayMgr::PlayGifFromSD(const char* path)
     }
 
     if (!SD.exists(sdPath.c_str())) {
-        Serial.printf("[DisplayMgr] GIF not found on SD: %s\n", sdPath.c_str());
+        TEST_LOG("GIF not found on SD: %s", sdPath.c_str());
         return false;
     }
 
@@ -645,18 +914,20 @@ bool DisplayMgr::PlayGifFromSD(const char* path)
         Serial.println("[DisplayMgr] lv_gif_create failed");
         return false;
     }
+    lv_obj_add_event_cb(_splashGif, splash_gif_event_cb, LV_EVENT_READY, nullptr);
 
     lv_gif_set_src(_splashGif, lvPath.c_str());
 #if LV_USE_GIF
-    lv_timer_set_period(((lv_gif_t*)_splashGif)->timer, 8);
+    lv_timer_set_period(((lv_gif_t*)_splashGif)->timer, 3);
 #endif
     lv_obj_center(_splashGif);
-    Serial.printf("[DisplayMgr] GIF started: %s\n", lvPath.c_str());
+    TEST_LOG("GIF started: %s", lvPath.c_str());
     return true;
 }
 
 bool DisplayMgr::PlayGifFromMemory(const GIFMemory& gifMem)
 {
+    TEST_LOG("PlayGifFromMemory size=%u", (unsigned int)gifMem.size);
     if (!_lvglInitialized || gifMem.data == nullptr || gifMem.size == 0) return false;
 
     lv_obj_t* screen = lv_scr_act();
@@ -670,6 +941,7 @@ bool DisplayMgr::PlayGifFromMemory(const GIFMemory& gifMem)
         Serial.println("[DisplayMgr] lv_gif_create failed");
         return false;
     }
+    lv_obj_add_event_cb(_splashGif, splash_gif_event_cb, LV_EVENT_READY, nullptr);
 
     _splashGifDsc.header.always_zero = 0;
     _splashGifDsc.header.cf = LV_IMG_CF_RAW;
@@ -680,10 +952,10 @@ bool DisplayMgr::PlayGifFromMemory(const GIFMemory& gifMem)
 
     lv_gif_set_src(_splashGif, &_splashGifDsc);
 #if LV_USE_GIF
-    lv_timer_set_period(((lv_gif_t*)_splashGif)->timer, 8);
+    lv_timer_set_period(((lv_gif_t*)_splashGif)->timer, 3);
 #endif
     lv_obj_center(_splashGif);
-    Serial.printf("[DisplayMgr] GIF started from PSRAM: %u bytes\n", (unsigned int)gifMem.size);
+    TEST_LOG("GIF started from PSRAM: %u bytes", (unsigned int)gifMem.size);
     return true;
 }
 
@@ -691,16 +963,37 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
 {
     DisplayMgr* self = static_cast<DisplayMgr*>(pvParameters);
     SystemAPI* system = SystemAPI::getInstance();
+    TEST_LINE();
+    if (!self || !system) {
+        Serial.println("[DisplayMgr] Critical: PlayGifTask self/system null");
+        vTaskDelete(NULL);
+        return;
+    }
     s_splashActive = true;
+
+    if (!self->_gfxInitialized || !self->gfx || !self->_fb_buf[self->_frontFbIndex]) {
+        Serial.println("[DisplayMgr] Critical: PlayGifTask entered without valid gfx/front FB");
+        s_splashActive = false;
+        vTaskDelete(NULL);
+        return;
+    }
 
     self->gfx->setFrameBuffer(self->_fb_buf[self->_frontFbIndex]);
     self->gfx->fillScreen(0x0000);
     self->gfx->flush();
+    TEST_LOG("splash pre-clear done");
 
     self->StartLVGL();
+    if (!self->_lvglInitialized) {
+        Serial.println("[DisplayMgr] Critical: StartLVGL failed in PlayGifTask");
+        s_splashActive = false;
+        vTaskDelete(NULL);
+        return;
+    }
 
     bool splashStarted = false;
     if (system->LockLvgl(pdMS_TO_TICKS(100))) {
+        TEST_LOG("LockLvgl acquired for splash start");
         lv_obj_t* screen = lv_scr_act();
         lv_obj_clean(screen);
         lv_obj_set_style_bg_color(screen, lv_color_black(), LV_PART_MAIN);
@@ -723,33 +1016,53 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
         lv_obj_invalidate(screen);
 
         system->UnlockLvgl();
+        TEST_LOG("LockLvgl released after splash start");
+    } else {
+        TEST_LOG("LockLvgl timeout at splash start");
     }
 
     if (!splashStarted) {
-        Serial.printf("[DisplayMgr] GIF start failed: %s\n", self->_pendingGifPath.c_str());
+        TEST_LOG("GIF start failed: %s", self->_pendingGifPath.c_str());
     }
 
+    s_splashGifReady = false;
     TickType_t startTick = xTaskGetTickCount();
-    const TickType_t splashDuration = pdMS_TO_TICKS(12000);
-    while ((xTaskGetTickCount() - startTick) < splashDuration) {
+    const TickType_t minSplashDuration = pdMS_TO_TICKS(1200);
+    const TickType_t maxSplashDuration = pdMS_TO_TICKS(12000);
+    while (true) {
         if (ulTaskNotifyTake(pdTRUE, 0)) break;
+
+        bool splashReady = false;
         if (system->LockLvgl(pdMS_TO_TICKS(20))) {
             lv_timer_handler();
+            splashReady = s_splashGifReady;
             system->UnlockLvgl();
         }
-        vTaskDelay(pdMS_TO_TICKS(8));
+
+        TickType_t elapsed = xTaskGetTickCount() - startTick;
+        if (splashReady && elapsed >= minSplashDuration) {
+            Serial.println("[DisplayMgr] Splash finished by GIF READY");
+            break;
+        }
+        if (elapsed >= maxSplashDuration) {
+            Serial.println("[DisplayMgr] Splash finished by timeout");
+            break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(4));
     }
 
     bool uiReady = false;
     for (int i = 0; i < 30; ++i) {
         if(system->LockLvgl(pdMS_TO_TICKS(100))) {
+            TEST_LOG("LockLvgl acquired for UI transition, try=%d", i);
             lv_obj_t* screen = lv_scr_act();
             if (self->_splashGif) {
                 lv_obj_del(self->_splashGif);
                 self->_splashGif = nullptr;
             }
-            lv_obj_clean(screen);
-            GaugeInit();
+            show_gauge_screen_locked(system);
+
             lv_obj_invalidate(screen);
             // Force at least one render pass before leaving splash task.
             lv_timer_handler();
@@ -767,8 +1080,8 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
 
     // Reclaim PSRAM used by splash GIF as soon as splash phase is done.
     system->storageSubscriber.SetEvent(STORAGE_CLEAR_LOADED_PSRAM);
-    // Delay monitor bars briefly after splash to avoid heavy concurrent redraw with needle ceremony.
-    s_monitorResumeTick = xTaskGetTickCount() + pdMS_TO_TICKS(5000);
+    // Allow monitor updates immediately; UI layer handles startup ceremony blending.
+    s_monitorResumeTick = 0;
 
     // Reuse GifTask as the persistent LVGL task to avoid dynamic task allocation failures.
     self->_lvglTaskHandler = xTaskGetCurrentTaskHandle();
@@ -792,10 +1105,42 @@ void DisplayMgr::Subscribe(void* pvParameters)
                 case DISPLAY_SHOW_SPLASH:
                 {
                     self->_pendingGifPath = String("S:") + String(event.data);
+                    TEST_LOG("DISPLAY_SHOW_SPLASH path=%s", self->_pendingGifPath.c_str());
 
                     if (self->_gifTaskHandler == nullptr) {
-                        Serial.printf("[DisplayMgr] Starting LVGL GIF Task: %s\n", self->_pendingGifPath.c_str());
-                        xTaskCreatePinnedToCore(DisplayMgr::PlayGifTask, "GifTask", GIF_TASK_STACK_WORDS, self, 5, &self->_gifTaskHandler, 1);
+                        TEST_LOG("Starting LVGL GIF Task: %s", self->_pendingGifPath.c_str());
+                        BaseType_t ret = xTaskCreatePinnedToCore(
+                            DisplayMgr::PlayGifTask, "GifTask", GIF_TASK_STACK_WORDS, self, 5, &self->_gifTaskHandler, 1
+                        );
+                        if (ret != pdPASS) {
+                            Serial.println("[DisplayMgr] Critical: GifTask create failed");
+                        } else {
+                            TEST_LOG("GifTask created");
+                        }
+                    }
+                    break;
+                }
+                case DISPLAY_SHOW_GOODBYE:
+                {
+                    TEST_LOG("DISPLAY_SHOW_GOODBYE");
+                    if (system->LockLvgl(pdMS_TO_TICKS(120))) {
+                        show_goodbye_screen_locked();
+                        lv_timer_handler();
+                        system->UnlockLvgl();
+                    } else {
+                        TEST_LOG("DISPLAY_SHOW_GOODBYE lock timeout");
+                    }
+                    break;
+                }
+                case DISPLAY_SHOW_GAUGE_REBOOT:
+                {
+                    TEST_LOG("DISPLAY_SHOW_GAUGE_REBOOT");
+                    if (system->LockLvgl(pdMS_TO_TICKS(180))) {
+                        show_gauge_screen_locked(system);
+                        lv_timer_handler();
+                        system->UnlockLvgl();
+                    } else {
+                        TEST_LOG("DISPLAY_SHOW_GAUGE_REBOOT lock timeout");
                     }
                     break;
                 }
@@ -825,8 +1170,15 @@ void DisplayMgr::HandleLvglTask(void *pvParameters)
 {
     DisplayMgr* self = static_cast<DisplayMgr*>(pvParameters);
     SystemAPI* system = SystemAPI::getInstance();
+    TEST_LINE();
+    if (!self || !system) {
+        Serial.println("[DisplayMgr] Critical: HandleLvglTask self/system null");
+        vTaskDelete(NULL);
+        return;
+    }
     TickType_t xLastWakeTime = xTaskGetTickCount();
     TickType_t lastMonTick = xLastWakeTime;
+    TickType_t lastUiTick = xLastWakeTime;
     TickType_t lastSyncLogTick = xLastWakeTime;
     uint32_t prevReq = 0;
     uint32_t prevDone = 0;
@@ -834,6 +1186,10 @@ void DisplayMgr::HandleLvglTask(void *pvParameters)
     uint32_t prevForced = 0;
     uint32_t prevBypass = 0;
     uint32_t prevVsync = 0;
+    uint32_t prevSingleArea = 0;
+    uint32_t prevSingleFrame = 0;
+    uint32_t prevSinglePixel = 0;
+    uint64_t prevSingleCopyUs = 0;
     Serial.println("[DisplayMgr] LvglTask started");
 
     while (true) {
@@ -842,20 +1198,31 @@ void DisplayMgr::HandleLvglTask(void *pvParameters)
 
             TickType_t now = xTaskGetTickCount();
             if (!s_splashActive &&
-                (now - lastMonTick) >= pdMS_TO_TICKS(1000) &&
-                (s_monitorResumeTick == 0 || now >= s_monitorResumeTick)) {
-                size_t total = heap_caps_get_total_size(MALLOC_CAP_8BIT);
-                size_t free = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-                int32_t ram = (total > 0) ? (int32_t)(((total - free) * 100U) / total) : 0;
-
-                uint8_t core0 = 0;
-                uint8_t core1 = 0;
-                if (sample_cpu_usage(&core0, &core1)) {
-                    update_system_monitor(ram, core0, core1);
-                } else {
-                    update_system_monitor(ram, 0, 0);
+                (now - lastUiTick) >= UI_SHARED_UPDATE_PERIOD_TICKS) {
+                UiSharedState snap = {};
+                if (system->GetUiSharedSnapshot(&snap, 0)) {
+                    apply_shared_ui_state(snap);
                 }
-                lastMonTick = now;
+                lastUiTick = now;
+            }
+
+            if (!s_splashActive &&
+                (now - lastMonTick) >= MONITOR_UPDATE_PERIOD_TICKS &&
+                (s_monitorResumeTick == 0 || now >= s_monitorResumeTick)) {
+                // if (lv_anim_count_running() == 0) {
+                    size_t total = heap_caps_get_total_size(MALLOC_CAP_8BIT);
+                    size_t free = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+                    int32_t ram = (total > 0) ? (int32_t)(((total - free) * 100U) / total) : 0;
+
+                    uint8_t core0 = 0;
+                    uint8_t core1 = 0;
+                    if (sample_cpu_usage(&core0, &core1)) {
+                        update_system_monitor(ram, core0, core1);
+                    } else {
+                        update_system_monitor(ram, 0, 0);
+                    }
+                    lastMonTick = now;
+                // }
             }
 
             if ((now - lastSyncLogTick) >= pdMS_TO_TICKS(2000)) {
@@ -865,26 +1232,43 @@ void DisplayMgr::HandleLvglTask(void *pvParameters)
                 uint32_t bypass = s_replayBypassCount;
                 uint32_t forced = s_swapForcedOnTimeoutCount;
                 uint32_t vs = s_vsyncCount;
-                Serial.printf("[DisplayMgr][SYNC] req:+%u done:+%u skip:+%u forced:+%u bypass:+%u vsync:+%u\n",
-                              (unsigned int)(req - prevReq),
-                              (unsigned int)(done - prevDone),
-                              (unsigned int)(skip - prevSkip),
-                              (unsigned int)(forced - prevForced),
-                              (unsigned int)(bypass - prevBypass),
-                              (unsigned int)(vs - prevVsync));
+                uint32_t sfArea = s_singleFlushAreaCount;
+                uint32_t sfFrame = s_singleFlushFrameCount;
+                uint32_t sfPixel = s_singleFlushPixelCount;
+                uint64_t sfCopyUs = s_singleFlushCopyTimeUs;
+                uint32_t sfMaxUs = s_singleFlushMaxCopyUs;
+                // Serial.printf("[DisplayMgr][SYNC] req:+%u done:+%u skip:+%u forced:+%u bypass:+%u vsync:+%u\n",
+                //               (unsigned int)(req - prevReq),
+                //               (unsigned int)(done - prevDone),
+                //               (unsigned int)(skip - prevSkip),
+                //               (unsigned int)(forced - prevForced),
+                //               (unsigned int)(bypass - prevBypass),
+                //               (unsigned int)(vs - prevVsync));
+                // Serial.printf("[DisplayMgr][FLUSH1] mode:%s frame:+%u area:+%u px:+%u copy_us:+%llu max_us:%u\n",
+                //               s_usePseudoDoubleBuffer ? "DBL" : "SGL",
+                //               (unsigned int)(sfFrame - prevSingleFrame),
+                //               (unsigned int)(sfArea - prevSingleArea),
+                //               (unsigned int)(sfPixel - prevSinglePixel),
+                //               (unsigned long long)(sfCopyUs - prevSingleCopyUs),
+                //               (unsigned int)sfMaxUs);
                 prevReq = req;
                 prevDone = done;
                 prevSkip = skip;
                 prevForced = forced;
                 prevBypass = bypass;
                 prevVsync = vs;
+                prevSingleArea = sfArea;
+                prevSingleFrame = sfFrame;
+                prevSinglePixel = sfPixel;
+                prevSingleCopyUs = sfCopyUs;
+                s_singleFlushMaxCopyUs = 0;
                 lastSyncLogTick = now;
             }
 
             system->UnlockLvgl();
         }
 
-        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(41));
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(16));
     }
 }
 

@@ -1,19 +1,28 @@
 #include <StorageMgr.h>
 #include <CommonApi.h>
 
+#define TEST_LOG(fmt, ...) Serial.printf("[StorageMgr] " fmt "\n", ##__VA_ARGS__)
+#define TEST_LINE() Serial.printf("[StorageMgr] %s\n", __func__)
+
 void StorageMgr::Init()
 {
+    TEST_LINE();
     if(!SD.begin(TF_CS, SPI, 40000000))
     {
         Serial.println("[StorageMgr] SD Card Mount Failed");
+        TEST_LOG("SD.begin failed");
     }
     else
     {
         Serial.println("[StorageMgr] SD Card Mounted Successfully");
+        TEST_LOG("SD.begin success");
         this->ScanDirectory("/", 0);
+        TEST_LOG("ScanDirectory finished, entries=%u", (unsigned int)this->fileList.size());
 
         SystemAPI* system = SystemAPI::getInstance();
+        TEST_LOG("SystemAPI ptr=%p", system);
         if (system->LockGif(pdMS_TO_TICKS(500))) {
+            TEST_LOG("LockGif acquired");
             GIFMemory* objPtr = system->GetPsramObjPtr();
             if (objPtr) {
                 if (objPtr->data != nullptr) {
@@ -23,13 +32,16 @@ void StorageMgr::Init()
                 }
                 *objPtr = this->LoadGifToPSRAM("/anim/splash.gif");
                 system->isGifLoaded = (objPtr->data != nullptr);
-                Serial.printf("[StorageMgr] Splash GIF preload: %s (%u bytes)\n",
-                              system->isGifLoaded ? "OK" : "FAIL",
-                              (unsigned int)objPtr->size);
+                TEST_LOG("Splash GIF preload: %s (%u bytes)",
+                         system->isGifLoaded ? "OK" : "FAIL",
+                         (unsigned int)objPtr->size);
+                TEST_LOG("preload result loaded=%d size=%u",
+                         system->isGifLoaded ? 1 : 0, (unsigned int)objPtr->size);
             }
             system->UnlockGif();
         } else {
             Serial.println("[StorageMgr] Splash GIF preload skipped (gif mutex timeout)");
+            TEST_LOG("LockGif timeout");
         }
 
         if (taskHandler != NULL) {
@@ -37,19 +49,26 @@ void StorageMgr::Init()
             taskHandler = NULL;
         }
 
-        xTaskCreate(
+        BaseType_t ret = xTaskCreatePinnedToCore(
             StorageMgr::Subscribe,
             "StorageEventSubscriber",
             8192,
             this,
             1,
-            &taskHandler
+            &taskHandler,
+            0
         );
+        if (ret != pdPASS) {
+            Serial.println("[StorageMgr] Critical: StorageEventSubscriber task create failed");
+        } else {
+            TEST_LOG("StorageEventSubscriber task created");
+        }
     }
 }
 
 void StorageMgr::Subscribe(void* pvParameters)
 {
+    TEST_LINE();
     StorageMgr* self = static_cast<StorageMgr*>(pvParameters);
     SystemAPI* system = SystemAPI::getInstance();
     StorageEventSubscriber& subscriber = system->storageSubscriber;
@@ -60,7 +79,7 @@ void StorageMgr::Subscribe(void* pvParameters)
     {
         if(subscriber.ReceiveEvent(&event, portMAX_DELAY))
         {
-            Serial.printf("[StorageMgr] Subscribe: %d\n", event.type);
+            TEST_LOG("Subscribe: %d", event.type);
             switch(event.type)
             {
                 case STORAGE_EVENT_TYPE::STORAGE_EVENT_NONE:
@@ -123,7 +142,7 @@ void StorageMgr::Subscribe(void* pvParameters)
                     break;
                 }
                 default:
-                    Serial.printf("[StorageMgr] Subscribe: Wrong Event type : %d\n", event.type);
+                    TEST_LOG("Subscribe: Wrong Event type : %d", event.type);
                     break;
             }
         }
@@ -150,7 +169,7 @@ void StorageMgr::ScanDirectory(const char* path, uint8_t depth)
         this->fileList.push_back(node);
         if (entry.isDirectory())
         {
-            Serial.printf("[StorageMgr] Dir: %s Depth: %d\n", entry.name(), depth);
+            TEST_LOG("Dir: %s Depth: %d", entry.name(), depth);
 
             if (String(entry.name()) != String("System Volume Information"))
             {
@@ -167,7 +186,7 @@ void StorageMgr::ScanDirectory(const char* path, uint8_t depth)
         }
         else
         {
-            Serial.printf("[StorageMgr] File: %s Depth: %d Size: %u bytes\n", entry.name(), depth, entry.size());
+            TEST_LOG("File: %s Depth: %d Size: %u bytes", entry.name(), depth, entry.size());
         }
         entry.close();
     }
@@ -209,18 +228,19 @@ bool StorageMgr::SDRemove(const char* path)
 }
 
 GIFMemory StorageMgr::LoadGifToPSRAM(const char* path) {
+    TEST_LOG("LoadGifToPSRAM path=%s", path ? path : "(null)");
     GIFMemory mem;
 
     File f = SD.open(path, FILE_READ);
     if (!f || f.isDirectory()) {
-        Serial.printf("[StorageMgr] Load PSRAM Error: Cannot open %s\n", path);
+        TEST_LOG("Load PSRAM Error: Cannot open %s", path);
         return mem;
     }
 
     size_t fileSize = f.size();
     mem.data = (uint8_t*)heap_caps_malloc(fileSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (mem.data == nullptr) {
-        Serial.printf("[StorageMgr] Load PSRAM Error: Failed to allocate %u bytes\n", (unsigned int)fileSize);
+        TEST_LOG("Load PSRAM Error: Failed to allocate %u bytes", (unsigned int)fileSize);
         f.close();
         return mem;
     }
@@ -229,18 +249,20 @@ GIFMemory StorageMgr::LoadGifToPSRAM(const char* path) {
     f.close();
 
     if (bytesRead != fileSize) {
-        Serial.printf("[StorageMgr] Load PSRAM Error: Read mismatch (%u/%u)\n",
-                      (unsigned int)bytesRead, (unsigned int)fileSize);
+        TEST_LOG("Load PSRAM Error: Read mismatch (%u/%u)",
+                 (unsigned int)bytesRead, (unsigned int)fileSize);
         heap_caps_free(mem.data);
         mem.data = nullptr;
         return mem;
     }
 
     mem.size = fileSize;
+    TEST_LOG("LoadGifToPSRAM success size=%u", (unsigned int)mem.size);
     return mem;
 }
 
 void StorageMgr::FreeGifFromPSRAM(GIFMemory& mem) {
+    TEST_LOG("FreeGifFromPSRAM data=%p size=%u", mem.data, (unsigned int)mem.size);
     if (mem.data != nullptr) {
         heap_caps_free(mem.data);
         mem.data = nullptr;

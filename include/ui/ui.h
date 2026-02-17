@@ -62,6 +62,8 @@ typedef struct {
 } monitor_item_t;
 
 void GaugeInit();
+void UiResetRuntimeState(void);
+void DrawGoodbyeScreenDummy(void);
 void GaugeSetValue(int16_t value);
 void GaugeSetNeedleAngle(int16_t angle);
 void CreateMainBackground();
@@ -74,6 +76,14 @@ void update_monitor_ui(monitor_item_t * item, int32_t usage);
 void update_system_monitor(int32_t ram_percent, int32_t core1_percent, int32_t core2_percent);
 void update_coolant_gauge(int32_t val);
 void update_battery_gauge(int32_t val);
+void update_obd_gauges(bool obd_connected, bool coolant_valid, int32_t coolant_val, bool battery_valid, int32_t battery_val);
+void update_clock_text(const char* text);
+void update_wifi_icon_connected(int32_t rssi);
+void update_wifi_icon_disconnected(void);
+void update_bt_icon_connected(void);
+void update_bt_icon_disconnected(void);
+void update_obd_icon_connected(void);
+void update_obd_icon_disconnected(void);
 
 #ifdef __cplusplus
 } /*extern "C"*/

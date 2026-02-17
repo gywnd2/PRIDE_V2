@@ -3,6 +3,10 @@
 #include <ObdMgr.h>
 #include <StorageMgr.h>
 #include <DisplayMgr.h>
+#include <string.h>
+
+#define TEST_LOG(fmt, ...) Serial.printf("[SystemAPI] " fmt "\n", ##__VA_ARGS__)
+#define TEST_LINE() Serial.printf("[SystemAPI] %s\n", __func__)
 
 SystemAPI* SystemAPI::_instance = nullptr;
 
@@ -13,17 +17,27 @@ SystemAPI::SystemAPI()
 
 void SystemAPI::Init()
 {
+    TEST_LINE();
     gifObj.data = nullptr;
     gifObj.size = 0;
     isGifLoaded = false;
+    memset(&uiState, 0, sizeof(uiState));
+    uiState.wifiRssi = -100;
 
     if (_gifMutex == NULL) {
         _gifMutex = xSemaphoreCreateMutex();
     }
+    TEST_LOG("gif mutex=%p", _gifMutex);
 
     if (_lvglMutex == NULL) {
         _lvglMutex = xSemaphoreCreateMutex();
     }
+    TEST_LOG("lvgl mutex=%p", _lvglMutex);
+
+    if (_uiStateMutex == NULL) {
+        _uiStateMutex = xSemaphoreCreateMutex();
+    }
+    TEST_LOG("ui state mutex=%p", _uiStateMutex);
 }
 
 // ----------------------------------------------------------------
@@ -66,7 +80,10 @@ void SoundEventSubscriber::SetEvent(SOUND_EVENT_TYPE type, int track) {
     SoundEventData data;
     data.type = type;
     data.track = track;
-    xQueueSend(_queue, &data, 0);
+    BaseType_t ok = xQueueSend(_queue, &data, 0);
+    if (ok != pdTRUE) {
+        TEST_LOG("sound queue full, drop type=%d track=%d", (int)type, track);
+    }
 }
 
 bool SoundEventSubscriber::ReceiveEvent(SoundEventData* event, TickType_t waitTime) {
@@ -142,6 +159,20 @@ bool SystemAPI::GetOBDConnected() {
     return false;
 }
 
+bool SystemAPI::IsObdCommConnected() {
+    return (obdMgr != nullptr) && (obdMgr->GetOBDStatus() == OBD_CONNECTED);
+}
+
+bool SystemAPI::IsObdDisconnected() {
+    return (obdMgr != nullptr) && (obdMgr->GetOBDStatus() == OBD_DISCONNECTED);
+}
+
+bool SystemAPI::IsDisplayReady() {
+    return (displayMgr != nullptr) &&
+           displayMgr->IsLvglInitialized() &&
+           displayMgr->IsSplashFinished();
+}
+
 Stream* SystemAPI::GetBtStream() {
     if (btMgr) return btMgr->GetBleStream();
     return nullptr;
@@ -149,6 +180,115 @@ Stream* SystemAPI::GetBtStream() {
 
 GIFMemory* SystemAPI::GetPsramObjPtr() {
     return &gifObj;
+}
+
+void SystemAPI::PublishWifiState(bool connected, int32_t rssi) {
+    if (LockUiState(pdMS_TO_TICKS(20))) {
+        uiState.wifiConnected = connected;
+        uiState.wifiRssi = rssi;
+        UnlockUiState();
+    }
+}
+
+void SystemAPI::PublishClockText(const char* hhmm) {
+    if (!hhmm || hhmm[0] == '\0') return;
+    if (LockUiState(pdMS_TO_TICKS(20))) {
+        strncpy(uiState.clockText, hhmm, sizeof(uiState.clockText) - 1);
+        uiState.clockText[sizeof(uiState.clockText) - 1] = '\0';
+        uiState.clockValid = true;
+        UnlockUiState();
+    }
+}
+
+void SystemAPI::PublishBtConnected(bool connected) {
+    if (LockUiState(pdMS_TO_TICKS(20))) {
+        uiState.btConnected = connected;
+        UnlockUiState();
+    }
+}
+
+void SystemAPI::PublishObdStatus(int status) {
+    if (LockUiState(pdMS_TO_TICKS(20))) {
+        uiState.obdStatus = status;
+        UnlockUiState();
+    }
+}
+
+void SystemAPI::PublishObdCoolant(uint16_t coolant) {
+    if (LockUiState(pdMS_TO_TICKS(20))) {
+        uiState.coolant = coolant;
+        uiState.coolantValid = true;
+        UnlockUiState();
+    }
+}
+
+void SystemAPI::PublishObdBatteryVoltage(uint16_t voltage) {
+    if (LockUiState(pdMS_TO_TICKS(20))) {
+        uiState.batteryVoltage = voltage;
+        uiState.batteryValid = true;
+        UnlockUiState();
+    }
+}
+
+bool SystemAPI::GetUiSharedSnapshot(UiSharedState* out, TickType_t waitTime) {
+    if (!out) return false;
+    if (!LockUiState(waitTime)) return false;
+    *out = uiState;
+    UnlockUiState();
+    return true;
+}
+
+bool SystemAPI::GetUiWifiState(bool* connected, int32_t* rssi, TickType_t waitTime) {
+    if (!connected) return false;
+    if (!LockUiState(waitTime)) return false;
+    *connected = uiState.wifiConnected;
+    if (rssi) *rssi = uiState.wifiRssi;
+    UnlockUiState();
+    return true;
+}
+
+bool SystemAPI::GetUiClockText(char* out, size_t outLen, TickType_t waitTime) {
+    if (!out || outLen == 0) return false;
+    if (!LockUiState(waitTime)) return false;
+    strncpy(out, uiState.clockText, outLen - 1);
+    out[outLen - 1] = '\0';
+    bool valid = uiState.clockValid;
+    UnlockUiState();
+    return valid;
+}
+
+bool SystemAPI::GetUiBtConnected(bool* connected, TickType_t waitTime) {
+    if (!connected) return false;
+    if (!LockUiState(waitTime)) return false;
+    *connected = uiState.btConnected;
+    UnlockUiState();
+    return true;
+}
+
+bool SystemAPI::GetUiObdStatus(int* status, TickType_t waitTime) {
+    if (!status) return false;
+    if (!LockUiState(waitTime)) return false;
+    *status = uiState.obdStatus;
+    UnlockUiState();
+    return true;
+}
+
+bool SystemAPI::GetUiCoolant(uint16_t* coolant, bool* valid, TickType_t waitTime) {
+    if (!coolant) return false;
+    if (!LockUiState(waitTime)) return false;
+    *coolant = uiState.coolant;
+    if (valid) *valid = uiState.coolantValid;
+    UnlockUiState();
+    return true;
+}
+
+bool SystemAPI::GetUiBatteryVoltage(uint16_t* voltage, bool* valid, TickType_t waitTime) {
+    if (!voltage) return false;
+    if (!LockUiState(waitTime)) return false;
+    *voltage = uiState.batteryVoltage;
+    if (valid) *valid = uiState.batteryValid;
+    UnlockUiState();
+    return true;
 }
 
 bool SystemAPI::LockGif(TickType_t waitTime) {
@@ -165,4 +305,12 @@ bool SystemAPI::LockLvgl(TickType_t waitTime) {
 
 void SystemAPI::UnlockLvgl() {
     if (_lvglMutex) xSemaphoreGive(_lvglMutex);
+}
+
+bool SystemAPI::LockUiState(TickType_t waitTime) {
+    return (_uiStateMutex) ? (xSemaphoreTake(_uiStateMutex, waitTime) == pdTRUE) : false;
+}
+
+void SystemAPI::UnlockUiState() {
+    if (_uiStateMutex) xSemaphoreGive(_uiStateMutex);
 }

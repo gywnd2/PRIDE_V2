@@ -12,6 +12,13 @@ struct GIFMemory;
 class DisplayMgr
 {
     private:
+        enum DisplayMgrEvent
+        {
+            DISPLAY_MGR_EVENT_NONE = 0,
+            DISPLAY_MGR_EVENT_SHOW_GOODBYE,
+            DISPLAY_MGR_EVENT_SHOW_GAUGE_REBOOT
+        };
+
         Arduino_ESP32RGBPanel *rgbPanel = nullptr;
         Arduino_RGB_Display *gfx = nullptr;
         bool _gfxInitialized = false;

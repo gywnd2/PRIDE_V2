@@ -5,90 +5,94 @@
 #include <BluetoothMgr.h>
 #include <ObdMgr.h>
 #include <Mp3Mgr.h>
+#include <WifiMgr.h>
 #include <ui.h>
+
+#define TEST_LOG(fmt, ...) Serial.printf("[Main] " fmt "\n", ##__VA_ARGS__)
 
 DisplayMgr* displayMgr   = nullptr;
 StorageMgr* storageMgr   = nullptr;
 Mp3Mgr* mp3Mgr           = nullptr;
 ObdMgr* obdMgr           = nullptr;
 BluetoothMgr* bluetoothMgr = nullptr;
+WifiMgr* wifiMgr = nullptr;
 
 void setup()
 {
     Serial.begin(115200);
+    TEST_LOG("setup begin");
+    Serial.println("[Build] bt-guard-20260216-03");
+
     SystemAPI* system = SystemAPI::getInstance();
+    TEST_LOG("SystemAPI::getInstance done, ptr=%p", system);
     system->Init();
+    TEST_LOG("SystemAPI::Init done");
 
+    TEST_LOG("create StorageMgr");
     storageMgr = new StorageMgr();
+    TEST_LOG("StorageMgr created ptr=%p", storageMgr);
     storageMgr->Init();
+    TEST_LOG("StorageMgr::Init done");
     system->registerStorage(storageMgr);
+    TEST_LOG("registerStorage done");
 
+    TEST_LOG("create Mp3Mgr");
     mp3Mgr = new Mp3Mgr();
+    TEST_LOG("Mp3Mgr created ptr=%p", mp3Mgr);
     mp3Mgr->Init();
+    TEST_LOG("Mp3Mgr::Init done");
     system->registerMp3(mp3Mgr);
+    TEST_LOG("registerMp3 done");
 
-    displayMgr = new DisplayMgr();
-    displayMgr->Init();
-    system->registerDisplay(displayMgr);
-
-    system->PlaySplash();
-
+    TEST_LOG("create BluetoothMgr");
     bluetoothMgr = new BluetoothMgr();
+    TEST_LOG("BluetoothMgr created ptr=%p", bluetoothMgr);
     bluetoothMgr->Init("PRIDE_V2");
+    TEST_LOG("BluetoothMgr::Init done");
     system->registerBt(bluetoothMgr);
+    TEST_LOG("registerBt done");
 
+    TEST_LOG("create ObdMgr");
     obdMgr = new ObdMgr();
+    TEST_LOG("ObdMgr created ptr=%p", obdMgr);
     system->registerObd(obdMgr);
+    TEST_LOG("registerObd done");
     obdMgr->Init();
+    TEST_LOG("ObdMgr::Init done");
+
+    TEST_LOG("create DisplayMgr");
+    displayMgr = new DisplayMgr();
+    TEST_LOG("DisplayMgr created ptr=%p", displayMgr);
+    displayMgr->Init();
+    TEST_LOG("DisplayMgr::Init done");
+    system->registerDisplay(displayMgr);
+    TEST_LOG("registerDisplay done");
+
+    TEST_LOG("create WifiMgr");
+    wifiMgr = new WifiMgr();
+    TEST_LOG("WifiMgr created ptr=%p", wifiMgr);
+    wifiMgr->Init();
+    TEST_LOG("WifiMgr::Init done");
+    system->registerWifi(wifiMgr);
+    TEST_LOG("registerWifi done");
+
+    TEST_LOG("PlaySplash event send");
+    system->PlaySplash();
+    TEST_LOG("setup end");
 }
 
 void loop()
 {
-    static SystemAPI* system = SystemAPI::getInstance();
-
-    static uint32_t startTime = 0;
-    static int step = 0; // ì§„í–‰ ?¨ê³„ë¥?ê¸°ë¡
-
     if (Serial.available() > 0) {
-        // ?œë¦¬??ë²„í¼?ì„œ ë¬¸ìž???½ê¸°
         String input = Serial.readStringUntil('\n');
-        input.trim(); // ê³µë°±?´ë‚˜ ì¤„ë°”ê¿??œê±°
+        input.trim();
 
         if (input == "reset") {
             Serial.println("[System] Reset command received. Rebooting...");
-            delay(500); // ë©”ì‹œì§€ê°€ ?„ì†¡???œê°„??? ì‹œ ë²Œì–´ì¤?
-            ESP.restart(); // ESP32 ?Œí”„?¸ì›¨??ë¦¬ì…‹
-        }
-    }
-
-    if(displayMgr->IsSplashFinished())
-    {
-        if(startTime == 0) {
-            startTime = millis(); // ?œìž‘ ?œê°„ ê¸°ë¡
-        }
-        uint32_t elapsed = millis() - startTime;
-
-        // 2. ????ë²ˆì”©ë§??œì°¨?ìœ¼ë¡??¤í–‰?˜ë„ë¡?êµ¬ì¡° ë³€ê²?
-        if (system->LockLvgl(pdMS_TO_TICKS(10))) {
-            if (step == 0 && elapsed >= 1000) {
-                update_coolant_gauge(150);
-                update_battery_gauge(20);
-                step = 1;
-            }
-            else if (step == 1 && elapsed >= 2500) {
-                update_coolant_gauge(0);
-                update_battery_gauge(0);
-                step = 2;
-            }
-            else if (step == 2 && elapsed >= 4000) {
-                update_coolant_gauge(90);
-                update_battery_gauge(18);
-                step = 3; // ?´ì œ ???´ìƒ ?¤í–‰ ????
-            }
-            system->UnlockLvgl();
+            delay(500);
+            ESP.restart();
         }
     }
 
     vTaskDelay(pdMS_TO_TICKS(50));
 }
-

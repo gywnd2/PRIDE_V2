@@ -38,11 +38,23 @@ public:
 class BluetoothMgr
 {
     private:
+        enum BluetoothMgrEvent
+        {
+            BLUETOOTH_MGR_EVENT_NONE = 0,
+            BLUETOOTH_MGR_EVENT_CONNECT_OBD,
+            BLUETOOTH_MGR_EVENT_DISCONNECT,
+            BLUETOOTH_MGR_EVENT_RESET_CONNECTION
+        };
+
         NimBLEClient* pClient = nullptr;
         NimBLEStream bleStream;
 
         uint8_t obd_addr[6] = {0x01, 0x23, 0x45, 0x67, 0x89, 0xba};
         TaskHandle_t taskHandler = nullptr;
+        TaskHandle_t connectObdTaskHandler = nullptr;
+        volatile bool connectObdTaskRunning = false;
+        uint32_t lastObdConnectRequestMs = 0;
+        static constexpr uint32_t OBD_CONNECT_RETRY_INTERVAL_MS = 10000;
         bool isConnected = false;
 
         static void Subscribe(void* pvParameters);
