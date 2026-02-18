@@ -91,6 +91,17 @@ void loop()
             Serial.println("[System] Reset command received. Rebooting...");
             delay(500);
             ESP.restart();
+        } else if (input == "outtemp") {
+            if (obdMgr == nullptr) {
+                TEST_LOG("not supported query");
+            } else {
+                float outsideTempC = 0.0f;
+                if (obdMgr->QueryOutsideTemp(outsideTempC)) {
+                    TEST_LOG("outtemp: %.1f C", outsideTempC);
+                } else {
+                    TEST_LOG("not supported query");
+                }
+            }
         }
     }
 

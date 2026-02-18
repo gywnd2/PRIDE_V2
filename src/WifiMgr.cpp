@@ -6,6 +6,44 @@
 #define TEST_LOG(fmt, ...) Serial.printf("[WifiMgr] " fmt "\n", ##__VA_ARGS__)
 #define TEST_LINE() Serial.printf("[WifiMgr] %s\n", __func__)
 
+static bool s_wifiEventHookRegistered = false;
+
+static const char* wifi_reason_hint(int reason)
+{
+    // Common reason codes observed on ESP32/IDF variants.
+    // Keep this lightweight and conservative.
+    switch (reason) {
+        case 2:   // AUTH_EXPIRE
+        case 15:  // 4WAY_HANDSHAKE_TIMEOUT
+        case 202: // AUTH_FAIL
+        case 203: // ASSOC_FAIL
+        case 204: // HANDSHAKE_TIMEOUT
+            return "auth failure possible (check password/security)";
+        case 201: // NO_AP_FOUND
+            return "AP not found/weak signal";
+        default:
+            return "check reason code in esp_wifi docs";
+    }
+}
+
+static void wifi_event_logger(WiFiEvent_t event, WiFiEventInfo_t info)
+{
+#if defined(ARDUINO_EVENT_WIFI_STA_DISCONNECTED)
+    if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+        int reason = (int)info.wifi_sta_disconnected.reason;
+        TEST_LOG("STA disconnected event: reason=%d (%s)", reason, wifi_reason_hint(reason));
+    }
+#elif defined(SYSTEM_EVENT_STA_DISCONNECTED)
+    if (event == SYSTEM_EVENT_STA_DISCONNECTED) {
+        int reason = (int)info.wifi_sta_disconnected.reason;
+        TEST_LOG("STA disconnected event: reason=%d (%s)", reason, wifi_reason_hint(reason));
+    }
+#else
+    (void)event;
+    (void)info;
+#endif
+}
+
 static int32_t clamp_rssi(int32_t rssi)
 {
     if (rssi > -40) return -40;
@@ -13,9 +51,57 @@ static int32_t clamp_rssi(int32_t rssi)
     return rssi;
 }
 
+static bool has_wifi_credentials()
+{
+    const bool cred1 = (WIFI_CRED_SSID1[0] != '\0' &&
+                        WIFI_CRED_PASSWORD1[0] != '\0');
+    const bool cred2 = (WIFI_CRED_SSID2[0] != '\0' &&
+                        WIFI_CRED_PASSWORD2[0] != '\0');
+    return cred1 || cred2;
+}
+
+static uint8_t get_wifi_cred_count()
+{
+    uint8_t count = 0;
+    if (WIFI_CRED_SSID1[0] != '\0' && WIFI_CRED_PASSWORD1[0] != '\0') count++;
+    if (WIFI_CRED_SSID2[0] != '\0' && WIFI_CRED_PASSWORD2[0] != '\0') count++;
+    return count;
+}
+
+static bool get_wifi_credential_by_order(uint8_t order, const char** ssid, const char** password, uint8_t* slot)
+{
+    if (!ssid || !password || !slot) return false;
+
+    uint8_t idx = 0;
+    if (WIFI_CRED_SSID1[0] != '\0' && WIFI_CRED_PASSWORD1[0] != '\0') {
+        if (idx == order) {
+            *ssid = WIFI_CRED_SSID1;
+            *password = WIFI_CRED_PASSWORD1;
+            *slot = 1;
+            return true;
+        }
+        idx++;
+    }
+    if (WIFI_CRED_SSID2[0] != '\0' && WIFI_CRED_PASSWORD2[0] != '\0') {
+        if (idx == order) {
+            *ssid = WIFI_CRED_SSID2;
+            *password = WIFI_CRED_PASSWORD2;
+            *slot = 2;
+            return true;
+        }
+    }
+    return false;
+}
+
 void WifiMgr::Init()
 {
     TEST_LINE();
+    TEST_LOG("credential loaded=%d", (int)WIFI_CRED_LOADED);
+    if (!s_wifiEventHookRegistered) {
+        WiFi.onEvent(wifi_event_logger);
+        s_wifiEventHookRegistered = true;
+        TEST_LOG("Wi-Fi event logger registered");
+    }
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
     WiFi.disconnect(false, false);
@@ -114,8 +200,21 @@ void WifiMgr::ConnectTask(void* pvParameters)
 
     uint32_t lastAttemptMs = 0;
     bool wasConnected = false;
+    uint8_t nextCredOrder = 0;
+    uint32_t attemptCount = 0;
 
     while (true) {
+        if (!has_wifi_credentials()) {
+            static bool missingLogged = false;
+            if (!missingLogged) {
+                Serial.println("[WifiMgr] Missing wifi_credentials.txt (SSID/PASSWORD). Wi-Fi connect disabled.");
+                missingLogged = true;
+            }
+            self->PublishWifiState(false, -100);
+            vTaskDelay(pdMS_TO_TICKS(WIFI_RETRY_INTERVAL_MS));
+            continue;
+        }
+
         wl_status_t status = WiFi.status();
         if (status == WL_CONNECTED) {
             if (!wasConnected) {
@@ -141,18 +240,55 @@ void WifiMgr::ConnectTask(void* pvParameters)
         uint32_t now = millis();
         if ((now - lastAttemptMs) >= WIFI_RETRY_INTERVAL_MS) {
             lastAttemptMs = now;
+            attemptCount++;
 
-            TEST_LOG("Connecting to SSID: %s", WIFI_SSID);
-            WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+            const char* ssid = nullptr;
+            const char* password = nullptr;
+            uint8_t slot = 0;
+            uint8_t credCount = get_wifi_cred_count();
+            if (credCount == 0 || !get_wifi_credential_by_order(nextCredOrder, &ssid, &password, &slot)) {
+                Serial.println("[WifiMgr] No valid credential pair available");
+                vTaskDelay(pdMS_TO_TICKS(200));
+                continue;
+            }
+            nextCredOrder = (uint8_t)((nextCredOrder + 1) % credCount);
+
+            TEST_LOG("Wi-Fi retry #%u: credential #%u, SSID=\"%s\"",
+                     (unsigned int)attemptCount,
+                     (unsigned int)slot,
+                     ssid);
+
+            // Ensure previous connecting state is cleared before changing STA config.
+            WiFi.disconnect(false, false);
+            vTaskDelay(pdMS_TO_TICKS(120));
+            WiFi.begin(ssid, password);
 
             uint32_t beginMs = millis();
-            while (WiFi.status() != WL_CONNECTED &&
-                   (millis() - beginMs) < WIFI_CONNECT_TIMEOUT_MS) {
+            while ((millis() - beginMs) < WIFI_CONNECT_TIMEOUT_MS) {
+                wl_status_t waitStatus = WiFi.status();
+                if (waitStatus == WL_CONNECTED ||
+                    waitStatus == WL_CONNECT_FAILED ||
+                    waitStatus == WL_NO_SSID_AVAIL) {
+                    break;
+                }
                 vTaskDelay(pdMS_TO_TICKS(250));
             }
 
-            if (WiFi.status() != WL_CONNECTED) {
-                Serial.println("[WifiMgr] Connect failed, retry in 5s");
+            wl_status_t finalStatus = WiFi.status();
+            if (finalStatus != WL_CONNECTED) {
+                if (finalStatus == WL_NO_SSID_AVAIL) {
+                    TEST_LOG("Connect failed (#%u, SSID=\"%s\"): SSID not found",
+                             (unsigned int)slot, ssid);
+                } else if (finalStatus == WL_CONNECT_FAILED) {
+                    TEST_LOG("Connect failed (#%u, SSID=\"%s\"): auth failed (check password)",
+                             (unsigned int)slot, ssid);
+                } else {
+                    TEST_LOG("Connect failed (#%u, SSID=\"%s\"): status=%d (retry in 5s)",
+                             (unsigned int)slot, ssid, (int)finalStatus);
+                }
+                // Keep next attempt clean and avoid ESP_ERR_WIFI_STATE.
+                WiFi.disconnect(false, false);
+                vTaskDelay(pdMS_TO_TICKS(120));
             }
         }
 

@@ -74,6 +74,8 @@ private:
 
     bool LockData(TickType_t waitTime);
     void UnlockData();
+    bool TryLockObdQuery();
+    void UnlockObdQuery();
     void PostEvent(ObdMgrEventType type);
     bool StartConnectTask();
     bool StartQueryTask();
@@ -109,6 +111,7 @@ public:
     void SetMafRate(float val);
     void SetOBDStatus(int status);
     int GetOBDStatus(void);
+    bool QueryOutsideTemp(float& outsideTempC);
 };
 
 #endif

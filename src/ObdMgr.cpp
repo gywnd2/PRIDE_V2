@@ -17,6 +17,8 @@ String ObdStatusStr[8] =
     "OBD Disconnected"
 };
 
+static portMUX_TYPE s_obdBusyMux = portMUX_INITIALIZER_UNLOCKED;
+
 bool ObdMgr::LockData(TickType_t waitTime)
 {
     return (_dataMutex != nullptr) && (xSemaphoreTake(_dataMutex, waitTime) == pdTRUE);
@@ -25,6 +27,25 @@ bool ObdMgr::LockData(TickType_t waitTime)
 void ObdMgr::UnlockData()
 {
     if (_dataMutex) xSemaphoreGive(_dataMutex);
+}
+
+bool ObdMgr::TryLockObdQuery()
+{
+    bool locked = false;
+    portENTER_CRITICAL(&s_obdBusyMux);
+    if (!obd_busy) {
+        obd_busy = true;
+        locked = true;
+    }
+    portEXIT_CRITICAL(&s_obdBusyMux);
+    return locked;
+}
+
+void ObdMgr::UnlockObdQuery()
+{
+    portENTER_CRITICAL(&s_obdBusyMux);
+    obd_busy = false;
+    portEXIT_CRITICAL(&s_obdBusyMux);
 }
 
 void ObdMgr::PostEvent(ObdMgrEventType type)
@@ -353,6 +374,35 @@ void ObdMgr::QueryRPM(uint16_t &rpm_value)
 #endif
 }
 
+bool ObdMgr::QueryOutsideTemp(float& outsideTempC)
+{
+#ifdef OBD_SIMUL_MODE
+    outsideTempC = (float)(rand() % 40) - 10.0f;
+    return true;
+#else
+    outsideTempC = 0.0f;
+    if (GetOBDStatus() != OBD_CONNECTED) return false;
+    if (!TryLockObdQuery()) return false;
+
+    bool success = false;
+    const int maxAttempts = 40; // ~2s at 50ms intervals
+    for (int i = 0; i < maxAttempts; ++i) {
+        outsideTempC = myELM327.ambientAirTemp();
+        if (myELM327.nb_rx_state == ELM_SUCCESS) {
+            success = true;
+            break;
+        }
+        if (myELM327.nb_rx_state != ELM_GETTING_MSG) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    UnlockObdQuery();
+    return success;
+#endif
+}
+
 void ObdMgr::QueryOBDData(void *param)
 {
     TEST_LINE();
@@ -376,9 +426,8 @@ void ObdMgr::QueryOBDData(void *param)
 
         if (current_time - last_rpm_time >= 500)
         {
-            if (!self->obd_busy)
+            if (self->TryLockObdQuery())
             {
-                self->obd_busy = true;
                 self->QueryRPM(data.rpm);
                 if (data.rpm != OBD_QUERY_INVALID_RESPONSE) {
                     self->SetRPM(data.rpm);
@@ -387,23 +436,22 @@ void ObdMgr::QueryOBDData(void *param)
                         self->PostEvent(OBD_MGR_EVENT_RPM_SUCCESS);
                     }
                 }
-                self->obd_busy = false;
+                self->UnlockObdQuery();
             }
             last_rpm_time = current_time;
         }
 
-        if (current_time - last_query_time >= 30000)
+        if (current_time - last_query_time >= 28150)
         {
-            if (!self->obd_busy)
+            if (self->TryLockObdQuery())
             {
-                self->obd_busy = true;
                 self->QueryVoltage(data.voltage);
                 self->SetVoltageLevel(data.voltage);
                 self->QueryCoolant(data.coolant);
                 self->SetCoolantTemp(data.coolant);
                 self->QueryDistAfterErrorClear(data.distance);
                 self->SetDistance(data.distance);
-                self->obd_busy = false;
+                self->UnlockObdQuery();
             }
             last_query_time = current_time;
         }

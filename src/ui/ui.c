@@ -326,7 +326,7 @@ void create_outside_temp()
     lv_obj_set_style_text_font(label_outside, &lv_font_montserrat_24, 0);
 
     lv_obj_t * label_val = lv_label_create(temp_cont);
-    lv_label_set_text(label_val, "25°C");
+    lv_label_set_text(label_val, "--°C");
     lv_obj_set_style_text_color(label_val, lv_color_white(), 0);
     lv_obj_set_style_text_font(label_val, &lv_font_montserrat_36, 0);
 }
@@ -334,7 +334,7 @@ void create_outside_temp()
 void create_clock()
 {
     clock_label = lv_label_create(lv_scr_act());
-    lv_label_set_text(clock_label, "00:00");
+    lv_label_set_text(clock_label, "--:--");
     lv_obj_set_style_text_color(clock_label, lv_color_white(), 0);
     lv_obj_set_style_text_font(clock_label, &lv_font_montserrat_36, 0);
     lv_obj_align(clock_label, LV_ALIGN_TOP_RIGHT, -30, 10);
