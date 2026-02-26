@@ -21,7 +21,7 @@ extern "C" int Cache_WriteBack_Addr(uint32_t addr, uint32_t size);
 #define TEST_LOG(fmt, ...) Serial.printf("[DisplayMgr] " fmt "\n", ##__VA_ARGS__)
 #define TEST_LINE() Serial.printf("[DisplayMgr] %s\n", __func__)
 
-static constexpr uint32_t GIF_TASK_STACK_WORDS = 6144;
+static constexpr uint32_t GIF_TASK_STACK_WORDS = 8192;
 
 static SemaphoreHandle_t s_vsyncSem = nullptr;
 static volatile uint32_t s_vsyncCount = 0;
@@ -88,6 +88,28 @@ static inline void cache_writeback_span(const void* ptr, size_t bytes)
     LV_UNUSED(ptr);
     LV_UNUSED(bytes);
 #endif
+}
+
+static inline void cache_writeback_area(uint16_t* fb, const lv_area_t* area)
+{
+    if (!fb || !area) return;
+
+    uint32_t w = lv_area_get_width(area);
+    uint32_t h = lv_area_get_height(area);
+    if (w == 0 || h == 0) return;
+
+    size_t rowBytes = (size_t)w * sizeof(uint16_t);
+    bool fullWidth = (area->x1 == 0) && (w == SCREEN_WIDTH);
+    if (fullWidth) {
+        size_t off = (size_t)area->y1 * SCREEN_WIDTH;
+        cache_writeback_span(&fb[off], rowBytes * h);
+        return;
+    }
+
+    for (uint32_t y = 0; y < h; ++y) {
+        size_t off = (size_t)(area->y1 + y) * SCREEN_WIDTH + (size_t)area->x1;
+        cache_writeback_span(&fb[off], rowBytes);
+    }
 }
 
 static inline bool area_can_merge(const lv_area_t* a, const lv_area_t* b)
@@ -212,17 +234,13 @@ static void apply_shared_ui_state(const UiSharedState& s)
     if (s.clockValid && s.clockText[0] != '\0') {
         update_clock_text(s.clockText);
     }
+    update_outside_temp((int32_t)s.outsideTempC, s.outsideTempValid);
 
-    if (s.obdStatus == OBD_DISCONNECTED) {
-        update_bt_icon_disconnected();
-        update_obd_icon_disconnected();
-    } else {
-        if (s.btConnected) update_bt_icon_connected();
-        else update_bt_icon_disconnected();
+    if (s.btConnected) update_bt_icon_connected();
+    else update_bt_icon_disconnected();
 
-        if (s.obdStatus == OBD_CONNECTED) update_obd_icon_connected();
-        else update_obd_icon_disconnected();
-    }
+    if (s.obdStatus == OBD_CONNECTED) update_obd_icon_connected();
+    else update_obd_icon_disconnected();
 
     update_obd_gauges(
         s.obdStatus == OBD_CONNECTED,
@@ -238,10 +256,21 @@ static void show_goodbye_screen_locked()
 
     lv_obj_clean(screen);
     UiResetRuntimeState();
-    lv_obj_set_style_bg_color(screen, lv_color_black(), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(screen, lv_color_black(), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    // Force a full-screen black redraw so goodbye transition is always visible.
+    lv_obj_t* blackout = lv_obj_create(screen);
+    lv_obj_remove_style_all(blackout);
+    lv_obj_set_size(blackout, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_pos(blackout, 0, 0);
+    lv_obj_set_style_bg_color(blackout, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(blackout, LV_OPA_COVER, 0);
+
     DrawGoodbyeScreenDummy();
     lv_obj_invalidate(screen);
+    lv_refr_now(lv_disp_get_default());
+    TEST_LOG("Goodbye screen applied, children=%u", (unsigned int)lv_obj_get_child_cnt(screen));
     s_goodbyeScreenActive = true;
 }
 
@@ -519,7 +548,7 @@ void DisplayMgr::Init()
     BaseType_t taskRet = xTaskCreatePinnedToCore(
         DisplayMgr::Subscribe,
         "DisplaySub",
-        4096,
+        6144,
         this,
         4,
         &this->_eventTaskHandler,
@@ -595,7 +624,7 @@ void DisplayMgr::StartLVGL() {
     _disp_drv.user_data = this;
     _disp_drv.full_refresh = 0;
     _disp_drv.direct_mode = 0;
-    _disp_drv.antialiasing = 1;
+    _disp_drv.antialiasing = 0;
 
     lv_disp_drv_register(&_disp_drv);
     TEST_LOG("lv_disp_drv_register done");
@@ -737,6 +766,7 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
                 uint16_t* back = self->_fb_buf[self->_backFbIndex];
                 if (front && back) {
                     memcpy(back, front, self->_fb_pixels * sizeof(uint16_t));
+                    cache_writeback_span(back, self->_fb_pixels * sizeof(uint16_t));
                 }
                 s_backBufferSynced = true;
             }
@@ -766,6 +796,7 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
                     }
                 }
             }
+            cache_writeback_area(fb, &writeArea);
         } else if (!s_loggedNullBackFb) {
             s_loggedNullBackFb = true;
             Serial.println("[DisplayMgr] Warning: back FB is null in flush");
@@ -811,6 +842,7 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
                     uint16_t* back = self->_fb_buf[self->_backFbIndex];
                     if (front && back) {
                         memcpy(back, front, self->_fb_pixels * sizeof(uint16_t));
+                        cache_writeback_span(back, self->_fb_pixels * sizeof(uint16_t));
                     }
                     s_backBufferSynced = true;
                     s_dirtyAreaCount = 0;
@@ -872,6 +904,7 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
                             size_t off = (size_t)(a->y1 + y) * SCREEN_WIDTH + (size_t)a->x1;
                             memcpy(&back[off], &front[off], w * sizeof(uint16_t));
                         }
+                        cache_writeback_area(back, a);
                     }
                 }
                 s_backBufferSynced = true;
@@ -918,7 +951,7 @@ bool DisplayMgr::PlayGifFromSD(const char* path)
 
     lv_gif_set_src(_splashGif, lvPath.c_str());
 #if LV_USE_GIF
-    lv_timer_set_period(((lv_gif_t*)_splashGif)->timer, 3);
+    lv_timer_set_period(((lv_gif_t*)_splashGif)->timer, 1);
 #endif
     lv_obj_center(_splashGif);
     TEST_LOG("GIF started: %s", lvPath.c_str());
@@ -1049,7 +1082,7 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
             break;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(4));
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
 
     bool uiReady = false;
@@ -1123,11 +1156,18 @@ void DisplayMgr::Subscribe(void* pvParameters)
                 case DISPLAY_SHOW_GOODBYE:
                 {
                     TEST_LOG("DISPLAY_SHOW_GOODBYE");
-                    if (system->LockLvgl(pdMS_TO_TICKS(120))) {
-                        show_goodbye_screen_locked();
-                        lv_timer_handler();
-                        system->UnlockLvgl();
-                    } else {
+                    bool applied = false;
+                    for (int i = 0; i < 3; ++i) {
+                        if (system->LockLvgl(pdMS_TO_TICKS(120))) {
+                            show_goodbye_screen_locked();
+                            lv_timer_handler();
+                            system->UnlockLvgl();
+                            applied = true;
+                            break;
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(20));
+                    }
+                    if (!applied) {
                         TEST_LOG("DISPLAY_SHOW_GOODBYE lock timeout");
                     }
                     break;

@@ -6,6 +6,8 @@
 #include <vector>
 #include <SPI.h>
 #include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 struct GIFMemory
 {
@@ -28,6 +30,12 @@ class StorageMgr
         void Exists(const char* path);
         File OpenFile(const char* path, const char* mode);
         TaskHandle_t taskHandler = nullptr;
+        SemaphoreHandle_t _logMutex = nullptr;
+        String _activeLogPath;
+        uint32_t _activeLogIndex = 0;
+
+        bool EnsureLogDir();
+        bool PrepareNextLogFileLocked();
 
         static void Subscribe(void* pvParameters);
 
@@ -49,6 +57,8 @@ class StorageMgr
         File SDOpen(const char* path, const char* mode = "r");
         size_t SDReadAll(const char* path, uint8_t* buffer, size_t maxLen);
         bool SDRemove(const char* path);
+        bool AppendRuntimeLogLine(const char* line);
+        String GetActiveLogPath() const { return _activeLogPath; }
 
         GIFMemory LoadGifToPSRAM(const char* path);
         void FreeGifFromPSRAM(GIFMemory& mem);

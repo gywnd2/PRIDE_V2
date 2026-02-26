@@ -6,7 +6,6 @@
 #include <ObdMgr.h>
 #include <Mp3Mgr.h>
 #include <WifiMgr.h>
-#include <ui.h>
 
 #define TEST_LOG(fmt, ...) Serial.printf("[Main] " fmt "\n", ##__VA_ARGS__)
 
@@ -16,6 +15,19 @@ Mp3Mgr* mp3Mgr           = nullptr;
 ObdMgr* obdMgr           = nullptr;
 BluetoothMgr* bluetoothMgr = nullptr;
 WifiMgr* wifiMgr = nullptr;
+
+static bool is_hex4(const String& s)
+{
+    if (s.length() != 4) return false;
+    for (size_t i = 0; i < s.length(); ++i) {
+        char c = s.charAt(i);
+        bool isHex = (c >= '0' && c <= '9') ||
+                     (c >= 'A' && c <= 'F') ||
+                     (c >= 'a' && c <= 'f');
+        if (!isHex) return false;
+    }
+    return true;
+}
 
 void setup()
 {
@@ -86,21 +98,31 @@ void loop()
     if (Serial.available() > 0) {
         String input = Serial.readStringUntil('\n');
         input.trim();
+        String inputLower = input;
+        inputLower.toLowerCase();
 
-        if (input == "reset") {
+        if (inputLower == "reset") {
             Serial.println("[System] Reset command received. Rebooting...");
             delay(500);
             ESP.restart();
-        } else if (input == "outtemp") {
-            if (obdMgr == nullptr) {
-                TEST_LOG("not supported query");
+        } else if (inputLower.startsWith("pid")) {
+            String pid = input.substring(3);
+            pid.trim();
+            pid.toUpperCase();
+
+            if (!is_hex4(pid)) {
+                TEST_LOG("usage: pid 0000 (4 hex)");
+            } else if (obdMgr == nullptr) {
+                TEST_LOG("pid %s fail: obd manager unavailable", pid.c_str());
             } else {
-                float outsideTempC = 0.0f;
-                if (obdMgr->QueryOutsideTemp(outsideTempC)) {
-                    TEST_LOG("outtemp: %.1f C", outsideTempC);
-                } else {
-                    TEST_LOG("not supported query");
-                }
+                String payload;
+                int8_t state = ELM_GENERAL_ERROR;
+                bool ok = obdMgr->QueryPidRaw(pid, payload, state);
+                TEST_LOG("pid %s %s state=%d payload=%s",
+                         pid.c_str(),
+                         ok ? "ok" : "fail",
+                         (int)state,
+                         payload.c_str());
             }
         }
     }

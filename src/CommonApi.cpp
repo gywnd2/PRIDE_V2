@@ -57,7 +57,10 @@ void BtEventSubscriber::SetEvent(BT_EVENT_TYPE type, uint8_t address[6]) {
     data.type = type;
     if (address != nullptr) memcpy(data.address, address, 6);
     else memset(data.address, 0, 6);
-    xQueueSend(_queue, &data, 0);
+    BaseType_t ok = xQueueSend(_queue, &data, 0);
+    if (ok != pdTRUE) {
+        TEST_LOG("bt queue full, drop type=%d", (int)type);
+    }
 }
 
 bool BtEventSubscriber::ReceiveEvent(BtEventData* event, TickType_t waitTime) {
@@ -107,7 +110,10 @@ void DisplayEventSubscriber::SetEvent(DISPLAY_EVENT_TYPE type, const String& dat
     evt.type = type;
     strncpy(evt.data, data.c_str(), sizeof(evt.data) - 1);
     evt.data[sizeof(evt.data) - 1] = '\0';
-    xQueueSend(_queue, &evt, 0);
+    BaseType_t ok = xQueueSend(_queue, &evt, 0);
+    if (ok != pdTRUE) {
+        TEST_LOG("display queue full, drop type=%d", (int)type);
+    }
 }
 
 bool DisplayEventSubscriber::ReceiveEvent(DisplayEventData* event, TickType_t waitTime) {
@@ -131,7 +137,10 @@ void StorageEventSubscriber::SetEvent(STORAGE_EVENT_TYPE type, const String& pat
     evt.type = type;
     strncpy(evt.filePath, path.c_str(), sizeof(evt.filePath) - 1);
     evt.filePath[sizeof(evt.filePath) - 1] = '\0';
-    xQueueSend(_queue, &evt, 0);
+    BaseType_t ok = xQueueSend(_queue, &evt, 0);
+    if (ok != pdTRUE) {
+        TEST_LOG("storage queue full, drop type=%d path=%s", (int)type, evt.filePath);
+    }
 }
 
 bool StorageEventSubscriber::ReceiveEvent(StorageEventData* event, TickType_t waitTime) {
@@ -182,6 +191,11 @@ GIFMemory* SystemAPI::GetPsramObjPtr() {
     return &gifObj;
 }
 
+void SystemAPI::AppendStorageLog(const char* line) {
+    if (!storageMgr || !line || line[0] == '\0') return;
+    storageSubscriber.SetEvent(STORAGE_APPEND_LOG, String(line));
+}
+
 void SystemAPI::PublishWifiState(bool connected, int32_t rssi) {
     if (LockUiState(pdMS_TO_TICKS(20))) {
         uiState.wifiConnected = connected;
@@ -196,6 +210,18 @@ void SystemAPI::PublishClockText(const char* hhmm) {
         strncpy(uiState.clockText, hhmm, sizeof(uiState.clockText) - 1);
         uiState.clockText[sizeof(uiState.clockText) - 1] = '\0';
         uiState.clockValid = true;
+        UnlockUiState();
+    }
+}
+
+void SystemAPI::PublishWeatherText(const char* city, const char* weather) {
+    if (!city || !weather || city[0] == '\0' || weather[0] == '\0') return;
+    if (LockUiState(pdMS_TO_TICKS(20))) {
+        strncpy(uiState.cityText, city, sizeof(uiState.cityText) - 1);
+        uiState.cityText[sizeof(uiState.cityText) - 1] = '\0';
+        strncpy(uiState.weatherText, weather, sizeof(uiState.weatherText) - 1);
+        uiState.weatherText[sizeof(uiState.weatherText) - 1] = '\0';
+        uiState.weatherValid = true;
         UnlockUiState();
     }
 }
@@ -230,6 +256,14 @@ void SystemAPI::PublishObdBatteryVoltage(uint16_t voltage) {
     }
 }
 
+void SystemAPI::PublishObdOutsideTemp(int16_t tempC, bool valid) {
+    if (LockUiState(pdMS_TO_TICKS(20))) {
+        uiState.outsideTempC = tempC;
+        uiState.outsideTempValid = valid;
+        UnlockUiState();
+    }
+}
+
 bool SystemAPI::GetUiSharedSnapshot(UiSharedState* out, TickType_t waitTime) {
     if (!out) return false;
     if (!LockUiState(waitTime)) return false;
@@ -255,6 +289,19 @@ bool SystemAPI::GetUiClockText(char* out, size_t outLen, TickType_t waitTime) {
     bool valid = uiState.clockValid;
     UnlockUiState();
     return valid;
+}
+
+bool SystemAPI::GetUiWeather(char* outCity, size_t cityLen, char* outWeather, size_t weatherLen, bool* valid, TickType_t waitTime) {
+    if (!outCity || cityLen == 0 || !outWeather || weatherLen == 0) return false;
+    if (!LockUiState(waitTime)) return false;
+    strncpy(outCity, uiState.cityText, cityLen - 1);
+    outCity[cityLen - 1] = '\0';
+    strncpy(outWeather, uiState.weatherText, weatherLen - 1);
+    outWeather[weatherLen - 1] = '\0';
+    if (valid) *valid = uiState.weatherValid;
+    bool hasData = uiState.weatherValid;
+    UnlockUiState();
+    return hasData;
 }
 
 bool SystemAPI::GetUiBtConnected(bool* connected, TickType_t waitTime) {
@@ -287,6 +334,15 @@ bool SystemAPI::GetUiBatteryVoltage(uint16_t* voltage, bool* valid, TickType_t w
     if (!LockUiState(waitTime)) return false;
     *voltage = uiState.batteryVoltage;
     if (valid) *valid = uiState.batteryValid;
+    UnlockUiState();
+    return true;
+}
+
+bool SystemAPI::GetUiOutsideTemp(int16_t* tempC, bool* valid, TickType_t waitTime) {
+    if (!tempC) return false;
+    if (!LockUiState(waitTime)) return false;
+    *tempC = uiState.outsideTempC;
+    if (valid) *valid = uiState.outsideTempValid;
     UnlockUiState();
     return true;
 }

@@ -4,6 +4,9 @@
 #define TEST_LOG(fmt, ...) Serial.printf("[StorageMgr] " fmt "\n", ##__VA_ARGS__)
 #define TEST_LINE() Serial.printf("[StorageMgr] %s\n", __func__)
 
+static constexpr const char* STORAGE_LOG_DIR = "/log";
+static constexpr uint32_t STORAGE_LOG_MAX_INDEX = 9999;
+
 void StorageMgr::Init()
 {
     TEST_LINE();
@@ -16,6 +19,15 @@ void StorageMgr::Init()
     {
         Serial.println("[StorageMgr] SD Card Mounted Successfully");
         TEST_LOG("SD.begin success");
+        if (_logMutex == nullptr) {
+            _logMutex = xSemaphoreCreateMutex();
+        }
+        TEST_LOG("log mutex=%p", _logMutex);
+        if (_logMutex && xSemaphoreTake(_logMutex, pdMS_TO_TICKS(300)) == pdTRUE) {
+            PrepareNextLogFileLocked();
+            xSemaphoreGive(_logMutex);
+        }
+
         this->ScanDirectory("/", 0);
         TEST_LOG("ScanDirectory finished, entries=%u", (unsigned int)this->fileList.size());
 
@@ -141,6 +153,13 @@ void StorageMgr::Subscribe(void* pvParameters)
                     }
                     break;
                 }
+                case STORAGE_EVENT_TYPE::STORAGE_APPEND_LOG:
+                {
+                    if (!self->AppendRuntimeLogLine(event.filePath)) {
+                        TEST_LOG("log append failed");
+                    }
+                    break;
+                }
                 default:
                     TEST_LOG("Subscribe: Wrong Event type : %d", event.type);
                     break;
@@ -152,6 +171,10 @@ void StorageMgr::Subscribe(void* pvParameters)
 
 void StorageMgr::ScanDirectory(const char* path, uint8_t depth)
 {
+    if (depth == 0) {
+        fileList.clear();
+    }
+
     File dir = SD.open(path);
     if(!dir || !dir.isDirectory()) return;
 
@@ -225,6 +248,68 @@ size_t StorageMgr::SDReadAll(const char* path, uint8_t* buffer, size_t maxLen)
 bool StorageMgr::SDRemove(const char* path)
 {
     return SD.remove(path);
+}
+
+bool StorageMgr::EnsureLogDir()
+{
+    if (SD.exists(STORAGE_LOG_DIR)) return true;
+    bool ok = SD.mkdir(STORAGE_LOG_DIR);
+    TEST_LOG("log dir create %s (ok=%d)", STORAGE_LOG_DIR, ok ? 1 : 0);
+    return ok;
+}
+
+bool StorageMgr::PrepareNextLogFileLocked()
+{
+    if (_activeLogPath.length() > 0) return true;
+    if (!EnsureLogDir()) return false;
+
+    char candidate[32] = {0};
+    for (uint32_t idx = 1; idx <= STORAGE_LOG_MAX_INDEX; ++idx) {
+        snprintf(candidate, sizeof(candidate), "%s/log_%lu.txt",
+                 STORAGE_LOG_DIR, (unsigned long)idx);
+        if (!SD.exists(candidate)) {
+            File f = SD.open(candidate, FILE_WRITE);
+            if (!f) {
+                TEST_LOG("failed to create runtime log file: %s", candidate);
+                return false;
+            }
+            f.printf("[BOOT] runtime log start ms=%lu\n", (unsigned long)millis());
+            f.close();
+
+            _activeLogPath = String(candidate);
+            _activeLogIndex = idx;
+            TEST_LOG("runtime log file=%s", _activeLogPath.c_str());
+            return true;
+        }
+    }
+
+    TEST_LOG("runtime log file index exhausted (max=%lu)",
+             (unsigned long)STORAGE_LOG_MAX_INDEX);
+    return false;
+}
+
+bool StorageMgr::AppendRuntimeLogLine(const char* line)
+{
+    if (!line || line[0] == '\0') return false;
+    if (_logMutex == nullptr) return false;
+    if (xSemaphoreTake(_logMutex, pdMS_TO_TICKS(120)) != pdTRUE) return false;
+
+    bool ok = false;
+    do {
+        if (!PrepareNextLogFileLocked()) break;
+
+        File f = SD.open(_activeLogPath.c_str(), FILE_WRITE);
+        if (!f) {
+            TEST_LOG("failed to open runtime log file: %s", _activeLogPath.c_str());
+            break;
+        }
+        f.printf("[%lu] %s\n", (unsigned long)millis(), line);
+        f.close();
+        ok = true;
+    } while (false);
+
+    xSemaphoreGive(_logMutex);
+    return ok;
 }
 
 GIFMemory StorageMgr::LoadGifToPSRAM(const char* path) {

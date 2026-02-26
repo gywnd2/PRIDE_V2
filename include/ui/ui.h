@@ -55,6 +55,8 @@ LV_IMG_DECLARE(wifi_2);
 LV_IMG_DECLARE(wifi_1);
 LV_IMG_DECLARE(wifi_off);
 LV_IMG_DECLARE(frost);
+LV_IMG_DECLARE(location_avail);
+LV_IMG_DECLARE(location_non);
 
 typedef struct {
     lv_obj_t * bar;
@@ -71,12 +73,14 @@ void CreateMainBackground();
 void create_outside_temp();
 void create_clock();
 void create_gauge();
+void create_weather();
 void create_sys_monitor_panel();
 void update_monitor_ui(monitor_item_t * item, int32_t usage);
 void update_system_monitor(int32_t ram_percent, int32_t core1_percent, int32_t core2_percent);
 void update_coolant_gauge(int32_t val);
 void update_battery_gauge(int32_t val);
 void update_obd_gauges(bool obd_connected, bool coolant_valid, int32_t coolant_val, bool battery_valid, int32_t battery_val);
+void update_outside_temp(int32_t temp_c, bool valid);
 void update_clock_text(const char* text);
 void update_wifi_icon_connected(int32_t rssi);
 void update_wifi_icon_disconnected(void);

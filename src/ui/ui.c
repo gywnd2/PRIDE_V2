@@ -8,6 +8,7 @@ static lv_obj_t * icon_obd = NULL;
 static lv_obj_t * icon_wifi = NULL;
 static lv_obj_t * icon_frost = NULL;
 static lv_obj_t * clock_label = NULL;
+static lv_obj_t * outside_temp_label = NULL;
 static lv_obj_t * main_test_panel = NULL;
 
 static monitor_item_t cpu_core1, cpu_core2, ram_usage;
@@ -325,10 +326,10 @@ void create_outside_temp()
     lv_obj_set_style_text_color(label_outside, lv_color_hex(0xAAAAAA), 0);
     lv_obj_set_style_text_font(label_outside, &lv_font_montserrat_24, 0);
 
-    lv_obj_t * label_val = lv_label_create(temp_cont);
-    lv_label_set_text(label_val, "--°C");
-    lv_obj_set_style_text_color(label_val, lv_color_white(), 0);
-    lv_obj_set_style_text_font(label_val, &lv_font_montserrat_36, 0);
+    outside_temp_label = lv_label_create(temp_cont);
+    lv_label_set_text(outside_temp_label, "--\xC2\xB0" "C");
+    lv_obj_set_style_text_color(outside_temp_label, lv_color_white(), 0);
+    lv_obj_set_style_text_font(outside_temp_label, &lv_font_montserrat_36, 0);
 }
 
 void create_clock()
@@ -474,6 +475,7 @@ void create_gauge()
     icon_obd = create_icon(lv_scr_act(), &obdOff, OBD_X_POS, OBD_Y_POS);
     icon_wifi = create_icon(lv_scr_act(), &wifi_off, WIFI_X_POS, WIFI_Y_POS);
     icon_frost = create_icon(lv_scr_act(), &frost, FROST_X_POS, FROST_Y_POS);
+    lv_obj_add_flag(icon_frost, LV_OBJ_FLAG_HIDDEN);
 }
 
 void update_clock_text(const char* text)
@@ -484,6 +486,30 @@ void update_clock_text(const char* text)
     if (current && strcmp(current, text) == 0) return;
 
     lv_label_set_text(clock_label, text);
+}
+
+void update_outside_temp(int32_t temp_c, bool valid)
+{
+    if (!outside_temp_label) return;
+
+    if (!valid) {
+        if (strcmp(lv_label_get_text(outside_temp_label), "--\xC2\xB0" "C") != 0) {
+            lv_label_set_text(outside_temp_label, "--\xC2\xB0" "C");
+        }
+        if (icon_frost) {
+            lv_obj_add_flag(icon_frost, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+    }
+
+    if (temp_c > 99) temp_c = 99;
+    if (temp_c < -9) temp_c = -9;
+    lv_label_set_text_fmt(outside_temp_label, "%d\xC2\xB0" "C", (int)temp_c);
+
+    if (icon_frost) {
+        if (temp_c < 10) lv_obj_clear_flag(icon_frost, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(icon_frost, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 static const void* get_wifi_icon_from_rssi(int32_t rssi)
@@ -592,6 +618,7 @@ void UiResetRuntimeState(void)
     icon_wifi = NULL;
     icon_frost = NULL;
     clock_label = NULL;
+    outside_temp_label = NULL;
     main_test_panel = NULL;
 
     cpu_core1.bar = NULL;
@@ -605,6 +632,36 @@ void UiResetRuntimeState(void)
 void DrawGoodbyeScreenDummy(void)
 {
     // Placeholder. The user will provide the actual goodbye screen rendering.
+}
+
+void create_weather()
+{
+    lv_obj_t* weather_cont = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(weather_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_align(weather_cont, LV_ALIGN_TOP_LEFT, 250, 15);
+
+    lv_obj_set_style_bg_opa(weather_cont, 0, 0);
+    lv_obj_set_style_border_width(weather_cont, 0, 0);
+    lv_obj_set_style_pad_all(weather_cont, 0, 0);
+    lv_obj_clear_flag(weather_cont, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_set_flex_flow(weather_cont, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(weather_cont, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
+    lv_obj_set_style_pad_column(weather_cont, 10, 0);
+
+    lv_obj_t* location_icon = lv_img_create(weather_cont);
+    lv_img_set_src(location_icon, &location_non);
+    lv_obj_align(location_icon, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t * location_val = lv_label_create(weather_cont);
+    lv_label_set_text(location_val, "Gwangmyeong");
+    lv_obj_set_style_text_color(location_val, lv_color_hex(0xAAAAAA), 0);
+    lv_obj_set_style_text_font(location_val, &lv_font_montserrat_24, 0);
+
+    lv_obj_t * weather_val = lv_label_create(weather_cont);
+    lv_label_set_text(weather_val, "Mostly Cloudy");
+    lv_obj_set_style_text_color(weather_val, lv_color_white(), 0);
+    lv_obj_set_style_text_font(weather_val, &lv_font_montserrat_24, 0);
 }
 
 void DisplayColorTest() {
@@ -658,6 +715,7 @@ void GaugeInit()
     create_clock();
     create_sys_monitor_panel();
     create_gauge();
+    //create_weather();
 
     pending_ram_percent = 0;
     pending_core1_percent = 0;
@@ -694,8 +752,6 @@ void update_system_monitor(int32_t ram_percent, int32_t core1_percent, int32_t c
     update_monitor_ui(&cpu_core1, core1_percent);
     update_monitor_ui(&cpu_core2, core2_percent);
 }
-
-
 
 
 

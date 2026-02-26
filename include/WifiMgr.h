@@ -61,21 +61,25 @@ private:
     static constexpr const char* WIFI_PASSWORD_2 = WIFI_CRED_PASSWORD2;
     static constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 5000;
     static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 10000;
-    static constexpr uint32_t WIFI_STATUS_UPDATE_INTERVAL_MS = 1000;
     static constexpr uint32_t NTP_SYNC_INTERVAL_MS = 3600000;
+    static constexpr uint32_t WEATHER_UPDATE_INTERVAL_MS = 300000;
+    static constexpr uint32_t WEATHER_LOCATION_REFRESH_INTERVAL_MS = 21600000;
+    static constexpr uint32_t WEATHER_REQUEST_TIMEOUT_MS = 8000;
+    static constexpr uint32_t WEATHER_TASK_STACK_SIZE = 10240;
 
     TaskHandle_t _connectTaskHandler = nullptr;
     TaskHandle_t _timeUpdateTaskHandler = nullptr;
-    TaskHandle_t _wifiStatusTaskHandler = nullptr;
-    bool _workerTasksStarted = false;
+    TaskHandle_t _weatherUpdateTaskHandler = nullptr;
 
     static void ConnectTask(void* pvParameters);
     static void TimeUpdateTask(void* pvParameters);
-    static void WifiStatusUpdateTask(void* pvParameters);
+    static void WeatherUpdateTask(void* pvParameters);
 
-    bool TryStartWorkerTasks();
+    bool StartTimeTask();
+    bool StartWeatherTask();
     void PublishWifiState(bool connected, int32_t rssi);
     bool PublishClockText(const char* hhmm);
+    bool PublishWeatherText(const char* city, const char* weather);
 
 public:
     WifiMgr()

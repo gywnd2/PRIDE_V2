@@ -71,7 +71,8 @@ typedef enum
     STORAGE_READ,
     STORAGE_WRITE,
     STORAGE_LOAD_TO_PSRAM,
-    STORAGE_CLEAR_LOADED_PSRAM
+    STORAGE_CLEAR_LOADED_PSRAM,
+    STORAGE_APPEND_LOG
 } STORAGE_EVENT_TYPE;
 
 typedef struct {
@@ -84,6 +85,9 @@ typedef struct {
     int32_t wifiRssi;
     bool clockValid;
     char clockText[6];   // "HH:MM"
+    bool weatherValid;
+    char cityText[64];
+    char weatherText[32];
 
     bool btConnected;
     int obdStatus;
@@ -93,6 +97,9 @@ typedef struct {
 
     bool batteryValid;
     uint16_t batteryVoltage;
+
+    bool outsideTempValid;
+    int16_t outsideTempC;
 } UiSharedState;
 
 // ----------------------------------------------------------------
@@ -207,17 +214,22 @@ public:
     // Shared UI state publish/snapshot
     void PublishWifiState(bool connected, int32_t rssi);
     void PublishClockText(const char* hhmm);
+    void PublishWeatherText(const char* city, const char* weather);
     void PublishBtConnected(bool connected);
     void PublishObdStatus(int status);
     void PublishObdCoolant(uint16_t coolant);
     void PublishObdBatteryVoltage(uint16_t voltage);
+    void PublishObdOutsideTemp(int16_t tempC, bool valid = true);
+    void AppendStorageLog(const char* line);
     bool GetUiSharedSnapshot(UiSharedState* out, TickType_t waitTime = 0);
     bool GetUiWifiState(bool* connected, int32_t* rssi = nullptr, TickType_t waitTime = 0);
     bool GetUiClockText(char* out, size_t outLen, TickType_t waitTime = 0);
+    bool GetUiWeather(char* outCity, size_t cityLen, char* outWeather, size_t weatherLen, bool* valid = nullptr, TickType_t waitTime = 0);
     bool GetUiBtConnected(bool* connected, TickType_t waitTime = 0);
     bool GetUiObdStatus(int* status, TickType_t waitTime = 0);
     bool GetUiCoolant(uint16_t* coolant, bool* valid = nullptr, TickType_t waitTime = 0);
     bool GetUiBatteryVoltage(uint16_t* voltage, bool* valid = nullptr, TickType_t waitTime = 0);
+    bool GetUiOutsideTemp(int16_t* tempC, bool* valid = nullptr, TickType_t waitTime = 0);
 
     // Resource Locking (Thread Safety)
     bool LockGif(TickType_t waitTime = portMAX_DELAY);

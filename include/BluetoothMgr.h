@@ -16,7 +16,8 @@ class NimBLEStream : public Stream
 private:
     std::deque<char> rxBuffer;
     portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
-    NimBLERemoteCharacteristic* pRemoteCharacteristic = nullptr;
+    NimBLERemoteCharacteristic* pNotifyCharacteristic = nullptr;
+    NimBLERemoteCharacteristic* pWriteCharacteristic = nullptr;
 
 public:
     NimBLEStream() {}
@@ -25,6 +26,7 @@ public:
     void onNotify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify);
 
     void setCharacteristic(NimBLERemoteCharacteristic* pChar);
+    void setCharacteristics(NimBLERemoteCharacteristic* pNotifyChar, NimBLERemoteCharacteristic* pWriteChar);
 
     // Stream 인터페이스 구현 (기존과 동일)
     int available() override;

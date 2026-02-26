@@ -7,8 +7,8 @@
 
 #define DFPLAYER_VOLUME 30
 // P4 포트에 맞춰 18, 17로 수정하거나 기존 핀을 사용하세요.
-#define DFPLAYER_RX 18
-#define DFPLAYER_TX 17
+#define DFPLAYER_RX 17
+#define DFPLAYER_TX 18
 
 class Mp3Mgr
 {

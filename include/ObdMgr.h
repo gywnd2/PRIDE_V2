@@ -18,6 +18,8 @@ struct ObdData
     uint16_t voltage;
     uint16_t rpm;
     uint16_t distance;
+    int16_t outside_temp;
+    bool outside_temp_valid;
     float maf_rate;
 };
 
@@ -108,10 +110,12 @@ public:
     void SetVoltageLevel(uint16_t val);
     void SetRPM(uint16_t val);
     void SetDistance(uint16_t val);
+    void SetOutsideTemp(int16_t tempC, bool valid = true);
     void SetMafRate(float val);
     void SetOBDStatus(int status);
     int GetOBDStatus(void);
     bool QueryOutsideTemp(float& outsideTempC);
+    bool QueryPidRaw(const String& pidCommand, String& payloadOut, int8_t& stateOut);
 };
 
 #endif
