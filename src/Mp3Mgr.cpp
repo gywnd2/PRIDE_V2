@@ -1,8 +1,8 @@
 #include "Mp3Mgr.h"
 #include "CommonApi.h"
 
-#define TEST_LOG(fmt, ...) Serial.printf("[Mp3Mgr] " fmt "\n", ##__VA_ARGS__)
-#define TEST_LINE() Serial.printf("[Mp3Mgr] %s\n", __func__)
+#define TEST_LOG(fmt, ...) UartLogf("[Mp3Mgr] " fmt "\n", ##__VA_ARGS__)
+#define TEST_LINE() UartLogf("[Mp3Mgr] %s\n", __func__)
 static constexpr int MP3_TRACK_WELCOME = 1;
 
 bool Mp3Mgr::Init(void)

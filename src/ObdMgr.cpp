@@ -2,11 +2,15 @@
 #include <CommonApi.h>
 #include <string.h>
 
-#define TEST_LOG(fmt, ...) Serial.printf("[ObdMgr] " fmt "\n", ##__VA_ARGS__)
-#define TEST_LINE() Serial.printf("[ObdMgr] %s\n", __func__)
+#define TEST_LOG(fmt, ...) UartLogf("[ObdMgr] " fmt "\n", ##__VA_ARGS__)
+#define TEST_LINE() UartLogf("[ObdMgr] %s\n", __func__)
 
-#ifndef OBD_RPM_STATE_FILE_LOG_ENABLE
-#define OBD_RPM_STATE_FILE_LOG_ENABLE 1
+#ifndef OBD_ODO_STATE_FILE_LOG_ENABLE
+#ifdef OBD_RPM_STATE_FILE_LOG_ENABLE
+#define OBD_ODO_STATE_FILE_LOG_ENABLE OBD_RPM_STATE_FILE_LOG_ENABLE
+#else
+#define OBD_ODO_STATE_FILE_LOG_ENABLE 1
+#endif
 #endif
 
 String ObdStatusStr[8] =
@@ -22,10 +26,17 @@ String ObdStatusStr[8] =
 };
 
 static portMUX_TYPE s_obdBusyMux = portMUX_INITIALIZER_UNLOCKED;
-static uint32_t s_lastRpmLogMs = 0;
-static int8_t s_lastRpmLogState = ELM_GENERAL_ERROR;
+static uint32_t s_lastOdoLogMs = 0;
+static int8_t s_lastOdoLogState = ELM_GENERAL_ERROR;
+static uint32_t s_lastOdoStorageLogMs = 0;
+static int8_t s_lastOdoStorageLogState = ELM_GENERAL_ERROR;
 static constexpr uint16_t ELM_INIT_TIMEOUT_MS = 600;
+static constexpr uint16_t ELM_PID_TIMEOUT_MS = 1500;
+static constexpr uint16_t ELM_QUERY_WAIT_INTERVAL_MS = 30;
 static constexpr char ELM_INIT_PROTOCOL = ISO_15765_11_BIT_500_KBAUD;
+static constexpr uint32_t ODO_QUERY_INTERVAL_MS = 1000;
+static constexpr uint8_t ODO_LINK_LOST_RETRY_MAX = 2;
+static constexpr uint32_t OBD_DIAG_LOG_INTERVAL_MS = 30000;
 
 namespace {
 const char* ElmStateToString(int8_t state)
@@ -46,13 +57,25 @@ const char* ElmStateToString(int8_t state)
     }
 }
 
-bool ShouldLogRpm(int8_t state)
+bool ShouldLogOdometer(int8_t state)
 {
     const uint32_t now = millis();
     const uint32_t minIntervalMs = (state == ELM_SUCCESS) ? 5000U : 1500U;
-    if (state != s_lastRpmLogState || (now - s_lastRpmLogMs) >= minIntervalMs) {
-        s_lastRpmLogState = state;
-        s_lastRpmLogMs = now;
+    if (state != s_lastOdoLogState || (now - s_lastOdoLogMs) >= minIntervalMs) {
+        s_lastOdoLogState = state;
+        s_lastOdoLogMs = now;
+        return true;
+    }
+    return false;
+}
+
+bool ShouldStoreOdometerLog(int8_t state)
+{
+    const uint32_t now = millis();
+    const uint32_t minIntervalMs = (state == ELM_SUCCESS) ? 5000U : 1500U;
+    if (state != s_lastOdoStorageLogState || (now - s_lastOdoStorageLogMs) >= minIntervalMs) {
+        s_lastOdoStorageLogState = state;
+        s_lastOdoStorageLogMs = now;
         return true;
     }
     return false;
@@ -64,6 +87,22 @@ bool IsObdLinkLostState(int8_t state)
            state == ELM_NO_RESPONSE ||
            state == ELM_NO_DATA ||
            state == ELM_TIMEOUT;
+}
+
+void LogPidError(const char* pid, int8_t state, const char* detail = nullptr)
+{
+    if (detail && detail[0] != '\0') {
+        TEST_LOG("pid %s error state=%d (%s) %s",
+                 pid,
+                 (int)state,
+                 ElmStateToString(state),
+                 detail);
+        return;
+    }
+    TEST_LOG("pid %s error state=%d (%s)",
+             pid,
+             (int)state,
+             ElmStateToString(state));
 }
 } // namespace
 
@@ -172,8 +211,12 @@ void ObdMgr::Init(void)
     _connectTaskRunning = false;
     _queryTaskRunning = false;
     _hadPidSuccess = false;
-    _awaitingRpmRecovery = false;
+    _awaitingOdometerRecovery = false;
     _goodbyeScreenActive = false;
+    _bootMs = millis();
+    _odometerStartKm = 0;
+    _odometerLastKm = 0;
+    _odometerStartValid = false;
 
     Serial.println("[ObdMgr] S3 BLE OBD task started");
     SetOBDStatus(BT_INIT_SUCCESS);
@@ -225,7 +268,7 @@ void ObdMgr::EventTask(void *param)
             case OBD_MGR_EVENT_LINK_LOST:
             {
                 self->SetOBDStatus(OBD_DISCONNECTED);
-                self->_awaitingRpmRecovery = true;
+                self->_awaitingOdometerRecovery = true;
                 system->btSubscriber.SetEvent(BT_REQUEST_DISCONNECT);
 
                 if (!self->_goodbyeScreenActive) {
@@ -239,14 +282,14 @@ void ObdMgr::EventTask(void *param)
                 break;
             }
 
-            case OBD_MGR_EVENT_RPM_SUCCESS:
+            case OBD_MGR_EVENT_ODOMETER_SUCCESS:
             {
                 self->_hadPidSuccess = true;
                 if (system->GetOBDConnected()) {
                     self->SetOBDStatus(OBD_CONNECTED);
                 }
-                if (self->_awaitingRpmRecovery) {
-                    self->_awaitingRpmRecovery = false;
+                if (self->_awaitingOdometerRecovery) {
+                    self->_awaitingOdometerRecovery = false;
                     if (self->_goodbyeScreenActive) {
                         system->displaySubscriber.SetEvent(DISPLAY_SHOW_GAUGE_REBOOT);
                         self->_goodbyeScreenActive = false;
@@ -368,7 +411,7 @@ void ObdMgr::QueryCoolant(uint16_t &coolant_temp)
 #ifdef OBD_SIMUL_MODE
     vTaskDelay(pdMS_TO_TICKS(OBD_SIMUL_QUERY_TIME));
     coolant_temp = rand() % (150 - 0 + 1) + 0;
-    TEST_LOG("Query coolant (PID 0105): OK value=%u C [sim]", (unsigned int)coolant_temp);
+    TEST_LOG("pid 0105 ok value=%u C [sim]", (unsigned int)coolant_temp);
 #else
     int8_t finalState = ELM_GENERAL_ERROR;
     while (true)
@@ -384,13 +427,12 @@ void ObdMgr::QueryCoolant(uint16_t &coolant_temp)
             coolant_temp = OBD_QUERY_INVALID_RESPONSE;
             break;
         }
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(ELM_QUERY_WAIT_INTERVAL_MS));
     }
     if (finalState == ELM_SUCCESS) {
-        TEST_LOG("Query coolant (PID 0105): OK value=%u C", (unsigned int)coolant_temp);
+        TEST_LOG("pid 0105 ok value=%u C", (unsigned int)coolant_temp);
     } else {
-        TEST_LOG("Query coolant (PID 0105): FAIL state=%d (%s)",
-                 (int)finalState, ElmStateToString(finalState));
+        LogPidError("0105", finalState);
     }
 #endif
 }
@@ -400,7 +442,7 @@ void ObdMgr::QueryVoltage(uint16_t &voltage_level)
 #ifdef OBD_SIMUL_MODE
     vTaskDelay(pdMS_TO_TICKS(OBD_SIMUL_QUERY_TIME));
     voltage_level = rand() % (18 - 6 + 1) + 6;
-    TEST_LOG("Query battery voltage (PID 0142): OK value=%u V [sim]", (unsigned int)voltage_level);
+    TEST_LOG("pid 0142 ok value=%u V [sim]", (unsigned int)voltage_level);
 #else
     int8_t finalState = ELM_GENERAL_ERROR;
     float finalVoltage = 0.0f;
@@ -418,13 +460,53 @@ void ObdMgr::QueryVoltage(uint16_t &voltage_level)
             voltage_level = OBD_QUERY_INVALID_RESPONSE;
             break;
         }
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(ELM_QUERY_WAIT_INTERVAL_MS));
     }
     if (finalState == ELM_SUCCESS) {
-        TEST_LOG("Query battery voltage (PID 0142): OK value=%.1f V", (double)finalVoltage);
+        TEST_LOG("pid 0142 ok value=%.1f V", (double)finalVoltage);
     } else {
-        TEST_LOG("Query battery voltage (PID 0142): FAIL state=%d (%s)",
-                 (int)finalState, ElmStateToString(finalState));
+        LogPidError("0142", finalState);
+    }
+#endif
+}
+
+void ObdMgr::QueryOdometer(uint32_t &odometer_km)
+{
+#ifdef OBD_SIMUL_MODE
+    static uint32_t simOdometer = 123456;
+    vTaskDelay(pdMS_TO_TICKS(OBD_SIMUL_QUERY_TIME));
+    simOdometer += 1;
+    odometer_km = simOdometer;
+    myELM327.nb_rx_state = ELM_SUCCESS;
+    TEST_LOG("pid 0131 ok value=%u km [sim]", (unsigned int)odometer_km);
+#else
+    int8_t finalState = ELM_GENERAL_ERROR;
+    float odometerRaw = 0.0f;
+    uint32_t startMs = millis();
+    while (true) {
+        odometerRaw = myELM327.distSinceCodesCleared();
+        finalState = myELM327.nb_rx_state;
+        if (finalState == ELM_SUCCESS) {
+            odometer_km = (uint32_t)odometerRaw;
+            break;
+        }
+        if (finalState != ELM_GETTING_MSG) {
+            odometer_km = OBD_QUERY_INVALID_RESPONSE;
+            break;
+        }
+        if ((millis() - startMs) >= ELM_PID_TIMEOUT_MS) {
+            finalState = ELM_TIMEOUT;
+            myELM327.nb_rx_state = ELM_TIMEOUT;
+            odometer_km = OBD_QUERY_INVALID_RESPONSE;
+            break;
+        }
+        // Yield CPU while waiting ELM response to reduce bus/RTOS contention.
+        vTaskDelay(pdMS_TO_TICKS(ELM_QUERY_WAIT_INTERVAL_MS));
+    }
+    if (finalState == ELM_SUCCESS) {
+        TEST_LOG("pid 0131 ok value=%u km", (unsigned int)odometer_km);
+    } else {
+        LogPidError("0131", finalState);
     }
 #endif
 }
@@ -435,8 +517,8 @@ void ObdMgr::QueryRPM(uint16_t &rpm_value)
 #ifdef OBD_SIMUL_MODE
     vTaskDelay(pdMS_TO_TICKS(OBD_SIMUL_QUERY_TIME));
     rpm_value = rand() % (6000 - 1000 + 1) + 1000;
-    if (ShouldLogRpm(ELM_SUCCESS)) {
-        TEST_LOG("Query RPM (PID 010C): OK value=%u rpm [sim]", (unsigned int)rpm_value);
+    if (ShouldLogOdometer(ELM_SUCCESS)) {
+        TEST_LOG("pid 010C ok value=%u rpm [sim]", (unsigned int)rpm_value);
     }
 #else
     int8_t finalState = ELM_GENERAL_ERROR;
@@ -463,14 +545,13 @@ void ObdMgr::QueryRPM(uint16_t &rpm_value)
             rpm_value = OBD_QUERY_INVALID_RESPONSE;
             break;
         }
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(ELM_QUERY_WAIT_INTERVAL_MS));
     }
-    if (ShouldLogRpm(finalState)) {
+    if (ShouldLogOdometer(finalState)) {
         if (finalState == ELM_SUCCESS) {
-            TEST_LOG("Query RPM (PID 010C): OK value=%u rpm", (unsigned int)rpm_value);
+            TEST_LOG("pid 010C ok value=%u rpm", (unsigned int)rpm_value);
         } else {
-            TEST_LOG("Query RPM (PID 010C): FAIL state=%d (%s)",
-                     (int)finalState, ElmStateToString(finalState));
+            LogPidError("010C", finalState);
         }
     }
 #endif
@@ -480,7 +561,7 @@ bool ObdMgr::QueryOutsideTemp(float& outsideTempC)
 {
 #ifdef OBD_SIMUL_MODE
     outsideTempC = (float)(rand() % 40) - 10.0f;
-    TEST_LOG("Query outside temp (PID 0146): OK value=%.1f C [sim]", (double)outsideTempC);
+    TEST_LOG("pid 0146 ok value=%.1f C [sim]", (double)outsideTempC);
     return true;
 #else
     outsideTempC = 0.0f;
@@ -489,8 +570,8 @@ bool ObdMgr::QueryOutsideTemp(float& outsideTempC)
 
     bool success = false;
     int8_t finalState = ELM_GENERAL_ERROR;
-    const int maxAttempts = 40; // ~2s at 50ms intervals
-    for (int i = 0; i < maxAttempts; ++i) {
+    uint32_t startMs = millis();
+    while (true) {
         outsideTempC = myELM327.ambientAirTemp();
         finalState = myELM327.nb_rx_state;
         if (finalState == ELM_SUCCESS) {
@@ -500,16 +581,19 @@ bool ObdMgr::QueryOutsideTemp(float& outsideTempC)
         if (finalState != ELM_GETTING_MSG) {
             break;
         }
-        vTaskDelay(pdMS_TO_TICKS(50));
+        if ((millis() - startMs) >= ELM_PID_TIMEOUT_MS) {
+            finalState = ELM_TIMEOUT;
+            myELM327.nb_rx_state = ELM_TIMEOUT;
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(ELM_QUERY_WAIT_INTERVAL_MS));
     }
 
     UnlockObdQuery();
     if (success) {
-        TEST_LOG("Query outside temp (PID 0146): OK value=%.1f C", (double)outsideTempC);
+        TEST_LOG("pid 0146 ok value=%.1f C", (double)outsideTempC);
     } else {
-        TEST_LOG("Query outside temp (PID 0146): FAIL state=%d (%s)",
-                 (int)finalState,
-                 ElmStateToString(finalState));
+        LogPidError("0146", finalState);
     }
     return success;
 #endif
@@ -586,52 +670,84 @@ void ObdMgr::QueryOBDData(void *param)
 
     ObdData data = {};
     unsigned long now = millis();
-    unsigned long last_rpm_time = now;
-    // Run non-RPM query once immediately after OBD task starts.
+    unsigned long last_odo_time = now;
+    // Run non-odometer query once immediately after OBD task starts.
     unsigned long last_query_time = now - 60000;
-    bool sessionRpmSuccess = false;
+    unsigned long last_diag_log_time = now;
+    bool sessionOdoSuccess = false;
 
     while (true)
     {
         unsigned long current_time = millis();
 
-        if (current_time - last_rpm_time >= 500)
+        if (current_time - last_odo_time >= ODO_QUERY_INTERVAL_MS)
         {
+            bool odoRetryTriggered = false;
             if (self->TryLockObdQuery())
             {
-                self->QueryRPM(data.rpm);
-                const int8_t rpmState = self->myELM327.nb_rx_state;
-#if OBD_RPM_STATE_FILE_LOG_ENABLE
-                {
-                    char rpmLog[128] = {0};
-                    if (rpmState == ELM_SUCCESS) {
-                        snprintf(rpmLog, sizeof(rpmLog),
-                                 "OBD RPM state=%d(%s) rpm=%u",
-                                 (int)rpmState,
-                                 ElmStateToString(rpmState),
-                                 (unsigned int)data.rpm);
-                    } else {
-                        snprintf(rpmLog, sizeof(rpmLog),
-                                 "OBD RPM state=%d(%s)",
-                                 (int)rpmState,
-                                 ElmStateToString(rpmState));
+                self->QueryOdometer(data.odometer_km);
+                int8_t odoState = self->myELM327.nb_rx_state;
+
+                if (IsObdLinkLostState(odoState)) {
+                    odoRetryTriggered = true;
+                    for (uint8_t retry = 0; retry < ODO_LINK_LOST_RETRY_MAX; ++retry) {
+                        TEST_LOG("pid 0131 retry %u/%u after state=%d (%s)",
+                                 (unsigned int)(retry + 1),
+                                 (unsigned int)ODO_LINK_LOST_RETRY_MAX,
+                                 (int)odoState,
+                                 ElmStateToString(odoState));
+                        self->QueryOdometer(data.odometer_km);
+                        odoState = self->myELM327.nb_rx_state;
+                        if (!IsObdLinkLostState(odoState)) {
+                            break;
+                        }
                     }
-                    system->AppendStorageLog(rpmLog);
+                }
+#if OBD_ODO_STATE_FILE_LOG_ENABLE
+                if (ShouldStoreOdometerLog(odoState)) {
+                    char odoLog[128] = {0};
+                    if (odoState == ELM_SUCCESS) {
+                        snprintf(odoLog, sizeof(odoLog),
+                                 "OBD ODO state=%d(%s) km=%u",
+                                 (int)odoState,
+                                 ElmStateToString(odoState),
+                                 (unsigned int)data.odometer_km);
+                    } else {
+                        snprintf(odoLog, sizeof(odoLog),
+                                 "OBD ODO state=%d(%s)",
+                                 (int)odoState,
+                                 ElmStateToString(odoState));
+                    }
+                    system->AppendStorageLog(odoLog);
                 }
 #endif
-                // RPM=0 is a valid value (engine idling/off). Use ELM state instead of value check.
-                if (rpmState == ELM_SUCCESS) {
-                    self->SetRPM(data.rpm);
-                    if (!sessionRpmSuccess ||
-                        self->_awaitingRpmRecovery ||
-                        self->GetOBDStatus() != OBD_CONNECTED) {
-                        sessionRpmSuccess = true;
-                        self->PostEvent(OBD_MGR_EVENT_RPM_SUCCESS);
+                {
+                    uint32_t elapsedSec = (millis() - self->_bootMs) / 1000U;
+                    self->SetDriveTimeSec(elapsedSec);
+                }
+
+                if (odoState == ELM_SUCCESS) {
+                    self->SetOdometerKm(data.odometer_km);
+                    if (!self->_odometerStartValid || data.odometer_km < self->_odometerStartKm) {
+                        self->_odometerStartValid = true;
+                        self->_odometerStartKm = data.odometer_km;
                     }
-                } else if (IsObdLinkLostState(rpmState)) {
-                    TEST_LOG("RPM error -> link lost handling state=%d (%s)",
-                             (int)rpmState,
-                             ElmStateToString(rpmState));
+                    self->_odometerLastKm = data.odometer_km;
+                    if (self->_odometerStartValid) {
+                        uint32_t trip = (self->_odometerLastKm >= self->_odometerStartKm)
+                                            ? (self->_odometerLastKm - self->_odometerStartKm)
+                                            : 0;
+                        self->SetTripDistanceKm(trip);
+                    }
+
+                    if (!sessionOdoSuccess ||
+                        self->_awaitingOdometerRecovery ||
+                        self->GetOBDStatus() != OBD_CONNECTED) {
+                        sessionOdoSuccess = true;
+                        self->PostEvent(OBD_MGR_EVENT_ODOMETER_SUCCESS);
+                    }
+                } else if (IsObdLinkLostState(odoState)) {
+                    LogPidError("0131", odoState, "link-lost");
                     self->UnlockObdQuery();
                     self->_queryTaskRunning = false;
                     self->query_obd_data_task = NULL;
@@ -641,60 +757,44 @@ void ObdMgr::QueryOBDData(void *param)
                 }
                 self->UnlockObdQuery();
             }
-            last_rpm_time = current_time;
+            last_odo_time = current_time;
+            if (odoRetryTriggered) {
+                // When in ODO retry mode, skip all non-ODO PID queries in this cycle.
+                vTaskDelay(pdMS_TO_TICKS(ELM_QUERY_WAIT_INTERVAL_MS));
+                continue;
+            }
+        }
+
+        if ((current_time - last_diag_log_time) >= OBD_DIAG_LOG_INTERVAL_MS) {
+            UBaseType_t hwmWords = uxTaskGetStackHighWaterMark(NULL);
+            TEST_LOG("OBD diag: stack_hwm=%u words, odo_state=%d, query_interval=%lu ms",
+                     (unsigned int)hwmWords,
+                     (int)self->myELM327.nb_rx_state,
+                     (unsigned long)ODO_QUERY_INTERVAL_MS);
+            last_diag_log_time = current_time;
         }
 
         if (current_time - last_query_time >= 5150)
         {
-            bool queryFatal = false;
-            int8_t fatalState = ELM_GENERAL_ERROR;
-            const char* fatalPid = "";
-
             if (self->TryLockObdQuery())
             {
                 self->QueryVoltage(data.voltage);
-                if (IsObdLinkLostState(self->myELM327.nb_rx_state)) {
-                    queryFatal = true;
-                    fatalState = self->myELM327.nb_rx_state;
-                    fatalPid = "0142";
-                } else {
+                int8_t voltageState = self->myELM327.nb_rx_state;
+                if (voltageState == ELM_SUCCESS) {
                     self->SetVoltageLevel(data.voltage);
-                    self->QueryCoolant(data.coolant);
-                    if (IsObdLinkLostState(self->myELM327.nb_rx_state)) {
-                        queryFatal = true;
-                        fatalState = self->myELM327.nb_rx_state;
-                        fatalPid = "0105";
-                    } else {
-                        self->SetCoolantTemp(data.coolant);
-                    }
+                }
+
+                self->QueryCoolant(data.coolant);
+                int8_t coolantState = self->myELM327.nb_rx_state;
+                if (coolantState == ELM_SUCCESS) {
+                    self->SetCoolantTemp(data.coolant);
                 }
                 self->UnlockObdQuery();
             }
 
-            if (queryFatal) {
-                TEST_LOG("PID %s error -> link lost handling state=%d (%s)",
-                         fatalPid,
-                         (int)fatalState,
-                         ElmStateToString(fatalState));
-                self->_queryTaskRunning = false;
-                self->query_obd_data_task = NULL;
-                self->PostEvent(OBD_MGR_EVENT_LINK_LOST);
-                vTaskDelete(NULL);
-                return;
-            }
-
             float outsideTemp = 0.0f;
-            if (!queryFatal && self->QueryOutsideTemp(outsideTemp)) {
+            if (self->QueryOutsideTemp(outsideTemp)) {
                 self->SetOutsideTemp((int16_t)outsideTemp, true);
-            } else if (IsObdLinkLostState(self->myELM327.nb_rx_state)) {
-                TEST_LOG("PID 0146 error -> link lost handling state=%d (%s)",
-                         (int)self->myELM327.nb_rx_state,
-                         ElmStateToString(self->myELM327.nb_rx_state));
-                self->_queryTaskRunning = false;
-                self->query_obd_data_task = NULL;
-                self->PostEvent(OBD_MGR_EVENT_LINK_LOST);
-                vTaskDelete(NULL);
-                return;
             }
             last_query_time = current_time;
         }
@@ -753,6 +853,72 @@ void ObdMgr::SetRPM(unsigned short rpmValue)
     }
 }
 
+void ObdMgr::SetOdometerKm(uint32_t odometerKm)
+{
+    if (LockData(pdMS_TO_TICKS(20))) {
+        this->obd_data.odometer_km = odometerKm;
+        UnlockData();
+    } else {
+        this->obd_data.odometer_km = odometerKm;
+    }
+}
+
+void ObdMgr::SetTripDistanceKm(uint32_t tripKm)
+{
+    if (LockData(pdMS_TO_TICKS(20))) {
+        this->obd_data.trip_distance_km = tripKm;
+        UnlockData();
+    } else {
+        this->obd_data.trip_distance_km = tripKm;
+    }
+}
+
+void ObdMgr::SetDriveTimeSec(uint32_t seconds)
+{
+    if (LockData(pdMS_TO_TICKS(20))) {
+        this->obd_data.drive_time_sec = seconds;
+        UnlockData();
+    } else {
+        this->obd_data.drive_time_sec = seconds;
+    }
+}
+
+uint32_t ObdMgr::GetOdometerKm(void)
+{
+    uint32_t value = 0;
+    if (LockData(pdMS_TO_TICKS(20))) {
+        value = this->obd_data.odometer_km;
+        UnlockData();
+    } else {
+        value = this->obd_data.odometer_km;
+    }
+    return value;
+}
+
+uint32_t ObdMgr::GetTripDistanceKm(void)
+{
+    uint32_t value = 0;
+    if (LockData(pdMS_TO_TICKS(20))) {
+        value = this->obd_data.trip_distance_km;
+        UnlockData();
+    } else {
+        value = this->obd_data.trip_distance_km;
+    }
+    return value;
+}
+
+uint32_t ObdMgr::GetDriveTimeSec(void)
+{
+    uint32_t value = 0;
+    if (LockData(pdMS_TO_TICKS(20))) {
+        value = this->obd_data.drive_time_sec;
+        UnlockData();
+    } else {
+        value = this->obd_data.drive_time_sec;
+    }
+    return value;
+}
+
 void ObdMgr::SetVoltageLevel(unsigned short volt)
 {
     if (LockData(pdMS_TO_TICKS(20))) {
@@ -780,16 +946,6 @@ void ObdMgr::SetCoolantTemp(unsigned short temp)
     SystemAPI* system = SystemAPI::getInstance();
     if (system) {
         system->PublishObdCoolant(temp);
-    }
-}
-
-void ObdMgr::SetDistance(unsigned short dist)
-{
-    if (LockData(pdMS_TO_TICKS(20))) {
-        this->obd_data.distance = dist;
-        UnlockData();
-    } else {
-        this->obd_data.distance = dist;
     }
 }
 
@@ -836,17 +992,16 @@ void ObdMgr::QueryDistAfterErrorClear(uint16_t &dist_value)
 {
 #ifdef OBD_SIMUL_MODE
     dist_value = rand() % 1000;
-    TEST_LOG("Query distance (PID 0131): OK value=%u km [sim]", (unsigned int)dist_value);
+    TEST_LOG("pid 0131 ok value=%u km [sim]", (unsigned int)dist_value);
 #else
     float dist = myELM327.distSinceCodesCleared();
     int8_t finalState = myELM327.nb_rx_state;
     if (finalState == ELM_SUCCESS) {
         dist_value = (uint16_t)dist;
-        TEST_LOG("Query distance (PID 0131): OK value=%u km", (unsigned int)dist_value);
+        TEST_LOG("pid 0131 ok value=%u km", (unsigned int)dist_value);
     } else {
         dist_value = 0;
-        TEST_LOG("Query distance (PID 0131): FAIL state=%d (%s)",
-                 (int)finalState, ElmStateToString(finalState));
+        LogPidError("0131", finalState);
     }
 #endif
 }

@@ -8,8 +8,8 @@
 #include "esp_heap_caps.h"
 #include "mbedtls/platform.h"
 
-#define TEST_LOG(fmt, ...) Serial.printf("[WifiMgr] " fmt "\n", ##__VA_ARGS__)
-#define TEST_LINE() Serial.printf("[WifiMgr] %s\n", __func__)
+#define TEST_LOG(fmt, ...) UartLogf("[WifiMgr] " fmt "\n", ##__VA_ARGS__)
+#define TEST_LINE() UartLogf("[WifiMgr] %s\n", __func__)
 
 #ifndef WIFI_RF_TX_POWER
 #define WIFI_RF_TX_POWER WIFI_POWER_11dBm

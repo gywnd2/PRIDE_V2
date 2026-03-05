@@ -65,7 +65,6 @@ typedef struct {
 
 void GaugeInit();
 void UiResetRuntimeState(void);
-void DrawGoodbyeScreenDummy(void);
 void GaugeSetValue(int16_t value);
 void GaugeSetNeedleAngle(int16_t angle);
 void CreateMainBackground();
@@ -75,6 +74,10 @@ void create_clock();
 void create_gauge();
 void create_weather();
 void create_sys_monitor_panel();
+void create_goodbye_screen(const char* time_text, const char* distance_text);
+void create_debug_screen(void);
+bool ui_debug_log_capture_enabled(void);
+void ui_debug_log_enqueue(const char* line);
 void update_monitor_ui(monitor_item_t * item, int32_t usage);
 void update_system_monitor(int32_t ram_percent, int32_t core1_percent, int32_t core2_percent);
 void update_coolant_gauge(int32_t val);

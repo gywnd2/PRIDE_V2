@@ -4,9 +4,80 @@
 #include <StorageMgr.h>
 #include <DisplayMgr.h>
 #include <string.h>
+#include <stdarg.h>
+#include <ui.h>
 
-#define TEST_LOG(fmt, ...) Serial.printf("[SystemAPI] " fmt "\n", ##__VA_ARGS__)
-#define TEST_LINE() Serial.printf("[SystemAPI] %s\n", __func__)
+#define TEST_LOG(fmt, ...) UartLogf("[SystemAPI] " fmt "\n", ##__VA_ARGS__)
+#define TEST_LINE() UartLogf("[SystemAPI] %s\n", __func__)
+
+static void trim_trailing_newline(char* text)
+{
+    if (!text) return;
+    size_t len = strlen(text);
+    while (len > 0) {
+        char c = text[len - 1];
+        if (c != '\n' && c != '\r') break;
+        text[len - 1] = '\0';
+        len--;
+    }
+}
+
+#ifndef UART_LOG_MAX_PER_SEC
+#define UART_LOG_MAX_PER_SEC 48U
+#endif
+
+static portMUX_TYPE s_uartLogBudgetMux = portMUX_INITIALIZER_UNLOCKED;
+
+static bool uart_log_budget_acquire()
+{
+    static uint32_t windowStartMs = 0;
+    static uint16_t windowCount = 0;
+
+    bool allow = false;
+    uint32_t now = millis();
+    portENTER_CRITICAL(&s_uartLogBudgetMux);
+    if (windowStartMs == 0 || (now - windowStartMs) >= 1000U) {
+        windowStartMs = now;
+        windowCount = 0;
+    }
+
+    if (windowCount < UART_LOG_MAX_PER_SEC) {
+        windowCount++;
+        allow = true;
+    }
+    portEXIT_CRITICAL(&s_uartLogBudgetMux);
+
+    return allow;
+}
+
+void UartLogf(const char* fmt, ...)
+{
+    if (!fmt) return;
+    if (!uart_log_budget_acquire()) return;
+
+    char uart_line[384];
+    va_list args;
+    va_start(args, fmt);
+    int written = vsnprintf(uart_line, sizeof(uart_line), fmt, args);
+    va_end(args);
+    if (written < 0) return;
+
+    size_t uart_len = strlen(uart_line);
+    if (uart_len > 0) {
+        int avail = Serial.availableForWrite();
+        if (avail >= (int)uart_len) {
+            Serial.write((const uint8_t*)uart_line, uart_len);
+        }
+    }
+
+    trim_trailing_newline(uart_line);
+    if (uart_line[0] == '\0') return;
+    if (!ui_debug_log_capture_enabled()) return;
+
+    char ui_line[420];
+    snprintf(ui_line, sizeof(ui_line), "[UART] %s", uart_line);
+    ui_debug_log_enqueue(ui_line);
+}
 
 SystemAPI* SystemAPI::_instance = nullptr;
 
@@ -125,7 +196,7 @@ bool DisplayEventSubscriber::ReceiveEvent(DisplayEventData* event, TickType_t wa
 // ----------------------------------------------------------------
 
 StorageEventSubscriber::StorageEventSubscriber() {
-    _queue = xQueueCreate(10, sizeof(StorageEventData));
+    _queue = xQueueCreate(64, sizeof(StorageEventData));
 }
 
 StorageEventSubscriber::~StorageEventSubscriber() {
@@ -137,7 +208,8 @@ void StorageEventSubscriber::SetEvent(STORAGE_EVENT_TYPE type, const String& pat
     evt.type = type;
     strncpy(evt.filePath, path.c_str(), sizeof(evt.filePath) - 1);
     evt.filePath[sizeof(evt.filePath) - 1] = '\0';
-    BaseType_t ok = xQueueSend(_queue, &evt, 0);
+    TickType_t wait = (type == STORAGE_APPEND_LOG) ? pdMS_TO_TICKS(40) : 0;
+    BaseType_t ok = xQueueSend(_queue, &evt, wait);
     if (ok != pdTRUE) {
         TEST_LOG("storage queue full, drop type=%d path=%s", (int)type, evt.filePath);
     }
@@ -344,6 +416,13 @@ bool SystemAPI::GetUiOutsideTemp(int16_t* tempC, bool* valid, TickType_t waitTim
     *tempC = uiState.outsideTempC;
     if (valid) *valid = uiState.outsideTempValid;
     UnlockUiState();
+    return true;
+}
+
+bool SystemAPI::GetObdDataSnapshot(ObdData* out, TickType_t waitTime) {
+    (void)waitTime;
+    if (!out || !obdMgr) return false;
+    *out = obdMgr->GetObdData();
     return true;
 }
 

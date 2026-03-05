@@ -12,11 +12,11 @@ extern "C" bool btInUse(void) {
 }
 #endif
 
-#define TEST_LOG(fmt, ...) Serial.printf("[BluetoothMgr] " fmt "\n", ##__VA_ARGS__)
-#define TEST_LINE() Serial.printf("[BluetoothMgr] %s\n", __func__)
+#define TEST_LOG(fmt, ...) UartLogf("[BluetoothMgr] " fmt "\n", ##__VA_ARGS__)
+#define TEST_LINE() UartLogf("[BluetoothMgr] %s\n", __func__)
 
 #ifndef BT_OBD_SCAN_DEBUG
-#define BT_OBD_SCAN_DEBUG 1
+#define BT_OBD_SCAN_DEBUG 0
 #endif
 
 #ifndef BT_OBD_SCAN_SECONDS

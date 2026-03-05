@@ -4,6 +4,7 @@
 #include <lvgl.h>
 #include <SD.h>
 #include <ui.h>
+#include <stdio.h>
 #include "esp_heap_caps.h"
 #include "freertos/task.h"
 #include "esp_lcd_panel_rgb.h"
@@ -18,8 +19,8 @@ extern "C" int Cache_WriteBack_Addr(uint32_t addr, uint32_t size);
 #include <src/extra/libs/gif/lv_gif.h>
 #endif
 
-#define TEST_LOG(fmt, ...) Serial.printf("[DisplayMgr] " fmt "\n", ##__VA_ARGS__)
-#define TEST_LINE() Serial.printf("[DisplayMgr] %s\n", __func__)
+#define TEST_LOG(fmt, ...) UartLogf("[DisplayMgr] " fmt "\n", ##__VA_ARGS__)
+#define TEST_LINE() UartLogf("[DisplayMgr] %s\n", __func__)
 
 static constexpr uint32_t GIF_TASK_STACK_WORDS = 8192;
 
@@ -50,9 +51,17 @@ static bool s_strictVsyncSync = false;
 static TickType_t s_monitorResumeTick = 0;
 static bool s_loggedNullFrontFb = false;
 static bool s_loggedNullBackFb = false;
+static uint8_t s_vsyncTimeoutConsecutive = 0;
 
 static constexpr TickType_t MONITOR_UPDATE_PERIOD_TICKS = pdMS_TO_TICKS(200);
 static constexpr TickType_t UI_SHARED_UPDATE_PERIOD_TICKS = pdMS_TO_TICKS(100);
+static constexpr TickType_t LVGL_TASK_PERIOD_TICKS = pdMS_TO_TICKS(20);
+static constexpr uint8_t VSYNC_TIMEOUT_SKIP_BEFORE_FORCE_SWAP = 3;
+#ifndef DISPLAY_PCLK_DERATE_PERCENT
+#define DISPLAY_PCLK_DERATE_PERCENT 90U
+#endif
+static constexpr uint32_t DISPLAY_TARGET_PCLK_HZ =
+    (uint32_t)(((uint64_t)ST7262_PANEL_CONFIG_TIMINGS_PCLK_HZ * (uint64_t)DISPLAY_PCLK_DERATE_PERCENT) / 100ULL);
 static constexpr bool DISPLAY_ROTATE_180 = true;
 
 static inline uint32_t area_pixels(const lv_area_t* a)
@@ -249,6 +258,44 @@ static void apply_shared_ui_state(const UiSharedState& s)
     );
 }
 
+static void goodbye_fade_exec_cb(void* var, int32_t v)
+{
+    if (!var) return;
+    lv_obj_set_style_bg_opa((lv_obj_t*)var, (lv_opa_t)v, 0);
+}
+
+static void goodbye_fade_ready_cb(lv_anim_t* a)
+{
+    if (!a || !a->var) return;
+    lv_obj_del((lv_obj_t*)a->var);
+}
+
+static void start_goodbye_fade_in(lv_obj_t* screen)
+{
+    if (!screen) return;
+
+    lv_obj_t* overlay = lv_obj_create(screen);
+    lv_obj_remove_style_all(overlay);
+    lv_obj_set_size(overlay, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_pos(overlay, 0, 0);
+    lv_obj_set_style_bg_color(overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(overlay, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_move_foreground(overlay);
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, overlay);
+    lv_anim_set_exec_cb(&a, goodbye_fade_exec_cb);
+    lv_anim_set_values(&a, LV_OPA_COVER, LV_OPA_TRANSP);
+    lv_anim_set_time(&a, 2000);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_set_ready_cb(&a, goodbye_fade_ready_cb);
+    lv_anim_start(&a);
+}
+
 static void show_goodbye_screen_locked()
 {
     lv_obj_t* screen = lv_scr_act();
@@ -259,15 +306,26 @@ static void show_goodbye_screen_locked()
     lv_obj_set_style_bg_color(screen, lv_color_black(), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
 
-    // Force a full-screen black redraw so goodbye transition is always visible.
-    lv_obj_t* blackout = lv_obj_create(screen);
-    lv_obj_remove_style_all(blackout);
-    lv_obj_set_size(blackout, LV_HOR_RES, LV_VER_RES);
-    lv_obj_set_pos(blackout, 0, 0);
-    lv_obj_set_style_bg_color(blackout, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(blackout, LV_OPA_COVER, 0);
+    char time_text[12] = "--:--";
+    char dist_text[16] = "--";
 
-    DrawGoodbyeScreenDummy();
+    SystemAPI* system = SystemAPI::getInstance();
+    if (system) {
+        ObdData snapshot = {};
+        if (system->GetObdDataSnapshot(&snapshot, pdMS_TO_TICKS(20))) {
+            uint32_t totalMin = snapshot.drive_time_sec / 60U;
+            uint32_t hours = totalMin / 60U;
+            uint32_t mins = totalMin % 60U;
+            snprintf(time_text, sizeof(time_text), "%02u:%02u",
+                     (unsigned int)hours, (unsigned int)mins);
+            snprintf(dist_text, sizeof(dist_text), "%u",
+                     (unsigned int)snapshot.trip_distance_km);
+        }
+    }
+
+    create_goodbye_screen(time_text, dist_text);
+    start_goodbye_fade_in(screen);
+
     lv_obj_invalidate(screen);
     lv_refr_now(lv_disp_get_default());
     TEST_LOG("Goodbye screen applied, children=%u", (unsigned int)lv_obj_get_child_cnt(screen));
@@ -393,6 +451,7 @@ static lv_fs_res_t sd_fs_tell(lv_fs_drv_t * drv, void * file_p, uint32_t * pos_p
 void DisplayMgr::Init()
 {
     TEST_LINE();
+    const uint32_t panelPclkHz = (DISPLAY_TARGET_PCLK_HZ > 0U) ? DISPLAY_TARGET_PCLK_HZ : ST7262_PANEL_CONFIG_TIMINGS_PCLK_HZ;
 #ifdef GPIO_BCKL
     pinMode(GPIO_BCKL, OUTPUT);
     TEST_LOG("GPIO_BCKL configured");
@@ -434,7 +493,7 @@ void DisplayMgr::Init()
         ST7262_PANEL_CONFIG_TIMINGS_VSYNC_PULSE_WIDTH,
         ST7262_PANEL_CONFIG_TIMINGS_VSYNC_BACK_PORCH,
         ST7262_PANEL_CONFIG_TIMINGS_FLAGS_PCLK_ACTIVE_NEG,
-        ST7262_PANEL_CONFIG_TIMINGS_PCLK_HZ,
+        panelPclkHz,
         false,
         ST7262_PANEL_CONFIG_TIMINGS_FLAGS_DE_IDLE_HIGH,
         ST7262_PANEL_CONFIG_TIMINGS_FLAGS_PCLK_IDLE_HIGH,
@@ -454,7 +513,11 @@ void DisplayMgr::Init()
     }
     TEST_LOG("gfx allocated: %p", gfx);
 
-    bool ok = gfx->begin(ST7262_PANEL_CONFIG_TIMINGS_PCLK_HZ);
+    TEST_LOG("RGB panel pclk=%u (base=%u derate=%u%%)",
+             (unsigned int)panelPclkHz,
+             (unsigned int)ST7262_PANEL_CONFIG_TIMINGS_PCLK_HZ,
+             (unsigned int)DISPLAY_PCLK_DERATE_PERCENT);
+    bool ok = gfx->begin(panelPclkHz);
     _gfxInitialized = ok;
     TEST_LOG("gfx->begin result=%d", ok ? 1 : 0);
 
@@ -807,36 +870,25 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
             // Swap only after observing a new VSYNC edge.
             bool sawVsync = true;
             if (s_vsyncSem) {
-                if (s_strictVsyncSync) {
-                    uint32_t before = s_vsyncCount;
-                    xSemaphoreTake(s_vsyncSem, 0); // drain stale token
+                uint32_t before = s_vsyncCount;
+                xSemaphoreTake(s_vsyncSem, 0); // drain stale token
 
-                    TickType_t t0 = xTaskGetTickCount();
-                    while (s_vsyncCount == before &&
-                           (xTaskGetTickCount() - t0) < pdMS_TO_TICKS(25)) {
-                        xSemaphoreTake(s_vsyncSem, pdMS_TO_TICKS(2));
-                    }
-                    sawVsync = (s_vsyncCount != before);
-                } else {
-                    // IDF4 internal path: wait for next frame-done edge, but don't hard-fail.
-                    uint32_t before = s_vsyncCount;
-                    xSemaphoreTake(s_vsyncSem, 0); // drain stale token
-                    TickType_t t0 = xTaskGetTickCount();
-                    while (s_vsyncCount == before &&
-                           (xTaskGetTickCount() - t0) < pdMS_TO_TICKS(30)) {
-                        xSemaphoreTake(s_vsyncSem, pdMS_TO_TICKS(2));
-                    }
-                    sawVsync = (s_vsyncCount != before);
-                    if (!sawVsync) {
-                        s_swapForcedOnTimeoutCount++;
-                        sawVsync = true; // proceed to keep pipeline alive
-                    }
+                TickType_t waitBudget = s_strictVsyncSync ? pdMS_TO_TICKS(25) : pdMS_TO_TICKS(30);
+                TickType_t t0 = xTaskGetTickCount();
+                while (s_vsyncCount == before &&
+                       (xTaskGetTickCount() - t0) < waitBudget) {
+                    xSemaphoreTake(s_vsyncSem, pdMS_TO_TICKS(2));
                 }
+                sawVsync = (s_vsyncCount != before);
             }
 
             if (!sawVsync) {
-                if (s_strictVsyncSync) {
-                    // On true VSYNC backends, skip this frame to avoid out-of-phase swap.
+                s_vsyncTimeoutConsecutive++;
+                bool forceSwapAfterSkip = (!s_strictVsyncSync) &&
+                    (s_vsyncTimeoutConsecutive >= VSYNC_TIMEOUT_SKIP_BEFORE_FORCE_SWAP);
+
+                if (!forceSwapAfterSkip) {
+                    // Skip this frame to avoid out-of-phase swap and visible horizontal noise.
                     s_swapSkipTimeoutCount++;
                     uint16_t* front = self->_fb_buf[self->_frontFbIndex];
                     uint16_t* back = self->_fb_buf[self->_backFbIndex];
@@ -849,10 +901,13 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
                     s_flushFrameStarted = false;
                     lv_disp_flush_ready(drv);
                     return;
-                } else {
-                    // IDF4 frame_trans_done path: keep pipeline alive with forced swap.
-                    s_swapForcedOnTimeoutCount++;
                 }
+
+                // Keep pipeline alive on repeated timeout bursts.
+                s_swapForcedOnTimeoutCount++;
+                s_vsyncTimeoutConsecutive = 0;
+            } else {
+                s_vsyncTimeoutConsecutive = 0;
             }
 
             uint16_t* swapFb = self->_fb_buf[self->_backFbIndex];
@@ -1308,7 +1363,7 @@ void DisplayMgr::HandleLvglTask(void *pvParameters)
             system->UnlockLvgl();
         }
 
-        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(16));
+        vTaskDelayUntil(&xLastWakeTime, LVGL_TASK_PERIOD_TICKS);
     }
 }
 

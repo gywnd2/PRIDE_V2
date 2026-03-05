@@ -39,3 +39,7 @@
 
 # debug information files
 *.dwo
+
+# Local Wi-Fi credentials (do not commit)
+wifi_credentials.txt
+include/WifiCredentialsLocal.h

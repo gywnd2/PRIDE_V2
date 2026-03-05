@@ -1,11 +1,35 @@
 #include <StorageMgr.h>
 #include <CommonApi.h>
+#include <time.h>
 
-#define TEST_LOG(fmt, ...) Serial.printf("[StorageMgr] " fmt "\n", ##__VA_ARGS__)
-#define TEST_LINE() Serial.printf("[StorageMgr] %s\n", __func__)
+#define TEST_LOG(fmt, ...) UartLogf("[StorageMgr] " fmt "\n", ##__VA_ARGS__)
+#define TEST_LINE() UartLogf("[StorageMgr] %s\n", __func__)
 
 static constexpr const char* STORAGE_LOG_DIR = "/log";
-static constexpr uint32_t STORAGE_LOG_MAX_INDEX = 9999;
+static constexpr const char* STORAGE_RUNTIME_LOG_FILE = "/log/runtime.log";
+
+static bool format_wall_clock(char* out, size_t out_len)
+{
+    if (!out || out_len == 0) return false;
+    time_t now = time(nullptr);
+    if (now <= 0) return false;
+
+    struct tm tm_local = {};
+    if (localtime_r(&now, &tm_local) == nullptr) return false;
+
+    // Consider clock valid only after NTP sync (year >= 2024).
+    int year = tm_local.tm_year + 1900;
+    if (year < 2024) return false;
+
+    snprintf(out, out_len, "%04d-%02d-%02d %02d:%02d:%02d",
+             year,
+             tm_local.tm_mon + 1,
+             tm_local.tm_mday,
+             tm_local.tm_hour,
+             tm_local.tm_min,
+             tm_local.tm_sec);
+    return true;
+}
 
 void StorageMgr::Init()
 {
@@ -263,29 +287,26 @@ bool StorageMgr::PrepareNextLogFileLocked()
     if (_activeLogPath.length() > 0) return true;
     if (!EnsureLogDir()) return false;
 
-    char candidate[32] = {0};
-    for (uint32_t idx = 1; idx <= STORAGE_LOG_MAX_INDEX; ++idx) {
-        snprintf(candidate, sizeof(candidate), "%s/log_%lu.txt",
-                 STORAGE_LOG_DIR, (unsigned long)idx);
-        if (!SD.exists(candidate)) {
-            File f = SD.open(candidate, FILE_WRITE);
-            if (!f) {
-                TEST_LOG("failed to create runtime log file: %s", candidate);
-                return false;
-            }
-            f.printf("[BOOT] runtime log start ms=%lu\n", (unsigned long)millis());
-            f.close();
+    _activeLogPath = String(STORAGE_RUNTIME_LOG_FILE);
+    _activeLogIndex = 0;
 
-            _activeLogPath = String(candidate);
-            _activeLogIndex = idx;
-            TEST_LOG("runtime log file=%s", _activeLogPath.c_str());
-            return true;
-        }
+    File f = SD.open(_activeLogPath.c_str(), FILE_WRITE);
+    if (!f) {
+        TEST_LOG("failed to open runtime log file: %s", _activeLogPath.c_str());
+        _activeLogPath = "";
+        return false;
     }
 
-    TEST_LOG("runtime log file index exhausted (max=%lu)",
-             (unsigned long)STORAGE_LOG_MAX_INDEX);
-    return false;
+    char wall_clock[32] = {0};
+    if (format_wall_clock(wall_clock, sizeof(wall_clock))) {
+        f.printf("\n[BOOT] start=%s ms=%lu\n", wall_clock, (unsigned long)millis());
+    } else {
+        f.printf("\n[BOOT] start_ms=%lu\n", (unsigned long)millis());
+    }
+    f.close();
+
+    TEST_LOG("runtime log file=%s", _activeLogPath.c_str());
+    return true;
 }
 
 bool StorageMgr::AppendRuntimeLogLine(const char* line)
@@ -303,7 +324,15 @@ bool StorageMgr::AppendRuntimeLogLine(const char* line)
             TEST_LOG("failed to open runtime log file: %s", _activeLogPath.c_str());
             break;
         }
-        f.printf("[%lu] %s\n", (unsigned long)millis(), line);
+        char wall_clock[32] = {0};
+        if (format_wall_clock(wall_clock, sizeof(wall_clock))) {
+            f.printf("[%s][ms=%lu] %s\n",
+                     wall_clock,
+                     (unsigned long)millis(),
+                     line);
+        } else {
+            f.printf("[ms=%lu] %s\n", (unsigned long)millis(), line);
+        }
         f.close();
         ok = true;
     } while (false);

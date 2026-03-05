@@ -16,6 +16,9 @@ class Mp3Mgr;
 class BluetoothMgr;
 class StorageMgr;
 class WifiMgr;
+struct ObdData;
+
+void UartLogf(const char* fmt, ...);
 
 // ----------------------------------------------------------------
 // Event Types & Data Structures
@@ -230,6 +233,7 @@ public:
     bool GetUiCoolant(uint16_t* coolant, bool* valid = nullptr, TickType_t waitTime = 0);
     bool GetUiBatteryVoltage(uint16_t* voltage, bool* valid = nullptr, TickType_t waitTime = 0);
     bool GetUiOutsideTemp(int16_t* tempC, bool* valid = nullptr, TickType_t waitTime = 0);
+    bool GetObdDataSnapshot(ObdData* out, TickType_t waitTime = 0);
 
     // Resource Locking (Thread Safety)
     bool LockGif(TickType_t waitTime = portMAX_DELAY);

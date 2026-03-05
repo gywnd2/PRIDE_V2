@@ -17,7 +17,9 @@ struct ObdData
     uint16_t coolant;
     uint16_t voltage;
     uint16_t rpm;
-    uint16_t distance;
+    uint32_t odometer_km;      // total distance in km (PID 0131 fallback)
+    uint32_t trip_distance_km; // delta since first odometer read after boot
+    uint32_t drive_time_sec;   // seconds since boot
     int16_t outside_temp;
     bool outside_temp_valid;
     float maf_rate;
@@ -45,7 +47,7 @@ enum ObdMgrEventType
     OBD_MGR_EVENT_NONE = 0,
     OBD_MGR_EVENT_START_CONNECT,
     OBD_MGR_EVENT_LINK_LOST,
-    OBD_MGR_EVENT_RPM_SUCCESS
+    OBD_MGR_EVENT_ODOMETER_SUCCESS
 };
 
 typedef struct
@@ -70,8 +72,12 @@ private:
     volatile bool _connectTaskRunning = false;
     volatile bool _queryTaskRunning = false;
     volatile bool _hadPidSuccess = false;
-    volatile bool _awaitingRpmRecovery = false;
+    volatile bool _awaitingOdometerRecovery = false;
     volatile bool _goodbyeScreenActive = false;
+    uint32_t _bootMs = 0;
+    uint32_t _odometerStartKm = 0;
+    uint32_t _odometerLastKm = 0;
+    bool _odometerStartValid = false;
     static constexpr uint32_t OBD_RECONNECT_INTERVAL_MS = 10000;
 
     bool LockData(TickType_t waitTime);
@@ -86,6 +92,7 @@ protected:
     void QueryCoolant(uint16_t &coolant_temp);
     void QueryVoltage(uint16_t &voltage_level);
     void QueryRPM(uint16_t &rpm_value);
+    void QueryOdometer(uint32_t &odometer_km);
     void QueryDistAfterErrorClear(uint16_t &distance);
     void QueryMaf(float &fuel_consumption);
 
@@ -109,7 +116,12 @@ public:
     void SetCoolantTemp(uint16_t val);
     void SetVoltageLevel(uint16_t val);
     void SetRPM(uint16_t val);
-    void SetDistance(uint16_t val);
+    void SetOdometerKm(uint32_t val);
+    void SetTripDistanceKm(uint32_t val);
+    void SetDriveTimeSec(uint32_t val);
+    uint32_t GetOdometerKm(void);
+    uint32_t GetTripDistanceKm(void);
+    uint32_t GetDriveTimeSec(void);
     void SetOutsideTemp(int16_t tempC, bool valid = true);
     void SetMafRate(float val);
     void SetOBDStatus(int status);

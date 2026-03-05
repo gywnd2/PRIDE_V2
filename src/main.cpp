@@ -7,7 +7,7 @@
 #include <Mp3Mgr.h>
 #include <WifiMgr.h>
 
-#define TEST_LOG(fmt, ...) Serial.printf("[Main] " fmt "\n", ##__VA_ARGS__)
+#define TEST_LOG(fmt, ...) UartLogf("[Main] " fmt "\n", ##__VA_ARGS__)
 
 DisplayMgr* displayMgr   = nullptr;
 StorageMgr* storageMgr   = nullptr;

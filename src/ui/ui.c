@@ -1,5 +1,7 @@
 #include <ui.h>
 #include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 
 static lv_obj_t * target_needle = NULL;
 static lv_obj_t * target_batt_needle = NULL;
@@ -31,12 +33,282 @@ static bool battery_valid_latched = false;
 static int32_t battery_value_latched = 0;
 static int32_t coolant_rendered_value = -1;
 static int32_t battery_rendered_value = -1;
+static lv_obj_t * debug_container = NULL;
+static lv_obj_t * debug_swipe_zone = NULL;
+static lv_obj_t * debug_log_ta = NULL;
+static volatile bool debug_screen_visible = false;
+static bool debug_swipe_tracking = false;
+static bool debug_hide_tracking = false;
+static lv_point_t debug_swipe_start = {0, 0};
+static lv_point_t debug_hide_start = {0, 0};
+static lv_timer_t * debug_log_flush_timer = NULL;
+static QueueHandle_t debug_log_queue = NULL;
+
+static const int32_t DEBUG_EDGE_ZONE_HEIGHT = 28;
+static const int32_t DEBUG_OPEN_TRIGGER_PX = 60;
+static const int32_t DEBUG_CLOSE_TRIGGER_PX = 50;
+static const int32_t DEBUG_HEADER_GESTURE_HEIGHT = 70;
+static const uint32_t DEBUG_PANEL_ANIM_MS = 220;
+static const uint32_t DEBUG_LOG_FLUSH_PERIOD_MS = 120;
+static const uint32_t DEBUG_LOG_FLUSH_BATCH = 4;
+static const uint32_t DEBUG_LOG_QUEUE_DEPTH = 96;
+static const uint32_t DEBUG_LOG_TEXT_MAX_CHARS = 6000;
 
 static void set_coolant_gauge_instant(int32_t val);
 static void set_battery_gauge_instant(int32_t val);
 static void start_needle_ceremony(void);
 static void apply_latched_obd_needles(void);
 static void needle_ceremony_delay_timer_cb(lv_timer_t * t);
+static bool get_active_touch_point(lv_point_t * p);
+static void debug_show_panel(bool anim);
+static void debug_hide_panel(bool anim);
+static void debug_swipe_zone_event_cb(lv_event_t * e);
+static void debug_panel_event_cb(lv_event_t * e);
+static void create_debug_swipe_zone(void);
+static QueueHandle_t get_debug_log_queue(void);
+static void debug_log_queue_clear(void);
+static void debug_log_flush_timer_cb(lv_timer_t * t);
+
+static bool get_active_touch_point(lv_point_t * p)
+{
+    if (!p) return false;
+    lv_indev_t * indev = lv_indev_get_act();
+    if (!indev) return false;
+    lv_indev_get_point(indev, p);
+    return true;
+}
+
+static void debug_panel_y_anim_exec_cb(void * var, int32_t y)
+{
+    lv_obj_set_y((lv_obj_t *)var, y);
+}
+
+static void debug_hide_anim_ready_cb(lv_anim_t * a)
+{
+    LV_UNUSED(a);
+    if (debug_container) {
+        lv_obj_add_flag(debug_container, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (debug_swipe_zone) {
+        lv_obj_move_foreground(debug_swipe_zone);
+    }
+}
+
+static void debug_show_panel(bool anim)
+{
+    if (!debug_container || debug_screen_visible) return;
+
+    debug_screen_visible = true;
+    lv_obj_clear_flag(debug_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(debug_container);
+    lv_anim_del(debug_container, (lv_anim_exec_xcb_t)debug_panel_y_anim_exec_cb);
+    if (debug_log_flush_timer) {
+        lv_timer_resume(debug_log_flush_timer);
+    }
+
+    if (!anim) {
+        lv_obj_set_y(debug_container, 0);
+        debug_log_flush_timer_cb(NULL);
+        return;
+    }
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, debug_container);
+    lv_anim_set_exec_cb(&a, (lv_anim_exec_xcb_t)debug_panel_y_anim_exec_cb);
+    lv_anim_set_values(&a, lv_obj_get_y(debug_container), 0);
+    lv_anim_set_time(&a, DEBUG_PANEL_ANIM_MS);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+}
+
+static void debug_hide_panel(bool anim)
+{
+    if (!debug_container || !debug_screen_visible) return;
+
+    debug_screen_visible = false;
+    lv_anim_del(debug_container, (lv_anim_exec_xcb_t)debug_panel_y_anim_exec_cb);
+    if (debug_log_flush_timer) {
+        lv_timer_pause(debug_log_flush_timer);
+    }
+    debug_log_queue_clear();
+
+    if (!anim) {
+        lv_obj_set_y(debug_container, -SCREEN_HEIGHT);
+        lv_obj_add_flag(debug_container, LV_OBJ_FLAG_HIDDEN);
+        if (debug_swipe_zone) {
+            lv_obj_move_foreground(debug_swipe_zone);
+        }
+        return;
+    }
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, debug_container);
+    lv_anim_set_exec_cb(&a, (lv_anim_exec_xcb_t)debug_panel_y_anim_exec_cb);
+    lv_anim_set_values(&a, lv_obj_get_y(debug_container), -SCREEN_HEIGHT);
+    lv_anim_set_time(&a, DEBUG_PANEL_ANIM_MS);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_in);
+    lv_anim_set_ready_cb(&a, debug_hide_anim_ready_cb);
+    lv_anim_start(&a);
+}
+
+static void debug_swipe_zone_event_cb(lv_event_t * e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+
+    if (code == LV_EVENT_PRESSED) {
+        if (debug_screen_visible) return;
+        if (get_active_touch_point(&debug_swipe_start)) {
+            debug_swipe_tracking = true;
+        }
+        return;
+    }
+
+    if (code == LV_EVENT_PRESSING) {
+        if (!debug_swipe_tracking || debug_screen_visible) return;
+        lv_point_t p;
+        if (!get_active_touch_point(&p)) return;
+
+        int32_t dy = p.y - debug_swipe_start.y;
+        if (dy >= DEBUG_OPEN_TRIGGER_PX) {
+            debug_swipe_tracking = false;
+            debug_show_panel(true);
+        }
+        return;
+    }
+
+    if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        debug_swipe_tracking = false;
+    }
+}
+
+static void debug_panel_event_cb(lv_event_t * e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+
+    if (code == LV_EVENT_PRESSED) {
+        if (!debug_screen_visible) return;
+        lv_point_t p;
+        if (!get_active_touch_point(&p)) return;
+        if (p.y > DEBUG_HEADER_GESTURE_HEIGHT) return;
+        debug_hide_start = p;
+        debug_hide_tracking = true;
+        return;
+    }
+
+    if (code == LV_EVENT_PRESSING) {
+        if (!debug_hide_tracking || !debug_screen_visible) return;
+        lv_point_t p;
+        if (!get_active_touch_point(&p)) return;
+
+        int32_t dy = p.y - debug_hide_start.y;
+        if (dy <= -DEBUG_CLOSE_TRIGGER_PX) {
+            debug_hide_tracking = false;
+            debug_hide_panel(true);
+        }
+        return;
+    }
+
+    if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        debug_hide_tracking = false;
+    }
+}
+
+static void create_debug_swipe_zone(void)
+{
+    debug_swipe_zone = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(debug_swipe_zone, SCREEN_WIDTH, DEBUG_EDGE_ZONE_HEIGHT);
+    lv_obj_align(debug_swipe_zone, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_opa(debug_swipe_zone, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(debug_swipe_zone, 0, 0);
+    lv_obj_set_style_radius(debug_swipe_zone, 0, 0);
+    lv_obj_set_style_pad_all(debug_swipe_zone, 0, 0);
+    lv_obj_clear_flag(debug_swipe_zone, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(debug_swipe_zone, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(debug_swipe_zone, LV_OBJ_FLAG_PRESS_LOCK);
+    lv_obj_add_event_cb(debug_swipe_zone, debug_swipe_zone_event_cb, LV_EVENT_ALL, NULL);
+    lv_obj_move_foreground(debug_swipe_zone);
+}
+
+typedef struct {
+    char line[256];
+} debug_log_entry_t;
+
+static QueueHandle_t get_debug_log_queue(void)
+{
+    if (debug_log_queue) return debug_log_queue;
+    debug_log_queue = xQueueCreate((UBaseType_t)DEBUG_LOG_QUEUE_DEPTH, sizeof(debug_log_entry_t));
+    return debug_log_queue;
+}
+
+bool ui_debug_log_capture_enabled(void)
+{
+    return debug_screen_visible;
+}
+
+static void debug_log_queue_clear(void)
+{
+    QueueHandle_t q = get_debug_log_queue();
+    if (!q) return;
+
+    debug_log_entry_t dropped;
+    while (xQueueReceive(q, &dropped, 0) == pdTRUE) {
+        // drop pending logs
+    }
+}
+
+void ui_debug_log_enqueue(const char* line)
+{
+    if (!line || line[0] == '\0') return;
+    if (!ui_debug_log_capture_enabled()) return;
+
+    QueueHandle_t q = get_debug_log_queue();
+    if (!q) return;
+
+    debug_log_entry_t entry;
+    strncpy(entry.line, line, sizeof(entry.line) - 1);
+    entry.line[sizeof(entry.line) - 1] = '\0';
+
+    if (xQueueSend(q, &entry, 0) != pdTRUE) {
+        debug_log_entry_t dropped;
+        (void)xQueueReceive(q, &dropped, 0);
+        (void)xQueueSend(q, &entry, 0);
+    }
+}
+
+static void debug_log_flush_timer_cb(lv_timer_t * t)
+{
+    LV_UNUSED(t);
+    if (!debug_log_ta || !debug_screen_visible) return;
+
+    QueueHandle_t q = get_debug_log_queue();
+    if (!q) return;
+
+    debug_log_entry_t entry;
+    char batch[1024];
+    size_t used = 0;
+    uint32_t drained = 0;
+
+    batch[0] = '\0';
+    while (drained < DEBUG_LOG_FLUSH_BATCH && xQueueReceive(q, &entry, 0) == pdTRUE) {
+        int w = snprintf(batch + used, sizeof(batch) - used, "%s\n", entry.line);
+        if (w <= 0) break;
+        if ((size_t)w >= (sizeof(batch) - used)) break;
+        used += (size_t)w;
+        drained++;
+    }
+
+    if (drained > 0 && used > 0) {
+        const char * cur = lv_textarea_get_text(debug_log_ta);
+        size_t cur_len = cur ? strlen(cur) : 0;
+        if ((cur_len + used) > DEBUG_LOG_TEXT_MAX_CHARS) {
+            lv_textarea_set_text(debug_log_ta, "");
+        }
+        lv_textarea_add_text(debug_log_ta, batch);
+        lv_textarea_set_cursor_pos(debug_log_ta, LV_TEXTAREA_CURSOR_LAST);
+    }
+}
 
 static uint16_t ease_smoothstep_q15(uint16_t t_q15)
 {
@@ -591,6 +863,10 @@ void UiResetRuntimeState(void)
         lv_timer_del(needle_ceremony_delay_timer);
         needle_ceremony_delay_timer = NULL;
     }
+    if (debug_log_flush_timer) {
+        lv_timer_del(debug_log_flush_timer);
+        debug_log_flush_timer = NULL;
+    }
 
     monitor_ceremony_active = false;
     needle_ceremony_active = false;
@@ -620,6 +896,16 @@ void UiResetRuntimeState(void)
     clock_label = NULL;
     outside_temp_label = NULL;
     main_test_panel = NULL;
+    debug_container = NULL;
+    debug_swipe_zone = NULL;
+    debug_log_ta = NULL;
+    debug_screen_visible = false;
+    debug_swipe_tracking = false;
+    debug_hide_tracking = false;
+    debug_swipe_start.x = 0;
+    debug_swipe_start.y = 0;
+    debug_hide_start.x = 0;
+    debug_hide_start.y = 0;
 
     cpu_core1.bar = NULL;
     cpu_core1.label_val = NULL;
@@ -627,11 +913,6 @@ void UiResetRuntimeState(void)
     cpu_core2.label_val = NULL;
     ram_usage.bar = NULL;
     ram_usage.label_val = NULL;
-}
-
-void DrawGoodbyeScreenDummy(void)
-{
-    // Placeholder. The user will provide the actual goodbye screen rendering.
 }
 
 void create_weather()
@@ -703,6 +984,171 @@ void DisplayColorTest() {
     }
 }
 
+static lv_obj_t* create_goodbye_row(lv_obj_t* parent, const char* title, const char* value)
+{
+    lv_obj_t* row = lv_obj_create(parent);
+    lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(row, 0, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 20, 0);
+
+    lv_obj_t* title_lbl = lv_label_create(row);
+    lv_label_set_text(title_lbl, title);
+    lv_obj_set_style_text_color(title_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_opa(title_lbl, 255, 0);
+    lv_obj_set_style_text_font(title_lbl, &lv_font_montserrat_24, 0);
+    /* keep content width so title+value can be centered as a pair */
+
+    lv_obj_t* value_lbl = lv_label_create(row);
+    lv_label_set_text(value_lbl, value);
+    lv_obj_set_style_text_color(value_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_opa(value_lbl, 255, 0);
+    lv_obj_set_style_text_font(value_lbl, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_align(value_lbl, LV_TEXT_ALIGN_RIGHT, 0);
+
+    return value_lbl;
+}
+
+void create_goodbye_screen(const char* time_text, const char* distance_text)
+{
+    lv_obj_t* goodbye_container = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(goodbye_container, 800, 480);
+    lv_obj_clear_flag(goodbye_container, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
+    lv_obj_set_style_bg_color(goodbye_container, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(goodbye_container, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    lv_obj_set_style_border_width(goodbye_container, 0, 0);
+    lv_obj_set_style_outline_width(goodbye_container, 0, 0);
+    lv_obj_set_style_shadow_width(goodbye_container, 0, 0);
+
+    lv_obj_t* main_title = lv_label_create(goodbye_container);
+    lv_obj_set_width(main_title, LV_SIZE_CONTENT);   /// 8
+    lv_obj_set_height(main_title, LV_SIZE_CONTENT);    /// 1
+    lv_obj_set_x(main_title, 0);
+    lv_obj_set_y(main_title, -150);
+    lv_obj_set_align(main_title, LV_ALIGN_CENTER);
+    lv_label_set_text(main_title, "Last Trip Info.");
+    lv_obj_set_style_text_color(main_title, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_opa(main_title, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(main_title, &lv_font_montserrat_36, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    lv_obj_t* info_cont = lv_obj_create(goodbye_container);
+    lv_obj_set_size(info_cont, 600, 250);
+    lv_obj_align(info_cont, LV_ALIGN_CENTER, 0, 20);
+    lv_obj_set_style_bg_opa(info_cont, 0, 0);
+    lv_obj_set_style_border_width(info_cont, 0, 0);
+    lv_obj_set_style_pad_all(info_cont, 0, 0);
+    lv_obj_clear_flag(info_cont, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(info_cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(info_cont, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(info_cont, 0, 0);
+
+    const char* safe_time = (time_text && time_text[0] != '\0') ? time_text : "--:--";
+    const char* safe_dist = (distance_text && distance_text[0] != '\0') ? distance_text : "--";
+
+    create_goodbye_row(info_cont, "Time (HH:MM) : ", safe_time);
+    create_goodbye_row(info_cont, "Distance (Km) : ", safe_dist);
+    create_goodbye_row(info_cont, "Avg. Cons. (Km/L) : ", "15.6");
+
+    lv_obj_t* upper_bar = lv_obj_create(goodbye_container);
+    lv_obj_set_width(upper_bar, 600);
+    lv_obj_set_height(upper_bar, 4);
+    lv_obj_set_x(upper_bar, 0);
+    lv_obj_set_y(upper_bar, -100);
+    lv_obj_set_align(upper_bar, LV_ALIGN_CENTER);
+    lv_obj_clear_flag(upper_bar, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
+
+    lv_obj_t* lower_bar = lv_obj_create(goodbye_container);
+    lv_obj_set_width(lower_bar, 600);
+    lv_obj_set_height(lower_bar, 4);
+    lv_obj_set_x(lower_bar, -1);
+    lv_obj_set_y(lower_bar, 150);
+    lv_obj_set_align(lower_bar, LV_ALIGN_CENTER);
+    lv_obj_clear_flag(lower_bar, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
+}
+
+void create_debug_screen(void)
+{
+    debug_container = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(debug_container, SCREEN_WIDTH, SCREEN_HEIGHT);
+    lv_obj_clear_flag(debug_container, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
+    lv_obj_set_style_bg_color(debug_container, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(debug_container, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    lv_obj_set_style_border_width(debug_container, 0, 0);
+    lv_obj_set_style_outline_width(debug_container, 0, 0);
+    lv_obj_set_style_shadow_width(debug_container, 0, 0);
+
+    lv_obj_t* main_title = lv_label_create(debug_container);
+    lv_obj_set_width(main_title, LV_SIZE_CONTENT);   /// 8
+    lv_obj_set_height(main_title, LV_SIZE_CONTENT);    /// 1
+    lv_obj_set_x(main_title, 20);
+    lv_obj_set_y(main_title, 10);
+    lv_obj_set_align(main_title, LV_ALIGN_TOP_LEFT);
+    lv_label_set_text(main_title, "Debug Log");
+    lv_obj_set_style_text_color(main_title, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_opa(main_title, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(main_title, &lv_font_montserrat_24, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_add_flag(main_title, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    lv_obj_t* upper_bar = lv_obj_create(debug_container);
+    lv_obj_set_width(upper_bar, 800);
+    lv_obj_set_height(upper_bar, 4);
+    lv_obj_set_x(upper_bar, 0);
+    lv_obj_set_y(upper_bar, 65);
+    lv_obj_set_align(upper_bar, LV_ALIGN_TOP_MID);
+    lv_obj_clear_flag(upper_bar, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
+    lv_obj_add_flag(upper_bar, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    lv_obj_t* lower_bar = lv_obj_create(debug_container);
+    lv_obj_set_width(lower_bar, 60);
+    lv_obj_set_height(lower_bar, 4);
+    lv_obj_set_x(lower_bar, 0);
+    lv_obj_set_y(lower_bar, -5);
+    lv_obj_set_align(lower_bar, LV_ALIGN_BOTTOM_MID);
+    lv_obj_clear_flag(lower_bar, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
+    lv_obj_add_flag(lower_bar, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    lv_obj_t* log_ta = lv_textarea_create(debug_container);
+    lv_obj_set_size(log_ta, 760, 390);
+    lv_obj_align(log_ta, LV_ALIGN_TOP_MID, 0, 75);
+    lv_textarea_set_one_line(log_ta, false);
+    lv_obj_set_scroll_dir(log_ta, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(log_ta, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_clear_flag(log_ta, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+    lv_obj_set_style_bg_color(log_ta, lv_color_hex(0x101010), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(log_ta, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(log_ta, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_outline_width(log_ta, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_shadow_width(log_ta, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_color(log_ta, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(log_ta, &lv_font_montserrat_20, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_line_space(log_ta, 6, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_add_flag(log_ta, LV_OBJ_FLAG_EVENT_BUBBLE);
+    debug_log_ta = log_ta;
+
+    if (debug_log_flush_timer) {
+        lv_timer_del(debug_log_flush_timer);
+        debug_log_flush_timer = NULL;
+    }
+    debug_log_flush_timer = lv_timer_create(debug_log_flush_timer_cb, DEBUG_LOG_FLUSH_PERIOD_MS, NULL);
+    if (debug_log_flush_timer) {
+        lv_timer_pause(debug_log_flush_timer);
+    }
+    debug_log_flush_timer_cb(NULL);
+
+    lv_obj_set_pos(debug_container, 0, -SCREEN_HEIGHT);
+    lv_obj_add_flag(debug_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(debug_container, debug_panel_event_cb, LV_EVENT_ALL, NULL);
+    debug_screen_visible = false;
+    create_debug_swipe_zone();
+}
+
 void GaugeInit()
 {
     lv_obj_set_style_bg_color(lv_scr_act(), lv_color_black(), 0);
@@ -716,6 +1162,7 @@ void GaugeInit()
     create_sys_monitor_panel();
     create_gauge();
     //create_weather();
+    create_debug_screen();
 
     pending_ram_percent = 0;
     pending_core1_percent = 0;
