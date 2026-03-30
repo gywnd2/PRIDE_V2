@@ -11,6 +11,13 @@
 #include "esp_timer.h"
 #include "freertos/semphr.h"
 #include "esp_freertos_hooks.h"
+#if defined(BOARD_HAS_TOUCH)
+#if !defined(TOUCH_MODULES_GT911)
+#define TOUCH_MODULES_GT911
+#endif
+#include <Wire.h>
+#include <TouchLib.h>
+#endif
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
 #include "esp32s3/rom/cache.h"
 extern "C" int Cache_WriteBack_Addr(uint32_t addr, uint32_t size);
@@ -42,8 +49,18 @@ static bool s_backBufferSynced = true;
 static bool s_frameHasFullRefreshArea = false;
 static lv_area_t s_dirtyAreas[64];
 static uint8_t s_dirtyAreaCount = 0;
+static bool s_sceneResetPending = false;
 static volatile uint32_t s_idleLoopCount[2] = {0, 0};
 static bool s_idleHooksRegistered = false;
+static uint32_t s_cpuPrevIdle0 = 0;
+static uint32_t s_cpuPrevIdle1 = 0;
+static uint32_t s_cpuPeakIdle0 = 1;
+static uint32_t s_cpuPeakIdle1 = 1;
+static TickType_t s_cpuPrevSampleTick = 0;
+static uint8_t s_cpuFilteredUsage0 = 0;
+static uint8_t s_cpuFilteredUsage1 = 0;
+static bool s_cpuUsageValid = false;
+static uint8_t s_cpuWarmupSamples = 3;
 static volatile bool s_splashActive = false;
 static volatile bool s_splashGifReady = false;
 static volatile bool s_goodbyeScreenActive = false;
@@ -52,17 +69,184 @@ static TickType_t s_monitorResumeTick = 0;
 static bool s_loggedNullFrontFb = false;
 static bool s_loggedNullBackFb = false;
 static uint8_t s_vsyncTimeoutConsecutive = 0;
+static bool s_forceFullInvalidatePending = false;
+static uint32_t s_diagLastLogMs = 0;
 
 static constexpr TickType_t MONITOR_UPDATE_PERIOD_TICKS = pdMS_TO_TICKS(200);
 static constexpr TickType_t UI_SHARED_UPDATE_PERIOD_TICKS = pdMS_TO_TICKS(100);
 static constexpr TickType_t LVGL_TASK_PERIOD_TICKS = pdMS_TO_TICKS(20);
-static constexpr uint8_t VSYNC_TIMEOUT_SKIP_BEFORE_FORCE_SWAP = 3;
+static constexpr uint8_t VSYNC_TIMEOUT_SKIP_BEFORE_FORCE_SWAP = 8;
 #ifndef DISPLAY_PCLK_DERATE_PERCENT
 #define DISPLAY_PCLK_DERATE_PERCENT 90U
 #endif
 static constexpr uint32_t DISPLAY_TARGET_PCLK_HZ =
     (uint32_t)(((uint64_t)ST7262_PANEL_CONFIG_TIMINGS_PCLK_HZ * (uint64_t)DISPLAY_PCLK_DERATE_PERCENT) / 100ULL);
 static constexpr bool DISPLAY_ROTATE_180 = true;
+
+#if defined(BOARD_HAS_TOUCH)
+#ifndef GT911_I2C_CONFIG_SDA_IO_NUM
+#define GT911_I2C_CONFIG_SDA_IO_NUM 19
+#endif
+#ifndef GT911_I2C_CONFIG_SCL_IO_NUM
+#define GT911_I2C_CONFIG_SCL_IO_NUM 20
+#endif
+#ifndef GT911_I2C_CONFIG_MASTER_CLK_SPEED
+#define GT911_I2C_CONFIG_MASTER_CLK_SPEED 400000U
+#endif
+#ifndef GT911_TOUCH_CONFIG_RST_GPIO_NUM
+#define GT911_TOUCH_CONFIG_RST_GPIO_NUM -1
+#endif
+#ifndef TOUCH_SWAP_XY
+#define TOUCH_SWAP_XY false
+#endif
+#ifndef TOUCH_MIRROR_X
+#define TOUCH_MIRROR_X false
+#endif
+#ifndef TOUCH_MIRROR_Y
+#define TOUCH_MIRROR_Y false
+#endif
+#ifndef TOUCH_EXTRA_MIRROR_Y
+#define TOUCH_EXTRA_MIRROR_Y true
+#endif
+
+static constexpr int32_t TOUCH_I2C_SDA_PIN = GT911_I2C_CONFIG_SDA_IO_NUM;
+static constexpr int32_t TOUCH_I2C_SCL_PIN = GT911_I2C_CONFIG_SCL_IO_NUM;
+static constexpr int32_t TOUCH_RST_PIN = GT911_TOUCH_CONFIG_RST_GPIO_NUM;
+static constexpr uint32_t TOUCH_I2C_CLOCK_HZ = (uint32_t)GT911_I2C_CONFIG_MASTER_CLK_SPEED;
+static constexpr uint8_t TOUCH_GT911_ADDR = 0x5D;
+static constexpr uint8_t TOUCH_GT911_ADDR_ALT = 0x14;
+
+static TouchLib* s_touchPanel = nullptr;
+static bool s_touchReady = false;
+static uint8_t s_touchAddrInUse = 0;
+static int16_t s_touchLastX = 0;
+static int16_t s_touchLastY = 0;
+
+static inline int16_t clamp_touch_coord(int32_t v, int32_t max_v)
+{
+    if (v < 0) return 0;
+    if (v > max_v) return (int16_t)max_v;
+    return (int16_t)v;
+}
+
+static void transform_touch_point(int16_t* x, int16_t* y)
+{
+    if (!x || !y) return;
+
+    int32_t tx = *x;
+    int32_t ty = *y;
+
+#if TOUCH_SWAP_XY
+    int32_t tmp = tx;
+    tx = ty;
+    ty = tmp;
+#endif
+
+#if TOUCH_MIRROR_X
+    tx = (SCREEN_WIDTH - 1) - tx;
+#endif
+
+#if TOUCH_MIRROR_Y
+    ty = (SCREEN_HEIGHT - 1) - ty;
+#endif
+
+#if DISPLAY_ROTATE_180
+    tx = (SCREEN_WIDTH - 1) - tx;
+    ty = (SCREEN_HEIGHT - 1) - ty;
+#endif
+
+#if TOUCH_EXTRA_MIRROR_Y
+    ty = (SCREEN_HEIGHT - 1) - ty;
+#endif
+
+    *x = clamp_touch_coord(tx, SCREEN_WIDTH - 1);
+    *y = clamp_touch_coord(ty, SCREEN_HEIGHT - 1);
+}
+
+static bool init_touch_panel()
+{
+    if (s_touchReady) return true;
+
+    Wire.begin((int)TOUCH_I2C_SDA_PIN, (int)TOUCH_I2C_SCL_PIN);
+    Wire.setClock(TOUCH_I2C_CLOCK_HZ);
+
+    const uint8_t addr_candidates[] = {TOUCH_GT911_ADDR, TOUCH_GT911_ADDR_ALT};
+    for (size_t i = 0; i < (sizeof(addr_candidates) / sizeof(addr_candidates[0])); ++i) {
+        uint8_t addr = addr_candidates[i];
+        if (i > 0 && addr == addr_candidates[0]) continue;
+
+        if (s_touchPanel) {
+            delete s_touchPanel;
+            s_touchPanel = nullptr;
+        }
+
+        s_touchPanel = new TouchLib(Wire, TOUCH_I2C_SDA_PIN, TOUCH_I2C_SCL_PIN, addr, TOUCH_RST_PIN);
+        if (!s_touchPanel) {
+            Serial.println("[DisplayMgr] touch alloc failed");
+            break;
+        }
+
+        if (s_touchPanel->init()) {
+            s_touchReady = true;
+            s_touchAddrInUse = addr;
+            break;
+        }
+    }
+
+    if (!s_touchReady) {
+        Serial.printf("[DisplayMgr] touch init failed (sda=%d scl=%d tried=0x%02X,0x%02X)\n",
+                      (int)TOUCH_I2C_SDA_PIN,
+                      (int)TOUCH_I2C_SCL_PIN,
+                      (unsigned int)TOUCH_GT911_ADDR,
+                      (unsigned int)TOUCH_GT911_ADDR_ALT);
+        TEST_LOG("touch init failed");
+        return false;
+    }
+
+    Serial.printf("[DisplayMgr] touch init done (sda=%d scl=%d addr=0x%02X clk=%u)\n",
+                  (int)TOUCH_I2C_SDA_PIN,
+                  (int)TOUCH_I2C_SCL_PIN,
+                  (unsigned int)s_touchAddrInUse,
+                  (unsigned int)TOUCH_I2C_CLOCK_HZ);
+    TEST_LOG("touch init done (sda=%d scl=%d addr=0x%02X clk=%u)",
+             (int)TOUCH_I2C_SDA_PIN,
+             (int)TOUCH_I2C_SCL_PIN,
+             (unsigned int)s_touchAddrInUse,
+             (unsigned int)TOUCH_I2C_CLOCK_HZ);
+    return true;
+}
+
+static void lvgl_touch_read_cb(lv_indev_drv_t* indev_drv, lv_indev_data_t* data)
+{
+    LV_UNUSED(indev_drv);
+    if (!data) return;
+
+    if (!s_touchReady) {
+        data->state = LV_INDEV_STATE_REL;
+        data->point.x = s_touchLastX;
+        data->point.y = s_touchLastY;
+        return;
+    }
+
+    if (s_touchPanel && s_touchPanel->read()) {
+        TP_Point p = s_touchPanel->getPoint(0);
+        int16_t x = (int16_t)p.x;
+        int16_t y = (int16_t)p.y;
+        transform_touch_point(&x, &y);
+
+        s_touchLastX = x;
+        s_touchLastY = y;
+
+        data->state = LV_INDEV_STATE_PR;
+        data->point.x = x;
+        data->point.y = y;
+    } else {
+        data->state = LV_INDEV_STATE_REL;
+        data->point.x = s_touchLastX;
+        data->point.y = s_touchLastY;
+    }
+}
+#endif
 
 static inline uint32_t area_pixels(const lv_area_t* a)
 {
@@ -131,6 +315,9 @@ static inline bool area_can_merge(const lv_area_t* a, const lv_area_t* b)
     return true;
 }
 
+static inline void request_full_invalidate();
+static void display_diag_log(const char* tag);
+
 static inline lv_area_t area_union(const lv_area_t* a, const lv_area_t* b)
 {
     lv_area_t out;
@@ -170,7 +357,45 @@ static void add_dirty_area_merged(const lv_area_t* area)
         s_dirtyAreas[0].y1 = 0;
         s_dirtyAreas[0].x2 = SCREEN_WIDTH - 1;
         s_dirtyAreas[0].y2 = SCREEN_HEIGHT - 1;
+        request_full_invalidate();
+        display_diag_log("dirty-overflow");
     }
+}
+
+static inline void mark_scene_reset_pending()
+{
+    s_sceneResetPending = true;
+    s_backBufferSynced = false;
+    s_frameHasFullRefreshArea = false;
+    s_dirtyAreaCount = 0;
+    s_flushFrameStarted = false;
+}
+
+static inline void request_full_invalidate()
+{
+    s_forceFullInvalidatePending = true;
+}
+
+static void display_diag_log(const char* tag)
+{
+    uint32_t nowMs = (uint32_t)(esp_timer_get_time() / 1000ULL);
+    if ((nowMs - s_diagLastLogMs) < 500U) return;
+    s_diagLastLogMs = nowMs;
+
+    Serial.printf(
+        "[DisplayMgr][DIAG] %s req=%u done=%u skip=%u forced=%u bypass=%u dirty=%u backSync=%d frameFull=%d sceneReset=%d vsync=%u\n",
+        tag ? tag : "(null)",
+        (unsigned int)s_swapReqCount,
+        (unsigned int)s_swapDoneCount,
+        (unsigned int)s_swapSkipTimeoutCount,
+        (unsigned int)s_swapForcedOnTimeoutCount,
+        (unsigned int)s_replayBypassCount,
+        (unsigned int)s_dirtyAreaCount,
+        s_backBufferSynced ? 1 : 0,
+        s_frameHasFullRefreshArea ? 1 : 0,
+        s_sceneResetPending ? 1 : 0,
+        (unsigned int)s_vsyncCount
+    );
 }
 
 static bool IRAM_ATTR idle_hook_cpu0(void)
@@ -199,39 +424,97 @@ static void register_idle_hooks_once()
     }
 }
 
+static void reset_cpu_usage_sampler()
+{
+    s_cpuPrevIdle0 = 0;
+    s_cpuPrevIdle1 = 0;
+    s_cpuPeakIdle0 = 1;
+    s_cpuPeakIdle1 = 1;
+    s_cpuPrevSampleTick = 0;
+    s_cpuFilteredUsage0 = 0;
+    s_cpuFilteredUsage1 = 0;
+    s_cpuUsageValid = false;
+    s_cpuWarmupSamples = 3;
+}
+
 static bool sample_cpu_usage(uint8_t* core0_usage, uint8_t* core1_usage)
 {
     if (!core0_usage || !core1_usage || !s_idleHooksRegistered) return false;
-
-    static uint32_t prevIdle0 = 0;
-    static uint32_t prevIdle1 = 0;
-    static uint32_t peakIdle0 = 1;
-    static uint32_t peakIdle1 = 1;
+    const TickType_t maxGapTicks = MONITOR_UPDATE_PERIOD_TICKS * 3;
+    TickType_t nowTick = xTaskGetTickCount();
 
     uint32_t nowIdle0 = s_idleLoopCount[0];
     uint32_t nowIdle1 = s_idleLoopCount[1];
 
-    if (prevIdle0 == 0 && prevIdle1 == 0) {
-        prevIdle0 = nowIdle0;
-        prevIdle1 = nowIdle1;
+    if (s_cpuPrevSampleTick == 0 || (s_cpuPrevIdle0 == 0 && s_cpuPrevIdle1 == 0)) {
+        s_cpuPrevIdle0 = nowIdle0;
+        s_cpuPrevIdle1 = nowIdle1;
+        s_cpuPrevSampleTick = nowTick;
         return false;
     }
 
-    uint32_t dIdle0 = nowIdle0 - prevIdle0;
-    uint32_t dIdle1 = nowIdle1 - prevIdle1;
-    prevIdle0 = nowIdle0;
-    prevIdle1 = nowIdle1;
+    TickType_t dt = nowTick - s_cpuPrevSampleTick;
+    if (dt > maxGapTicks) {
+        // Ignore stale deltas after long pauses (e.g. debug screen open),
+        // otherwise one oversized idle delta corrupts peak normalization.
+        s_cpuPrevIdle0 = nowIdle0;
+        s_cpuPrevIdle1 = nowIdle1;
+        s_cpuPrevSampleTick = nowTick;
+        if (s_cpuUsageValid) {
+            *core0_usage = s_cpuFilteredUsage0;
+            *core1_usage = s_cpuFilteredUsage1;
+            return true;
+        }
+        return false;
+    }
 
-    if (dIdle0 > peakIdle0) peakIdle0 = dIdle0;
-    if (dIdle1 > peakIdle1) peakIdle1 = dIdle1;
+    uint32_t dIdle0 = nowIdle0 - s_cpuPrevIdle0;
+    uint32_t dIdle1 = nowIdle1 - s_cpuPrevIdle1;
+    s_cpuPrevIdle0 = nowIdle0;
+    s_cpuPrevIdle1 = nowIdle1;
+    s_cpuPrevSampleTick = nowTick;
 
-    uint32_t u0 = 100U - ((dIdle0 * 100U) / peakIdle0);
-    uint32_t u1 = 100U - ((dIdle1 * 100U) / peakIdle1);
+    // Keep peak as a monotonic baseline for stability.
+    // Decaying peak tracks short-term noise and amplifies jitter in usage ratio.
+    if (dIdle0 > s_cpuPeakIdle0) s_cpuPeakIdle0 = dIdle0;
+    if (dIdle1 > s_cpuPeakIdle1) s_cpuPeakIdle1 = dIdle1;
+    if (s_cpuPeakIdle0 == 0) s_cpuPeakIdle0 = 1;
+    if (s_cpuPeakIdle1 == 0) s_cpuPeakIdle1 = 1;
+
+    uint32_t u0 = 100U - ((dIdle0 * 100U) / s_cpuPeakIdle0);
+    uint32_t u1 = 100U - ((dIdle1 * 100U) / s_cpuPeakIdle1);
     if (u0 > 100U) u0 = 100U;
     if (u1 > 100U) u1 = 100U;
 
-    *core0_usage = (uint8_t)u0;
-    *core1_usage = (uint8_t)u1;
+    if (s_cpuWarmupSamples > 0) {
+        s_cpuFilteredUsage0 = (uint8_t)u0;
+        s_cpuFilteredUsage1 = (uint8_t)u1;
+        s_cpuWarmupSamples--;
+        if (s_cpuWarmupSamples == 0) {
+            s_cpuUsageValid = true;
+            *core0_usage = s_cpuFilteredUsage0;
+            *core1_usage = s_cpuFilteredUsage1;
+            return true;
+        }
+        return false;
+    }
+
+    // Strong low-pass filter + per-sample slew limiter to suppress rapid oscillation.
+    const uint32_t filtDen = 16U;
+    const uint32_t filtAlpha = 1U; // 6.25% new sample
+    uint32_t next0 = ((uint32_t)s_cpuFilteredUsage0 * (filtDen - filtAlpha) + (u0 * filtAlpha) + (filtDen / 2U)) / filtDen;
+    uint32_t next1 = ((uint32_t)s_cpuFilteredUsage1 * (filtDen - filtAlpha) + (u1 * filtAlpha) + (filtDen / 2U)) / filtDen;
+    const uint32_t maxStep = 5U;
+    if (next0 > ((uint32_t)s_cpuFilteredUsage0 + maxStep)) next0 = (uint32_t)s_cpuFilteredUsage0 + maxStep;
+    if ((next0 + maxStep) < (uint32_t)s_cpuFilteredUsage0) next0 = (uint32_t)s_cpuFilteredUsage0 - maxStep;
+    if (next1 > ((uint32_t)s_cpuFilteredUsage1 + maxStep)) next1 = (uint32_t)s_cpuFilteredUsage1 + maxStep;
+    if ((next1 + maxStep) < (uint32_t)s_cpuFilteredUsage1) next1 = (uint32_t)s_cpuFilteredUsage1 - maxStep;
+    s_cpuFilteredUsage0 = (uint8_t)next0;
+    s_cpuFilteredUsage1 = (uint8_t)next1;
+    s_cpuUsageValid = true;
+
+    *core0_usage = s_cpuFilteredUsage0;
+    *core1_usage = s_cpuFilteredUsage1;
     return true;
 }
 
@@ -338,6 +621,9 @@ static void show_gauge_screen_locked(SystemAPI* system)
     if (!screen) return;
 
     lv_obj_clean(screen);
+    lv_obj_set_style_bg_color(screen, lv_color_black(), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
+    mark_scene_reset_pending();
     GaugeInit();
     if (system) {
         UiSharedState snap = {};
@@ -687,10 +973,27 @@ void DisplayMgr::StartLVGL() {
     _disp_drv.user_data = this;
     _disp_drv.full_refresh = 0;
     _disp_drv.direct_mode = 0;
-    _disp_drv.antialiasing = 0;
+    // _disp_drv.antialiasing = 0;
 
     lv_disp_drv_register(&_disp_drv);
     TEST_LOG("lv_disp_drv_register done");
+
+#if defined(BOARD_HAS_TOUCH)
+    if (init_touch_panel()) {
+        static lv_indev_drv_t indev_drv;
+        lv_indev_drv_init(&indev_drv);
+        indev_drv.type = LV_INDEV_TYPE_POINTER;
+        indev_drv.read_cb = lvgl_touch_read_cb;
+        lv_indev_t* indev = lv_indev_drv_register(&indev_drv);
+        Serial.printf("[DisplayMgr] LVGL touch indev register %s (addr=0x%02X)\n",
+                      indev ? "ok" : "fail",
+                      (unsigned int)s_touchAddrInUse);
+        TEST_LOG("lv_indev_drv_register done (touch)");
+    } else {
+        Serial.println("[DisplayMgr] touch init failed; LVGL touch input disabled");
+        TEST_LOG("touch init failed; LVGL touch input disabled");
+    }
+#endif
 
     static lv_fs_drv_t fs_drv;
     lv_fs_drv_init(&fs_drv);
@@ -819,6 +1122,7 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
 
         if (isFullFrame) {
             s_frameHasFullRefreshArea = true;
+            s_sceneResetPending = false;
             // No need to keep dirty list for full-frame redraw.
             s_dirtyAreaCount = 0;
         } else {
@@ -828,10 +1132,18 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
                 uint16_t* front = self->_fb_buf[self->_frontFbIndex];
                 uint16_t* back = self->_fb_buf[self->_backFbIndex];
                 if (front && back) {
-                    memcpy(back, front, self->_fb_pixels * sizeof(uint16_t));
+                    if (s_sceneResetPending) {
+                        // Scene transition (e.g., splash->gauge): don't reuse old frame.
+                        memset(back, 0, self->_fb_pixels * sizeof(uint16_t));
+                        display_diag_log("resync-scene-reset");
+                    } else {
+                        memcpy(back, front, self->_fb_pixels * sizeof(uint16_t));
+                        display_diag_log("resync-front-to-back");
+                    }
                     cache_writeback_span(back, self->_fb_pixels * sizeof(uint16_t));
                 }
                 s_backBufferSynced = true;
+                s_sceneResetPending = false;
             }
 
             // Store dirty area for replay; merge fragments to reduce copy cost.
@@ -899,6 +1211,8 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
                     s_backBufferSynced = true;
                     s_dirtyAreaCount = 0;
                     s_flushFrameStarted = false;
+                    request_full_invalidate();
+                    display_diag_log("vsync-timeout-skip");
                     lv_disp_flush_ready(drv);
                     return;
                 }
@@ -906,6 +1220,8 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
                 // Keep pipeline alive on repeated timeout bursts.
                 s_swapForcedOnTimeoutCount++;
                 s_vsyncTimeoutConsecutive = 0;
+                request_full_invalidate();
+                display_diag_log("vsync-timeout-force-swap");
             } else {
                 s_vsyncTimeoutConsecutive = 0;
             }
@@ -944,6 +1260,8 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
                     s_backBufferSynced = false;
                     s_replayBypassCount++;
                     s_flushFrameStarted = false;
+                    request_full_invalidate();
+                    display_diag_log("replay-bypass");
                     lv_disp_flush_ready(drv);
                     return;
                 }
@@ -1285,14 +1603,33 @@ void DisplayMgr::HandleLvglTask(void *pvParameters)
     uint32_t prevSingleFrame = 0;
     uint32_t prevSinglePixel = 0;
     uint64_t prevSingleCopyUs = 0;
+    bool prevDebugBusy = false;
     Serial.println("[DisplayMgr] LvglTask started");
 
     while (true) {
         if (system->LockLvgl(pdMS_TO_TICKS(5))) {
             lv_timer_handler();
+            if (s_forceFullInvalidatePending && !s_splashActive) {
+                lv_obj_t* screen = lv_scr_act();
+                if (screen) {
+                    lv_obj_invalidate(screen);
+                    display_diag_log("full-invalidate-requested");
+                }
+                s_forceFullInvalidatePending = false;
+            }
 
             TickType_t now = xTaskGetTickCount();
-            if (!s_splashActive &&
+            bool debugVisible = ui_debug_log_capture_enabled();
+            bool debugAnimating = ui_debug_overlay_animating();
+            bool debugBusy = debugVisible || debugAnimating;
+            if (debugBusy != prevDebugBusy) {
+                reset_cpu_usage_sampler();
+            }
+            if (prevDebugBusy && !debugBusy) {
+                lastUiTick = now - UI_SHARED_UPDATE_PERIOD_TICKS;
+                lastMonTick = now - MONITOR_UPDATE_PERIOD_TICKS;
+            }
+            if (!s_splashActive && !debugBusy &&
                 (now - lastUiTick) >= UI_SHARED_UPDATE_PERIOD_TICKS) {
                 UiSharedState snap = {};
                 if (system->GetUiSharedSnapshot(&snap, 0)) {
@@ -1301,7 +1638,7 @@ void DisplayMgr::HandleLvglTask(void *pvParameters)
                 lastUiTick = now;
             }
 
-            if (!s_splashActive &&
+            if (!s_splashActive && !debugBusy &&
                 (now - lastMonTick) >= MONITOR_UPDATE_PERIOD_TICKS &&
                 (s_monitorResumeTick == 0 || now >= s_monitorResumeTick)) {
                 // if (lv_anim_count_running() == 0) {
@@ -1313,6 +1650,8 @@ void DisplayMgr::HandleLvglTask(void *pvParameters)
                     uint8_t core1 = 0;
                     if (sample_cpu_usage(&core0, &core1)) {
                         update_system_monitor(ram, core0, core1);
+                    } else if (s_cpuUsageValid) {
+                        update_system_monitor(ram, s_cpuFilteredUsage0, s_cpuFilteredUsage1);
                     } else {
                         update_system_monitor(ram, 0, 0);
                     }
@@ -1359,6 +1698,7 @@ void DisplayMgr::HandleLvglTask(void *pvParameters)
                 s_singleFlushMaxCopyUs = 0;
                 lastSyncLogTick = now;
             }
+            prevDebugBusy = debugBusy;
 
             system->UnlockLvgl();
         }

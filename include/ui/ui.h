@@ -77,6 +77,7 @@ void create_sys_monitor_panel();
 void create_goodbye_screen(const char* time_text, const char* distance_text);
 void create_debug_screen(void);
 bool ui_debug_log_capture_enabled(void);
+bool ui_debug_overlay_animating(void);
 void ui_debug_log_enqueue(const char* line);
 void update_monitor_ui(monitor_item_t * item, int32_t usage);
 void update_system_monitor(int32_t ram_percent, int32_t core1_percent, int32_t core2_percent);

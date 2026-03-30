@@ -26,6 +26,10 @@ static void trim_trailing_newline(char* text)
 #define UART_LOG_MAX_PER_SEC 48U
 #endif
 
+#ifndef UART_LOG_ONLY_WHEN_DEBUG_VISIBLE
+#define UART_LOG_ONLY_WHEN_DEBUG_VISIBLE 1
+#endif
+
 static portMUX_TYPE s_uartLogBudgetMux = portMUX_INITIALIZER_UNLOCKED;
 
 static bool uart_log_budget_acquire()
@@ -53,6 +57,10 @@ static bool uart_log_budget_acquire()
 void UartLogf(const char* fmt, ...)
 {
     if (!fmt) return;
+    bool debugVisible = ui_debug_log_capture_enabled();
+#if UART_LOG_ONLY_WHEN_DEBUG_VISIBLE
+    if (!debugVisible) return;
+#endif
     if (!uart_log_budget_acquire()) return;
 
     char uart_line[384];
@@ -72,7 +80,7 @@ void UartLogf(const char* fmt, ...)
 
     trim_trailing_newline(uart_line);
     if (uart_line[0] == '\0') return;
-    if (!ui_debug_log_capture_enabled()) return;
+    if (!debugVisible) return;
 
     char ui_line[420];
     snprintf(ui_line, sizeof(ui_line), "[UART] %s", uart_line);

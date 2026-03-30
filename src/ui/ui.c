@@ -35,8 +35,10 @@ static int32_t coolant_rendered_value = -1;
 static int32_t battery_rendered_value = -1;
 static lv_obj_t * debug_container = NULL;
 static lv_obj_t * debug_swipe_zone = NULL;
+static lv_obj_t * debug_close_zone = NULL;
 static lv_obj_t * debug_log_ta = NULL;
 static volatile bool debug_screen_visible = false;
+static volatile bool debug_animation_active = false;
 static bool debug_swipe_tracking = false;
 static bool debug_hide_tracking = false;
 static lv_point_t debug_swipe_start = {0, 0};
@@ -44,38 +46,113 @@ static lv_point_t debug_hide_start = {0, 0};
 static lv_timer_t * debug_log_flush_timer = NULL;
 static QueueHandle_t debug_log_queue = NULL;
 
-static const int32_t DEBUG_EDGE_ZONE_HEIGHT = 28;
+static const int32_t DEBUG_OPEN_ZONE_HEIGHT = 100;
+static const int32_t DEBUG_CLOSE_ZONE_HEIGHT = 100;
 static const int32_t DEBUG_OPEN_TRIGGER_PX = 60;
-static const int32_t DEBUG_CLOSE_TRIGGER_PX = 50;
-static const int32_t DEBUG_HEADER_GESTURE_HEIGHT = 70;
-static const uint32_t DEBUG_PANEL_ANIM_MS = 220;
-static const uint32_t DEBUG_LOG_FLUSH_PERIOD_MS = 120;
-static const uint32_t DEBUG_LOG_FLUSH_BATCH = 4;
+static const int32_t DEBUG_CLOSE_TRIGGER_PX = 60;
+// Keep this false when touch coordinates are already aligned to physical Y.
+static const bool DEBUG_GESTURE_Y_INVERTED = false;
+static const uint32_t DEBUG_PANEL_ANIM_MS = 500;
+static const uint32_t DEBUG_LOG_FLUSH_PERIOD_MS = 200;
+static const uint32_t DEBUG_LOG_FLUSH_BATCH = 8;
 static const uint32_t DEBUG_LOG_QUEUE_DEPTH = 96;
 static const uint32_t DEBUG_LOG_TEXT_MAX_CHARS = 6000;
+static const uint32_t DEBUG_LOG_ENQUEUE_MAX_PER_SEC = 12;
+
+static portMUX_TYPE debug_log_budget_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t debug_log_budget_window_ms = 0;
+static uint16_t debug_log_budget_count = 0;
+static uint16_t debug_log_budget_dropped = 0;
 
 static void set_coolant_gauge_instant(int32_t val);
 static void set_battery_gauge_instant(int32_t val);
 static void start_needle_ceremony(void);
 static void apply_latched_obd_needles(void);
 static void needle_ceremony_delay_timer_cb(lv_timer_t * t);
-static bool get_active_touch_point(lv_point_t * p);
+static bool get_active_touch_point(lv_event_t * e, lv_point_t * p);
+static void debug_invalidate_full_screen(void);
 static void debug_show_panel(bool anim);
 static void debug_hide_panel(bool anim);
 static void debug_swipe_zone_event_cb(lv_event_t * e);
-static void debug_panel_event_cb(lv_event_t * e);
+static void debug_close_zone_event_cb(lv_event_t * e);
 static void create_debug_swipe_zone(void);
+static void create_debug_close_zone(void);
 static QueueHandle_t get_debug_log_queue(void);
 static void debug_log_queue_clear(void);
 static void debug_log_flush_timer_cb(lv_timer_t * t);
+static int32_t debug_get_physical_y(int32_t y);
+static void debug_log_budget_reset(void);
+static bool debug_log_budget_take(uint16_t * dropped_report);
+static void debug_log_queue_push_line(const char* line);
 
-static bool get_active_touch_point(lv_point_t * p)
+static bool get_active_touch_point(lv_event_t * e, lv_point_t * p)
 {
     if (!p) return false;
-    lv_indev_t * indev = lv_indev_get_act();
+    lv_indev_t * indev = NULL;
+    if (e) {
+        indev = lv_event_get_indev(e);
+    }
+    if (!indev) {
+        indev = lv_indev_get_act();
+    }
+    if (!indev) {
+        indev = lv_indev_get_next(NULL);
+        while (indev && lv_indev_get_type(indev) != LV_INDEV_TYPE_POINTER) {
+            indev = lv_indev_get_next(indev);
+        }
+    }
     if (!indev) return false;
     lv_indev_get_point(indev, p);
     return true;
+}
+
+static int32_t debug_get_physical_y(int32_t y)
+{
+    if (!DEBUG_GESTURE_Y_INVERTED) return y;
+    return (SCREEN_HEIGHT - 1) - y;
+}
+
+static void debug_log_budget_reset(void)
+{
+    portENTER_CRITICAL(&debug_log_budget_mux);
+    debug_log_budget_window_ms = 0;
+    debug_log_budget_count = 0;
+    debug_log_budget_dropped = 0;
+    portEXIT_CRITICAL(&debug_log_budget_mux);
+}
+
+static bool debug_log_budget_take(uint16_t * dropped_report)
+{
+    if (dropped_report) *dropped_report = 0;
+    uint32_t now = (uint32_t)(xTaskGetTickCount() * (TickType_t)portTICK_PERIOD_MS);
+    bool allow = false;
+
+    portENTER_CRITICAL(&debug_log_budget_mux);
+    if (debug_log_budget_window_ms == 0 || (now - debug_log_budget_window_ms) >= 1000U) {
+        debug_log_budget_window_ms = now;
+        debug_log_budget_count = 0;
+        if (dropped_report) {
+            *dropped_report = debug_log_budget_dropped;
+        }
+        debug_log_budget_dropped = 0;
+    }
+
+    if (debug_log_budget_count < DEBUG_LOG_ENQUEUE_MAX_PER_SEC) {
+        debug_log_budget_count++;
+        allow = true;
+    } else {
+        debug_log_budget_dropped++;
+    }
+    portEXIT_CRITICAL(&debug_log_budget_mux);
+
+    return allow;
+}
+
+static void debug_invalidate_full_screen(void)
+{
+    lv_obj_t * scr = lv_scr_act();
+    if (!scr) return;
+    lv_obj_invalidate(scr);
 }
 
 static void debug_panel_y_anim_exec_cb(void * var, int32_t y)
@@ -83,32 +160,50 @@ static void debug_panel_y_anim_exec_cb(void * var, int32_t y)
     lv_obj_set_y((lv_obj_t *)var, y);
 }
 
+static void debug_show_anim_ready_cb(lv_anim_t * a)
+{
+    LV_UNUSED(a);
+    debug_animation_active = false;
+    debug_invalidate_full_screen();
+}
+
 static void debug_hide_anim_ready_cb(lv_anim_t * a)
 {
     LV_UNUSED(a);
+    debug_animation_active = false;
     if (debug_container) {
         lv_obj_add_flag(debug_container, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (debug_close_zone) {
+        lv_obj_add_flag(debug_close_zone, LV_OBJ_FLAG_HIDDEN);
     }
     if (debug_swipe_zone) {
         lv_obj_move_foreground(debug_swipe_zone);
     }
+    debug_invalidate_full_screen();
 }
 
 static void debug_show_panel(bool anim)
 {
-    if (!debug_container || debug_screen_visible) return;
+    if (!debug_container || debug_screen_visible || debug_animation_active) return;
 
     debug_screen_visible = true;
     lv_obj_clear_flag(debug_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(debug_container);
+    if (debug_close_zone) {
+        lv_obj_clear_flag(debug_close_zone, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(debug_close_zone);
+    }
     lv_anim_del(debug_container, (lv_anim_exec_xcb_t)debug_panel_y_anim_exec_cb);
     if (debug_log_flush_timer) {
         lv_timer_resume(debug_log_flush_timer);
     }
 
     if (!anim) {
+        debug_animation_active = false;
         lv_obj_set_y(debug_container, 0);
         debug_log_flush_timer_cb(NULL);
+        debug_invalidate_full_screen();
         return;
     }
 
@@ -119,26 +214,34 @@ static void debug_show_panel(bool anim)
     lv_anim_set_values(&a, lv_obj_get_y(debug_container), 0);
     lv_anim_set_time(&a, DEBUG_PANEL_ANIM_MS);
     lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_set_ready_cb(&a, debug_show_anim_ready_cb);
+    debug_animation_active = true;
     lv_anim_start(&a);
 }
 
 static void debug_hide_panel(bool anim)
 {
-    if (!debug_container || !debug_screen_visible) return;
+    if (!debug_container || !debug_screen_visible || debug_animation_active) return;
 
     debug_screen_visible = false;
+    if (debug_close_zone) {
+        lv_obj_add_flag(debug_close_zone, LV_OBJ_FLAG_HIDDEN);
+    }
     lv_anim_del(debug_container, (lv_anim_exec_xcb_t)debug_panel_y_anim_exec_cb);
     if (debug_log_flush_timer) {
         lv_timer_pause(debug_log_flush_timer);
     }
     debug_log_queue_clear();
+    debug_log_budget_reset();
 
     if (!anim) {
+        debug_animation_active = false;
         lv_obj_set_y(debug_container, -SCREEN_HEIGHT);
         lv_obj_add_flag(debug_container, LV_OBJ_FLAG_HIDDEN);
         if (debug_swipe_zone) {
             lv_obj_move_foreground(debug_swipe_zone);
         }
+        debug_invalidate_full_screen();
         return;
     }
 
@@ -150,6 +253,7 @@ static void debug_hide_panel(bool anim)
     lv_anim_set_time(&a, DEBUG_PANEL_ANIM_MS);
     lv_anim_set_path_cb(&a, lv_anim_path_ease_in);
     lv_anim_set_ready_cb(&a, debug_hide_anim_ready_cb);
+    debug_animation_active = true;
     lv_anim_start(&a);
 }
 
@@ -158,19 +262,21 @@ static void debug_swipe_zone_event_cb(lv_event_t * e)
     lv_event_code_t code = lv_event_get_code(e);
 
     if (code == LV_EVENT_PRESSED) {
-        if (debug_screen_visible) return;
-        if (get_active_touch_point(&debug_swipe_start)) {
-            debug_swipe_tracking = true;
-        }
+        if (debug_screen_visible || debug_animation_active) return;
+        debug_swipe_tracking = false;
+        if (!get_active_touch_point(e, &debug_swipe_start)) return;
+        int32_t start_y = debug_get_physical_y(debug_swipe_start.y);
+        if (start_y > DEBUG_OPEN_ZONE_HEIGHT) return;
+        debug_swipe_tracking = true;
         return;
     }
 
     if (code == LV_EVENT_PRESSING) {
-        if (!debug_swipe_tracking || debug_screen_visible) return;
+        if (!debug_swipe_tracking || debug_screen_visible || debug_animation_active) return;
         lv_point_t p;
-        if (!get_active_touch_point(&p)) return;
+        if (!get_active_touch_point(e, &p)) return;
 
-        int32_t dy = p.y - debug_swipe_start.y;
+        int32_t dy = debug_get_physical_y(p.y) - debug_get_physical_y(debug_swipe_start.y);
         if (dy >= DEBUG_OPEN_TRIGGER_PX) {
             debug_swipe_tracking = false;
             debug_show_panel(true);
@@ -178,31 +284,46 @@ static void debug_swipe_zone_event_cb(lv_event_t * e)
         return;
     }
 
-    if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+    if (code == LV_EVENT_RELEASED) {
+        if (debug_swipe_tracking && !debug_screen_visible && !debug_animation_active) {
+            lv_point_t p;
+            if (get_active_touch_point(e, &p)) {
+                int32_t dy = debug_get_physical_y(p.y) - debug_get_physical_y(debug_swipe_start.y);
+                if (dy >= DEBUG_OPEN_TRIGGER_PX) {
+                    debug_show_panel(true);
+                }
+            }
+        }
+        debug_swipe_tracking = false;
+        return;
+    }
+
+    if (code == LV_EVENT_PRESS_LOST) {
         debug_swipe_tracking = false;
     }
 }
 
-static void debug_panel_event_cb(lv_event_t * e)
+static void debug_close_zone_event_cb(lv_event_t * e)
 {
     lv_event_code_t code = lv_event_get_code(e);
 
     if (code == LV_EVENT_PRESSED) {
-        if (!debug_screen_visible) return;
+        if (!debug_screen_visible || debug_animation_active) return;
         lv_point_t p;
-        if (!get_active_touch_point(&p)) return;
-        if (p.y > DEBUG_HEADER_GESTURE_HEIGHT) return;
+        if (!get_active_touch_point(e, &p)) return;
+        int32_t start_y = debug_get_physical_y(p.y);
+        if (start_y < (SCREEN_HEIGHT - DEBUG_CLOSE_ZONE_HEIGHT)) return;
         debug_hide_start = p;
         debug_hide_tracking = true;
         return;
     }
 
     if (code == LV_EVENT_PRESSING) {
-        if (!debug_hide_tracking || !debug_screen_visible) return;
+        if (!debug_hide_tracking || !debug_screen_visible || debug_animation_active) return;
         lv_point_t p;
-        if (!get_active_touch_point(&p)) return;
+        if (!get_active_touch_point(e, &p)) return;
 
-        int32_t dy = p.y - debug_hide_start.y;
+        int32_t dy = debug_get_physical_y(p.y) - debug_get_physical_y(debug_hide_start.y);
         if (dy <= -DEBUG_CLOSE_TRIGGER_PX) {
             debug_hide_tracking = false;
             debug_hide_panel(true);
@@ -210,7 +331,21 @@ static void debug_panel_event_cb(lv_event_t * e)
         return;
     }
 
-    if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+    if (code == LV_EVENT_RELEASED) {
+        if (debug_hide_tracking && debug_screen_visible && !debug_animation_active) {
+            lv_point_t p;
+            if (get_active_touch_point(e, &p)) {
+                int32_t dy = debug_get_physical_y(p.y) - debug_get_physical_y(debug_hide_start.y);
+                if (dy <= -DEBUG_CLOSE_TRIGGER_PX) {
+                    debug_hide_panel(true);
+                }
+            }
+        }
+        debug_hide_tracking = false;
+        return;
+    }
+
+    if (code == LV_EVENT_PRESS_LOST) {
         debug_hide_tracking = false;
     }
 }
@@ -218,7 +353,7 @@ static void debug_panel_event_cb(lv_event_t * e)
 static void create_debug_swipe_zone(void)
 {
     debug_swipe_zone = lv_obj_create(lv_scr_act());
-    lv_obj_set_size(debug_swipe_zone, SCREEN_WIDTH, DEBUG_EDGE_ZONE_HEIGHT);
+    lv_obj_set_size(debug_swipe_zone, SCREEN_WIDTH, DEBUG_OPEN_ZONE_HEIGHT);
     lv_obj_align(debug_swipe_zone, LV_ALIGN_TOP_MID, 0, 0);
     lv_obj_set_style_bg_opa(debug_swipe_zone, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(debug_swipe_zone, 0, 0);
@@ -229,6 +364,23 @@ static void create_debug_swipe_zone(void)
     lv_obj_add_flag(debug_swipe_zone, LV_OBJ_FLAG_PRESS_LOCK);
     lv_obj_add_event_cb(debug_swipe_zone, debug_swipe_zone_event_cb, LV_EVENT_ALL, NULL);
     lv_obj_move_foreground(debug_swipe_zone);
+}
+
+static void create_debug_close_zone(void)
+{
+    debug_close_zone = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(debug_close_zone, SCREEN_WIDTH, DEBUG_CLOSE_ZONE_HEIGHT);
+    lv_obj_align(debug_close_zone, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_opa(debug_close_zone, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(debug_close_zone, 0, 0);
+    lv_obj_set_style_radius(debug_close_zone, 0, 0);
+    lv_obj_set_style_pad_all(debug_close_zone, 0, 0);
+    lv_obj_clear_flag(debug_close_zone, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(debug_close_zone, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(debug_close_zone, LV_OBJ_FLAG_PRESS_LOCK);
+    lv_obj_add_event_cb(debug_close_zone, debug_close_zone_event_cb, LV_EVENT_ALL, NULL);
+    lv_obj_add_flag(debug_close_zone, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(debug_close_zone);
 }
 
 typedef struct {
@@ -247,6 +399,11 @@ bool ui_debug_log_capture_enabled(void)
     return debug_screen_visible;
 }
 
+bool ui_debug_overlay_animating(void)
+{
+    return debug_animation_active;
+}
+
 static void debug_log_queue_clear(void)
 {
     QueueHandle_t q = get_debug_log_queue();
@@ -258,10 +415,9 @@ static void debug_log_queue_clear(void)
     }
 }
 
-void ui_debug_log_enqueue(const char* line)
+static void debug_log_queue_push_line(const char* line)
 {
     if (!line || line[0] == '\0') return;
-    if (!ui_debug_log_capture_enabled()) return;
 
     QueueHandle_t q = get_debug_log_queue();
     if (!q) return;
@@ -275,6 +431,21 @@ void ui_debug_log_enqueue(const char* line)
         (void)xQueueReceive(q, &dropped, 0);
         (void)xQueueSend(q, &entry, 0);
     }
+}
+
+void ui_debug_log_enqueue(const char* line)
+{
+    if (!line || line[0] == '\0') return;
+    if (!ui_debug_log_capture_enabled()) return;
+    uint16_t dropped_report = 0;
+    bool allow = debug_log_budget_take(&dropped_report);
+    if (dropped_report > 0) {
+        char notice[80];
+        snprintf(notice, sizeof(notice), "[DBG] dropped %u lines", (unsigned int)dropped_report);
+        debug_log_queue_push_line(notice);
+    }
+    if (!allow) return;
+    debug_log_queue_push_line(line);
 }
 
 static void debug_log_flush_timer_cb(lv_timer_t * t)
@@ -898,14 +1069,17 @@ void UiResetRuntimeState(void)
     main_test_panel = NULL;
     debug_container = NULL;
     debug_swipe_zone = NULL;
+    debug_close_zone = NULL;
     debug_log_ta = NULL;
     debug_screen_visible = false;
+    debug_animation_active = false;
     debug_swipe_tracking = false;
     debug_hide_tracking = false;
     debug_swipe_start.x = 0;
     debug_swipe_start.y = 0;
     debug_hide_start.x = 0;
     debug_hide_start.y = 0;
+    debug_log_budget_reset();
 
     cpu_core1.bar = NULL;
     cpu_core1.label_val = NULL;
@@ -1087,8 +1261,8 @@ void create_debug_screen(void)
     lv_obj_t* main_title = lv_label_create(debug_container);
     lv_obj_set_width(main_title, LV_SIZE_CONTENT);   /// 8
     lv_obj_set_height(main_title, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_x(main_title, 20);
-    lv_obj_set_y(main_title, 10);
+    lv_obj_set_x(main_title, 10);
+    lv_obj_set_y(main_title, -5);
     lv_obj_set_align(main_title, LV_ALIGN_TOP_LEFT);
     lv_label_set_text(main_title, "Debug Log");
     lv_obj_set_style_text_color(main_title, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -1100,7 +1274,7 @@ void create_debug_screen(void)
     lv_obj_set_width(upper_bar, 800);
     lv_obj_set_height(upper_bar, 4);
     lv_obj_set_x(upper_bar, 0);
-    lv_obj_set_y(upper_bar, 65);
+    lv_obj_set_y(upper_bar, 35);
     lv_obj_set_align(upper_bar, LV_ALIGN_TOP_MID);
     lv_obj_clear_flag(upper_bar, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
     lv_obj_add_flag(upper_bar, LV_OBJ_FLAG_EVENT_BUBBLE);
@@ -1109,14 +1283,14 @@ void create_debug_screen(void)
     lv_obj_set_width(lower_bar, 60);
     lv_obj_set_height(lower_bar, 4);
     lv_obj_set_x(lower_bar, 0);
-    lv_obj_set_y(lower_bar, -5);
+    lv_obj_set_y(lower_bar, 10);
     lv_obj_set_align(lower_bar, LV_ALIGN_BOTTOM_MID);
     lv_obj_clear_flag(lower_bar, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
     lv_obj_add_flag(lower_bar, LV_OBJ_FLAG_EVENT_BUBBLE);
 
     lv_obj_t* log_ta = lv_textarea_create(debug_container);
     lv_obj_set_size(log_ta, 760, 390);
-    lv_obj_align(log_ta, LV_ALIGN_TOP_MID, 0, 75);
+    lv_obj_align(log_ta, LV_ALIGN_TOP_MID, 0, 45);
     lv_textarea_set_one_line(log_ta, false);
     lv_obj_set_scroll_dir(log_ta, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(log_ta, LV_SCROLLBAR_MODE_AUTO);
@@ -1129,8 +1303,8 @@ void create_debug_screen(void)
     lv_obj_set_style_text_color(log_ta, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_font(log_ta, &lv_font_montserrat_20, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_line_space(log_ta, 6, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_add_flag(log_ta, LV_OBJ_FLAG_EVENT_BUBBLE);
     debug_log_ta = log_ta;
+    create_debug_close_zone();
 
     if (debug_log_flush_timer) {
         lv_timer_del(debug_log_flush_timer);
@@ -1144,8 +1318,8 @@ void create_debug_screen(void)
 
     lv_obj_set_pos(debug_container, 0, -SCREEN_HEIGHT);
     lv_obj_add_flag(debug_container, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(debug_container, debug_panel_event_cb, LV_EVENT_ALL, NULL);
     debug_screen_visible = false;
+    debug_animation_active = false;
     create_debug_swipe_zone();
 }
 
