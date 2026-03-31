@@ -38,6 +38,7 @@ static volatile uint32_t s_swapDoneCount = 0;
 static volatile uint32_t s_swapSkipTimeoutCount = 0;
 static volatile uint32_t s_replayBypassCount = 0;
 static volatile uint32_t s_swapForcedOnTimeoutCount = 0;
+static volatile uint32_t s_panelRestartCount = 0;
 static volatile uint32_t s_singleFlushAreaCount = 0;
 static volatile uint32_t s_singleFlushFrameCount = 0;
 static volatile uint32_t s_singleFlushPixelCount = 0;
@@ -47,6 +48,7 @@ static bool s_flushFrameStarted = false;
 static bool s_usePseudoDoubleBuffer = false;
 static bool s_backBufferSynced = true;
 static bool s_frameHasFullRefreshArea = false;
+static bool s_frameStartedFromSceneReset = false;
 static lv_area_t s_dirtyAreas[64];
 static uint8_t s_dirtyAreaCount = 0;
 static bool s_sceneResetPending = false;
@@ -71,16 +73,39 @@ static bool s_loggedNullBackFb = false;
 static uint8_t s_vsyncTimeoutConsecutive = 0;
 static bool s_forceFullInvalidatePending = false;
 static uint32_t s_diagLastLogMs = 0;
+static uint32_t s_successfulPseudoSwapFrameCount = 0;
 
 static constexpr TickType_t MONITOR_UPDATE_PERIOD_TICKS = pdMS_TO_TICKS(200);
 static constexpr TickType_t UI_SHARED_UPDATE_PERIOD_TICKS = pdMS_TO_TICKS(100);
 static constexpr TickType_t LVGL_TASK_PERIOD_TICKS = pdMS_TO_TICKS(20);
-static constexpr uint8_t VSYNC_TIMEOUT_SKIP_BEFORE_FORCE_SWAP = 8;
+#ifndef DISPLAY_PERIODIC_FULL_SYNC_INTERVAL
+#define DISPLAY_PERIODIC_FULL_SYNC_INTERVAL 120U
+#endif
+static constexpr uint32_t PERIODIC_FULL_SYNC_INTERVAL_FRAMES = DISPLAY_PERIODIC_FULL_SYNC_INTERVAL;
+static constexpr uint8_t VSYNC_TIMEOUT_RESTART_THRESHOLD = 3;
+static constexpr uint32_t SPLASH_GIF_TIMER_PERIOD_MS = 1;
+static constexpr uint32_t SPLASH_LVGL_HANDLER_MAX_SLEEP_MS = 5;
 #ifndef DISPLAY_PCLK_DERATE_PERCENT
 #define DISPLAY_PCLK_DERATE_PERCENT 90U
 #endif
 static constexpr uint32_t DISPLAY_TARGET_PCLK_HZ =
     (uint32_t)(((uint64_t)ST7262_PANEL_CONFIG_TIMINGS_PCLK_HZ * (uint64_t)DISPLAY_PCLK_DERATE_PERCENT) / 100ULL);
+static constexpr uint32_t DISPLAY_TOTAL_H_PIXELS =
+    (uint32_t)ST7262_PANEL_CONFIG_TIMINGS_H_RES +
+    (uint32_t)ST7262_PANEL_CONFIG_TIMINGS_HSYNC_FRONT_PORCH +
+    (uint32_t)ST7262_PANEL_CONFIG_TIMINGS_HSYNC_PULSE_WIDTH +
+    (uint32_t)ST7262_PANEL_CONFIG_TIMINGS_HSYNC_BACK_PORCH;
+static constexpr uint32_t DISPLAY_TOTAL_V_LINES =
+    (uint32_t)ST7262_PANEL_CONFIG_TIMINGS_V_RES +
+    (uint32_t)ST7262_PANEL_CONFIG_TIMINGS_VSYNC_FRONT_PORCH +
+    (uint32_t)ST7262_PANEL_CONFIG_TIMINGS_VSYNC_PULSE_WIDTH +
+    (uint32_t)ST7262_PANEL_CONFIG_TIMINGS_VSYNC_BACK_PORCH;
+static constexpr uint32_t DISPLAY_FRAME_PERIOD_MS =
+    (uint32_t)((((uint64_t)DISPLAY_TOTAL_H_PIXELS * (uint64_t)DISPLAY_TOTAL_V_LINES * 1000ULL) +
+                (uint64_t)DISPLAY_TARGET_PCLK_HZ - 1ULL) /
+               (uint64_t)DISPLAY_TARGET_PCLK_HZ);
+static constexpr uint32_t DISPLAY_VSYNC_WAIT_BUDGET_MS =
+    ((DISPLAY_FRAME_PERIOD_MS + 12U) < 40U) ? 40U : (DISPLAY_FRAME_PERIOD_MS + 12U);
 static constexpr bool DISPLAY_ROTATE_180 = true;
 
 #if defined(BOARD_HAS_TOUCH)
@@ -317,6 +342,8 @@ static inline bool area_can_merge(const lv_area_t* a, const lv_area_t* b)
 
 static inline void request_full_invalidate();
 static void display_diag_log(const char* tag);
+static bool wait_for_vsync_edge(TickType_t timeoutTicks);
+static void request_rgb_panel_restart(esp_lcd_panel_handle_t panel, const char* tag);
 
 static inline lv_area_t area_union(const lv_area_t* a, const lv_area_t* b)
 {
@@ -383,12 +410,12 @@ static void display_diag_log(const char* tag)
     s_diagLastLogMs = nowMs;
 
     Serial.printf(
-        "[DisplayMgr][DIAG] %s req=%u done=%u skip=%u forced=%u bypass=%u dirty=%u backSync=%d frameFull=%d sceneReset=%d vsync=%u\n",
+        "[DisplayMgr][DIAG] %s req=%u done=%u skip=%u restart=%u bypass=%u dirty=%u backSync=%d frameFull=%d sceneReset=%d vsync=%u\n",
         tag ? tag : "(null)",
         (unsigned int)s_swapReqCount,
         (unsigned int)s_swapDoneCount,
         (unsigned int)s_swapSkipTimeoutCount,
-        (unsigned int)s_swapForcedOnTimeoutCount,
+        (unsigned int)s_panelRestartCount,
         (unsigned int)s_replayBypassCount,
         (unsigned int)s_dirtyAreaCount,
         s_backBufferSynced ? 1 : 0,
@@ -396,6 +423,33 @@ static void display_diag_log(const char* tag)
         s_sceneResetPending ? 1 : 0,
         (unsigned int)s_vsyncCount
     );
+}
+
+static bool wait_for_vsync_edge(TickType_t timeoutTicks)
+{
+    if (!s_vsyncSem) return false;
+
+    uint32_t before = s_vsyncCount;
+    xSemaphoreTake(s_vsyncSem, 0);
+    TickType_t t0 = xTaskGetTickCount();
+    while (s_vsyncCount == before &&
+           (xTaskGetTickCount() - t0) < timeoutTicks) {
+        xSemaphoreTake(s_vsyncSem, pdMS_TO_TICKS(2));
+    }
+    return s_vsyncCount != before;
+}
+
+static void request_rgb_panel_restart(esp_lcd_panel_handle_t panel, const char* tag)
+{
+    if (!panel) return;
+
+    esp_err_t err = esp_lcd_rgb_panel_restart(panel);
+    if (err == ESP_OK) {
+        s_panelRestartCount++;
+        display_diag_log(tag ? tag : "panel-restart");
+    } else {
+        TEST_LOG("RGB panel restart failed: %d", (int)err);
+    }
 }
 
 static bool IRAM_ATTR idle_hook_cpu0(void)
@@ -803,6 +857,9 @@ void DisplayMgr::Init()
              (unsigned int)panelPclkHz,
              (unsigned int)ST7262_PANEL_CONFIG_TIMINGS_PCLK_HZ,
              (unsigned int)DISPLAY_PCLK_DERATE_PERCENT);
+    TEST_LOG("Estimated frame period=%u ms, VSYNC wait budget=%u ms",
+             (unsigned int)DISPLAY_FRAME_PERIOD_MS,
+             (unsigned int)DISPLAY_VSYNC_WAIT_BUDGET_MS);
     bool ok = gfx->begin(panelPclkHz);
     _gfxInitialized = ok;
     TEST_LOG("gfx->begin result=%d", ok ? 1 : 0);
@@ -1037,7 +1094,7 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
                 xSemaphoreTake(s_vsyncSem, 0);
                 TickType_t t0 = xTaskGetTickCount();
                 while (s_vsyncCount == before &&
-                       (xTaskGetTickCount() - t0) < pdMS_TO_TICKS(30)) {
+                       (xTaskGetTickCount() - t0) < pdMS_TO_TICKS(DISPLAY_VSYNC_WAIT_BUDGET_MS)) {
                     xSemaphoreTake(s_vsyncSem, pdMS_TO_TICKS(2));
                 }
                 s_flushFrameStarted = true;
@@ -1110,6 +1167,7 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
         if (!s_flushFrameStarted) {
             s_flushFrameStarted = true;
             s_frameHasFullRefreshArea = false;
+            s_frameStartedFromSceneReset = s_sceneResetPending;
             s_dirtyAreaCount = 0;
         }
 
@@ -1129,21 +1187,23 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
             // If the back buffer is stale and we render only partial areas,
             // recover once by mirroring front->back.
             if (!s_backBufferSynced) {
-                uint16_t* front = self->_fb_buf[self->_frontFbIndex];
-                uint16_t* back = self->_fb_buf[self->_backFbIndex];
-                if (front && back) {
-                    if (s_sceneResetPending) {
-                        // Scene transition (e.g., splash->gauge): don't reuse old frame.
-                        memset(back, 0, self->_fb_pixels * sizeof(uint16_t));
-                        display_diag_log("resync-scene-reset");
-                    } else {
-                        memcpy(back, front, self->_fb_pixels * sizeof(uint16_t));
-                        display_diag_log("resync-front-to-back");
+                if (!s_splashActive) {
+                    uint16_t* front = self->_fb_buf[self->_frontFbIndex];
+                    uint16_t* back = self->_fb_buf[self->_backFbIndex];
+                    if (front && back) {
+                        if (s_sceneResetPending) {
+                            // Scene transition (e.g., splash->gauge): don't reuse old frame.
+                            memset(back, 0, self->_fb_pixels * sizeof(uint16_t));
+                            display_diag_log("resync-scene-reset");
+                        } else {
+                            memcpy(back, front, self->_fb_pixels * sizeof(uint16_t));
+                            display_diag_log("resync-front-to-back");
+                        }
+                        cache_writeback_span(back, self->_fb_pixels * sizeof(uint16_t));
                     }
-                    cache_writeback_span(back, self->_fb_pixels * sizeof(uint16_t));
+                    s_backBufferSynced = true;
+                    s_sceneResetPending = false;
                 }
-                s_backBufferSynced = true;
-                s_sceneResetPending = false;
             }
 
             // Store dirty area for replay; merge fragments to reduce copy cost.
@@ -1185,7 +1245,7 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
                 uint32_t before = s_vsyncCount;
                 xSemaphoreTake(s_vsyncSem, 0); // drain stale token
 
-                TickType_t waitBudget = s_strictVsyncSync ? pdMS_TO_TICKS(25) : pdMS_TO_TICKS(30);
+                TickType_t waitBudget = pdMS_TO_TICKS(DISPLAY_VSYNC_WAIT_BUDGET_MS);
                 TickType_t t0 = xTaskGetTickCount();
                 while (s_vsyncCount == before &&
                        (xTaskGetTickCount() - t0) < waitBudget) {
@@ -1196,35 +1256,30 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
 
             if (!sawVsync) {
                 s_vsyncTimeoutConsecutive++;
-                bool forceSwapAfterSkip = (!s_strictVsyncSync) &&
-                    (s_vsyncTimeoutConsecutive >= VSYNC_TIMEOUT_SKIP_BEFORE_FORCE_SWAP);
-
-                if (!forceSwapAfterSkip) {
-                    // Skip this frame to avoid out-of-phase swap and visible horizontal noise.
-                    s_swapSkipTimeoutCount++;
-                    uint16_t* front = self->_fb_buf[self->_frontFbIndex];
-                    uint16_t* back = self->_fb_buf[self->_backFbIndex];
-                    if (front && back) {
-                        memcpy(back, front, self->_fb_pixels * sizeof(uint16_t));
-                        cache_writeback_span(back, self->_fb_pixels * sizeof(uint16_t));
-                    }
-                    s_backBufferSynced = true;
-                    s_dirtyAreaCount = 0;
-                    s_flushFrameStarted = false;
-                    request_full_invalidate();
-                    display_diag_log("vsync-timeout-skip");
-                    lv_disp_flush_ready(drv);
-                    return;
+                if (s_vsyncTimeoutConsecutive >= VSYNC_TIMEOUT_RESTART_THRESHOLD) {
+                    request_rgb_panel_restart(
+                        (self->rgbPanel) ? self->rgbPanel->getPanelHandle() : nullptr,
+                        "vsync-timeout-restart"
+                    );
+                    s_vsyncTimeoutConsecutive = 0;
                 }
-
-                // Keep pipeline alive on repeated timeout bursts.
-                s_swapForcedOnTimeoutCount++;
-                s_vsyncTimeoutConsecutive = 0;
+                // Skip this frame to avoid out-of-phase swap and keep buffers identical.
+                s_swapSkipTimeoutCount++;
+                uint16_t* front = self->_fb_buf[self->_frontFbIndex];
+                uint16_t* back = self->_fb_buf[self->_backFbIndex];
+                if (front && back) {
+                    memcpy(back, front, self->_fb_pixels * sizeof(uint16_t));
+                    cache_writeback_span(back, self->_fb_pixels * sizeof(uint16_t));
+                }
+                s_backBufferSynced = true;
+                s_dirtyAreaCount = 0;
+                s_flushFrameStarted = false;
                 request_full_invalidate();
-                display_diag_log("vsync-timeout-force-swap");
-            } else {
-                s_vsyncTimeoutConsecutive = 0;
+                display_diag_log("vsync-timeout-skip");
+                lv_disp_flush_ready(drv);
+                return;
             }
+            s_vsyncTimeoutConsecutive = 0;
 
             uint16_t* swapFb = self->_fb_buf[self->_backFbIndex];
             if (!swapFb) {
@@ -1243,32 +1298,54 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
             self->_frontFbIndex = self->_backFbIndex;
             self->_backFbIndex = oldFront;
 
-            if (s_frameHasFullRefreshArea) {
-                // Keep stale back buffer during continuous full-frame streams (e.g. GIF),
-                // and resync only when partial update appears later.
+            uint32_t dirtyPixels = 0;
+            for (uint8_t i = 0; i < s_dirtyAreaCount; ++i) {
+                dirtyPixels += area_pixels(&s_dirtyAreas[i]);
+            }
+            if (s_splashActive) {
+                // During splash GIF playback we prefer decoder cadence over keeping
+                // both full-screen framebuffers identical on every frame. Scene reset
+                // will resync deterministically before the UI becomes active.
                 s_backBufferSynced = false;
-            } else {
-                // Replay this frame's dirty regions into the new back buffer so
-                // next partial frame starts from identical content without full copy.
-                uint32_t dirtyPixels = 0;
-                for (uint8_t i = 0; i < s_dirtyAreaCount; ++i) {
-                    dirtyPixels += area_pixels(&s_dirtyAreas[i]);
-                }
-                const uint32_t replayThresholdPixels = (SCREEN_WIDTH * SCREEN_HEIGHT * 35U) / 100U;
-                if (dirtyPixels > replayThresholdPixels) {
-                    // Too much replay work: defer and resync lazily on next partial frame.
-                    s_backBufferSynced = false;
-                    s_replayBypassCount++;
-                    s_flushFrameStarted = false;
-                    request_full_invalidate();
-                    display_diag_log("replay-bypass");
-                    lv_disp_flush_ready(drv);
-                    return;
-                }
+                s_sceneResetPending = false;
+                s_frameStartedFromSceneReset = false;
+                s_dirtyAreaCount = 0;
+                s_flushFrameStarted = false;
+                lv_disp_flush_ready(drv);
+                return;
+            }
+            const uint32_t replayThresholdPixels = (SCREEN_WIDTH * SCREEN_HEIGHT * 35U) / 100U;
+            bool doPeriodicFullSync = false;
+            if (PERIODIC_FULL_SYNC_INTERVAL_FRAMES > 0U) {
+                s_successfulPseudoSwapFrameCount++;
+                doPeriodicFullSync =
+                    (s_successfulPseudoSwapFrameCount % PERIODIC_FULL_SYNC_INTERVAL_FRAMES) == 0U;
+            }
+            bool doFullSync =
+                s_frameHasFullRefreshArea ||
+                s_frameStartedFromSceneReset ||
+                doPeriodicFullSync ||
+                (dirtyPixels > replayThresholdPixels);
 
-                uint16_t* front = self->_fb_buf[self->_frontFbIndex];
-                uint16_t* back = self->_fb_buf[self->_backFbIndex];
-                if (front && back) {
+            uint16_t* front = self->_fb_buf[self->_frontFbIndex];
+            uint16_t* back = self->_fb_buf[self->_backFbIndex];
+            if (front && back) {
+                if (doFullSync) {
+                    memcpy(back, front, self->_fb_pixels * sizeof(uint16_t));
+                    cache_writeback_span(back, self->_fb_pixels * sizeof(uint16_t));
+
+                    if (s_frameHasFullRefreshArea) {
+                        display_diag_log("fullframe-full-sync");
+                    } else if (s_frameStartedFromSceneReset) {
+                        display_diag_log("scene-reset-full-sync");
+                    } else if (doPeriodicFullSync) {
+                        display_diag_log("periodic-full-sync");
+                    } else {
+                        display_diag_log("threshold-full-sync");
+                    }
+                } else {
+                    // Replay this frame's dirty regions into the new back buffer so
+                    // the next partial frame always starts from identical content.
                     for (uint8_t i = 0; i < s_dirtyAreaCount; ++i) {
                         const lv_area_t* a = &s_dirtyAreas[i];
                         uint32_t w = lv_area_get_width(a);
@@ -1281,8 +1358,12 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
                     }
                 }
                 s_backBufferSynced = true;
+            } else {
+                s_backBufferSynced = false;
             }
 
+            s_sceneResetPending = false;
+            s_frameStartedFromSceneReset = false;
             s_flushFrameStarted = false;
         }
     }
@@ -1324,7 +1405,7 @@ bool DisplayMgr::PlayGifFromSD(const char* path)
 
     lv_gif_set_src(_splashGif, lvPath.c_str());
 #if LV_USE_GIF
-    lv_timer_set_period(((lv_gif_t*)_splashGif)->timer, 1);
+    lv_timer_set_period(((lv_gif_t*)_splashGif)->timer, SPLASH_GIF_TIMER_PERIOD_MS);
 #endif
     lv_obj_center(_splashGif);
     TEST_LOG("GIF started: %s", lvPath.c_str());
@@ -1358,7 +1439,7 @@ bool DisplayMgr::PlayGifFromMemory(const GIFMemory& gifMem)
 
     lv_gif_set_src(_splashGif, &_splashGifDsc);
 #if LV_USE_GIF
-    lv_timer_set_period(((lv_gif_t*)_splashGif)->timer, 3);
+    lv_timer_set_period(((lv_gif_t*)_splashGif)->timer, SPLASH_GIF_TIMER_PERIOD_MS);
 #endif
     lv_obj_center(_splashGif);
     TEST_LOG("GIF started from PSRAM: %u bytes", (unsigned int)gifMem.size);
@@ -1439,10 +1520,20 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
         if (ulTaskNotifyTake(pdTRUE, 0)) break;
 
         bool splashReady = false;
+        TickType_t sleepTicks = pdMS_TO_TICKS(SPLASH_LVGL_HANDLER_MAX_SLEEP_MS);
         if (system->LockLvgl(pdMS_TO_TICKS(20))) {
-            lv_timer_handler();
+            uint32_t nextDelayMs = lv_timer_handler();
             splashReady = s_splashGifReady;
             system->UnlockLvgl();
+
+            if (nextDelayMs == 0U) {
+                sleepTicks = pdMS_TO_TICKS(1);
+            } else {
+                if (nextDelayMs > SPLASH_LVGL_HANDLER_MAX_SLEEP_MS) {
+                    nextDelayMs = SPLASH_LVGL_HANDLER_MAX_SLEEP_MS;
+                }
+                sleepTicks = pdMS_TO_TICKS(nextDelayMs);
+            }
         }
 
         TickType_t elapsed = xTaskGetTickCount() - startTick;
@@ -1455,7 +1546,10 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
             break;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(2));
+        if (sleepTicks == 0) {
+            sleepTicks = pdMS_TO_TICKS(1);
+        }
+        vTaskDelay(sleepTicks);
     }
 
     bool uiReady = false;
@@ -1472,6 +1566,11 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
             lv_obj_invalidate(screen);
             // Force at least one render pass before leaving splash task.
             lv_timer_handler();
+            request_rgb_panel_restart(
+                (self->rgbPanel) ? self->rgbPanel->getPanelHandle() : nullptr,
+                "ui-transition-restart"
+            );
+            wait_for_vsync_edge(pdMS_TO_TICKS(DISPLAY_VSYNC_WAIT_BUDGET_MS));
             system->UnlockLvgl();
             Serial.println("[DisplayMgr] LVGL UI Created");
             uiReady = true;
