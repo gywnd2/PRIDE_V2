@@ -85,6 +85,7 @@ static constexpr uint32_t PERIODIC_FULL_SYNC_INTERVAL_FRAMES = DISPLAY_PERIODIC_
 static constexpr uint8_t VSYNC_TIMEOUT_RESTART_THRESHOLD = 3;
 static constexpr uint32_t SPLASH_GIF_TIMER_PERIOD_MS = 1;
 static constexpr uint32_t SPLASH_LVGL_HANDLER_MAX_SLEEP_MS = 5;
+static constexpr uint32_t SPLASH_DIRECT_GIF_SPEED_FACTOR = 4;
 #ifndef DISPLAY_PCLK_DERATE_PERCENT
 #define DISPLAY_PCLK_DERATE_PERCENT 90U
 #endif
@@ -695,6 +696,19 @@ static void splash_gif_event_cb(lv_event_t* e)
     if (lv_event_get_code(e) == LV_EVENT_READY) {
         s_splashGifReady = true;
     }
+}
+
+static uint32_t splash_direct_gif_stream_pos(gd_GIF* gif)
+{
+    if (!gif) return 0;
+
+    if (gif->is_file) {
+        uint32_t pos = 0;
+        lv_fs_tell(&gif->fd, &pos);
+        return pos;
+    }
+
+    return gif->f_rw_p;
 }
 
 static bool IRAM_ATTR on_vsync_callback_common(
@@ -1457,6 +1471,7 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
         return;
     }
     s_splashActive = true;
+    s_splashGifReady = false;
 
     if (!self->_gfxInitialized || !self->gfx || !self->_fb_buf[self->_frontFbIndex]) {
         Serial.println("[DisplayMgr] Critical: PlayGifTask entered without valid gfx/front FB");
@@ -1464,11 +1479,6 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
         vTaskDelete(NULL);
         return;
     }
-
-    self->gfx->setFrameBuffer(self->_fb_buf[self->_frontFbIndex]);
-    self->gfx->fillScreen(0x0000);
-    self->gfx->flush();
-    TEST_LOG("splash pre-clear done");
 
     self->StartLVGL();
     if (!self->_lvglInitialized) {
@@ -1478,78 +1488,260 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
         return;
     }
 
-    bool splashStarted = false;
     if (system->LockLvgl(pdMS_TO_TICKS(100))) {
-        TEST_LOG("LockLvgl acquired for splash start");
         lv_obj_t* screen = lv_scr_act();
-        lv_obj_clean(screen);
-        lv_obj_set_style_bg_color(screen, lv_color_black(), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
-
-        GIFMemory gifMem;
-        if (system->LockGif(pdMS_TO_TICKS(100))) {
-            GIFMemory* shared = system->GetPsramObjPtr();
-            if (shared && shared->data && shared->size) {
-                gifMem = *shared;
-            }
-            system->UnlockGif();
+        if (screen) {
+            lv_obj_clean(screen);
+            lv_obj_set_style_bg_color(screen, lv_color_black(), LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
         }
-
-        if (gifMem.data && gifMem.size) {
-            splashStarted = self->PlayGifFromMemory(gifMem);
-        } else {
-            splashStarted = self->PlayGifFromSD(self->_pendingGifPath.c_str());
+        if (self->_splashGif) {
+            lv_obj_del(self->_splashGif);
+            self->_splashGif = nullptr;
         }
-        lv_obj_invalidate(screen);
-
         system->UnlockLvgl();
-        TEST_LOG("LockLvgl released after splash start");
-    } else {
-        TEST_LOG("LockLvgl timeout at splash start");
     }
 
-    if (!splashStarted) {
-        TEST_LOG("GIF start failed: %s", self->_pendingGifPath.c_str());
+    auto clear_framebuffer_black = [&](uint16_t* fb) {
+        if (!fb || self->_fb_pixels == 0) return;
+        memset(fb, 0, self->_fb_pixels * sizeof(uint16_t));
+        cache_writeback_span(fb, self->_fb_pixels * sizeof(uint16_t));
+    };
+
+    auto prepare_splash_buffers = [&]() {
+        clear_framebuffer_black(self->_fb_buf[self->_frontFbIndex]);
+        if (self->_fb_buf[self->_backFbIndex] &&
+            self->_fb_buf[self->_backFbIndex] != self->_fb_buf[self->_frontFbIndex]) {
+            clear_framebuffer_black(self->_fb_buf[self->_backFbIndex]);
+        }
+        self->gfx->setFrameBuffer(self->_fb_buf[self->_frontFbIndex]);
+        s_dirtyAreaCount = 0;
+        s_flushFrameStarted = false;
+    };
+
+    auto make_gif_area = [&](int32_t x, int32_t y, int32_t w, int32_t h, lv_area_t* out) -> bool {
+        if (!out || w <= 0 || h <= 0) return false;
+
+        int32_t x1 = x;
+        int32_t y1 = y;
+        int32_t x2 = x + w - 1;
+        int32_t y2 = y + h - 1;
+
+        if (x1 < 0) x1 = 0;
+        if (y1 < 0) y1 = 0;
+        if (x2 >= SCREEN_WIDTH) x2 = SCREEN_WIDTH - 1;
+        if (y2 >= SCREEN_HEIGHT) y2 = SCREEN_HEIGHT - 1;
+        if (x1 > x2 || y1 > y2) return false;
+
+        out->x1 = (lv_coord_t)x1;
+        out->y1 = (lv_coord_t)y1;
+        out->x2 = (lv_coord_t)x2;
+        out->y2 = (lv_coord_t)y2;
+        return true;
+    };
+
+    auto blit_splash_canvas = [&](gd_GIF* gif, uint16_t* fb, const lv_area_t* srcRect) {
+        if (!gif || !fb || !srcRect) return;
+
+        const int32_t dstX = (SCREEN_WIDTH - (int32_t)gif->width) / 2;
+        const int32_t dstY = (SCREEN_HEIGHT - (int32_t)gif->height) / 2;
+        const uint8_t* canvas = gif->canvas;
+
+        for (int32_t sy = srcRect->y1; sy <= srcRect->y2; ++sy) {
+            int32_t dy = dstY + sy;
+            if (dy < 0 || dy >= SCREEN_HEIGHT) continue;
+
+            if (!DISPLAY_ROTATE_180) {
+                uint16_t* dstRow = &fb[(size_t)dy * SCREEN_WIDTH];
+                for (int32_t sx = srcRect->x1; sx <= srcRect->x2; ++sx) {
+                    int32_t dx = dstX + sx;
+                    if (dx < 0 || dx >= SCREEN_WIDTH) continue;
+
+                    size_t srcOff = ((size_t)sy * gif->width + (size_t)sx) * 3U;
+                    uint16_t color = (uint16_t)(canvas[srcOff] | ((uint16_t)canvas[srcOff + 1] << 8));
+                    dstRow[dx] = (canvas[srcOff + 2] != 0U) ? color : 0x0000U;
+                }
+            } else {
+                uint16_t* dstRow = &fb[(size_t)(SCREEN_HEIGHT - 1 - dy) * SCREEN_WIDTH];
+                for (int32_t sx = srcRect->x1; sx <= srcRect->x2; ++sx) {
+                    int32_t dx = dstX + sx;
+                    if (dx < 0 || dx >= SCREEN_WIDTH) continue;
+
+                    size_t srcOff = ((size_t)sy * gif->width + (size_t)sx) * 3U;
+                    uint16_t color = (uint16_t)(canvas[srcOff] | ((uint16_t)canvas[srcOff + 1] << 8));
+                    dstRow[SCREEN_WIDTH - 1 - dx] = (canvas[srcOff + 2] != 0U) ? color : 0x0000U;
+                }
+            }
+        }
+
+        lv_area_t logicalArea = {
+            .x1 = (lv_coord_t)(dstX + srcRect->x1),
+            .y1 = (lv_coord_t)(dstY + srcRect->y1),
+            .x2 = (lv_coord_t)(dstX + srcRect->x2),
+            .y2 = (lv_coord_t)(dstY + srcRect->y2),
+        };
+        if ((logicalArea.x1 <= logicalArea.x2) && (logicalArea.y1 <= logicalArea.y2)) {
+            lv_area_t cacheArea = DISPLAY_ROTATE_180 ? rotate_area_180(&logicalArea) : logicalArea;
+            cache_writeback_area(fb, &cacheArea);
+        }
+    };
+
+    auto present_splash_frame = [&]() -> bool {
+        return (self->_fb_buf[self->_frontFbIndex] != nullptr);
+    };
+
+    prepare_splash_buffers();
+    TEST_LOG("splash direct-player buffers prepared");
+
+    GIFMemory gifMem = {};
+    if (system->LockGif(pdMS_TO_TICKS(100))) {
+        GIFMemory* shared = system->GetPsramObjPtr();
+        if (shared && shared->data && shared->size) {
+            gifMem = *shared;
+        }
+        system->UnlockGif();
     }
 
-    s_splashGifReady = false;
+    gd_GIF* directGif = nullptr;
+    String lvPath = self->_pendingGifPath;
+    String sdPath = lvPath;
+    if (sdPath.startsWith("S:")) {
+        sdPath = sdPath.substring(2);
+    }
+    if (!sdPath.startsWith("/")) {
+        sdPath = "/" + sdPath;
+    }
+
+    if (gifMem.data && gifMem.size) {
+        directGif = gd_open_gif_data(gifMem.data);
+        if (directGif) {
+            TEST_LOG("Direct GIF opened from PSRAM: %u bytes", (unsigned int)gifMem.size);
+        }
+    }
+    if (!directGif && SD.exists(sdPath.c_str())) {
+        directGif = gd_open_gif_file(lvPath.c_str());
+        if (directGif) {
+            TEST_LOG("Direct GIF opened from SD: %s", lvPath.c_str());
+        }
+    }
+
+    if (!directGif) {
+        TEST_LOG("Direct GIF open failed: %s", self->_pendingGifPath.c_str());
+    }
+
     TickType_t startTick = xTaskGetTickCount();
     const TickType_t minSplashDuration = pdMS_TO_TICKS(1200);
     const TickType_t maxSplashDuration = pdMS_TO_TICKS(12000);
+    uint32_t prevStreamPos = splash_direct_gif_stream_pos(directGif);
+    uint32_t renderedFrames = 0;
     while (true) {
-        if (ulTaskNotifyTake(pdTRUE, 0)) break;
-
-        bool splashReady = false;
-        TickType_t sleepTicks = pdMS_TO_TICKS(SPLASH_LVGL_HANDLER_MAX_SLEEP_MS);
-        if (system->LockLvgl(pdMS_TO_TICKS(20))) {
-            uint32_t nextDelayMs = lv_timer_handler();
-            splashReady = s_splashGifReady;
-            system->UnlockLvgl();
-
-            if (nextDelayMs == 0U) {
-                sleepTicks = pdMS_TO_TICKS(1);
-            } else {
-                if (nextDelayMs > SPLASH_LVGL_HANDLER_MAX_SLEEP_MS) {
-                    nextDelayMs = SPLASH_LVGL_HANDLER_MAX_SLEEP_MS;
-                }
-                sleepTicks = pdMS_TO_TICKS(nextDelayMs);
-            }
+        if (ulTaskNotifyTake(pdTRUE, 0)) {
+            Serial.println("[DisplayMgr] Splash interrupted by notify");
+            break;
         }
 
         TickType_t elapsed = xTaskGetTickCount() - startTick;
-        if (splashReady && elapsed >= minSplashDuration) {
-            Serial.println("[DisplayMgr] Splash finished by GIF READY");
-            break;
+        if (s_splashGifReady) {
+            if (elapsed >= minSplashDuration) {
+                Serial.println("[DisplayMgr] Splash finished by direct GIF completion");
+                break;
+            }
+
+            TickType_t waitTicks = minSplashDuration - elapsed;
+            if (waitTicks > pdMS_TO_TICKS(20)) {
+                waitTicks = pdMS_TO_TICKS(20);
+            }
+            if (ulTaskNotifyTake(pdTRUE, waitTicks)) {
+                Serial.println("[DisplayMgr] Splash interrupted while holding final frame");
+                break;
+            }
+            continue;
         }
+
         if (elapsed >= maxSplashDuration) {
             Serial.println("[DisplayMgr] Splash finished by timeout");
             break;
         }
 
-        if (sleepTicks == 0) {
-            sleepTicks = pdMS_TO_TICKS(1);
+        if (!directGif) {
+            if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20))) {
+                Serial.println("[DisplayMgr] Splash interrupted without direct GIF");
+            }
+            break;
         }
-        vTaskDelay(sleepTicks);
+
+        lv_area_t prevFrameRect = {};
+        bool havePrevFrameRect = make_gif_area(
+            (int32_t)directGif->fx,
+            (int32_t)directGif->fy,
+            (int32_t)directGif->fw,
+            (int32_t)directGif->fh,
+            &prevFrameRect
+        );
+        uint8_t prevDisposal = directGif->gce.disposal;
+
+        int frameStatus = gd_get_frame(directGif);
+        if (frameStatus == 0) {
+            s_splashGifReady = true;
+            continue;
+        }
+        if (frameStatus < 0) {
+            TEST_LOG("Direct GIF decode error");
+            break;
+        }
+
+        uint32_t streamPos = splash_direct_gif_stream_pos(directGif);
+        if (renderedFrames > 0U && streamPos < prevStreamPos) {
+            s_splashGifReady = true;
+            continue;
+        }
+        prevStreamPos = streamPos;
+
+        uint32_t frameStartMs = (uint32_t)(esp_timer_get_time() / 1000ULL);
+        gd_render_frame(directGif, directGif->canvas);
+
+        lv_area_t dirtyRect = {};
+        bool haveDirtyRect = make_gif_area(
+            (int32_t)directGif->fx,
+            (int32_t)directGif->fy,
+            (int32_t)directGif->fw,
+            (int32_t)directGif->fh,
+            &dirtyRect
+        );
+        if (havePrevFrameRect && prevDisposal == 2U) {
+            if (haveDirtyRect) {
+                dirtyRect = area_union(&dirtyRect, &prevFrameRect);
+            } else {
+                dirtyRect = prevFrameRect;
+                haveDirtyRect = true;
+            }
+        }
+
+        uint16_t* drawFb = self->_fb_buf[self->_frontFbIndex];
+        if (haveDirtyRect && drawFb) {
+            blit_splash_canvas(directGif, drawFb, &dirtyRect);
+        }
+        present_splash_frame();
+        renderedFrames++;
+
+        uint32_t frameDelayMs = (uint32_t)directGif->gce.delay * 10U;
+        if (SPLASH_DIRECT_GIF_SPEED_FACTOR > 1U) {
+            frameDelayMs /= SPLASH_DIRECT_GIF_SPEED_FACTOR;
+        }
+        if (frameDelayMs == 0U) {
+            frameDelayMs = 10U;
+        }
+
+        uint32_t frameElapsedMs = (uint32_t)((esp_timer_get_time() / 1000ULL) - frameStartMs);
+        uint32_t waitMs = (frameElapsedMs < frameDelayMs) ? (frameDelayMs - frameElapsedMs) : 1U;
+        if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(waitMs))) {
+            Serial.println("[DisplayMgr] Splash interrupted during frame wait");
+            break;
+        }
+    }
+
+    if (directGif) {
+        gd_close_gif(directGif);
     }
 
     bool uiReady = false;
