@@ -34,8 +34,6 @@ class DisplayMgr
         uint8_t _backFbIndex = 1;
 
         String _pendingGifPath;
-        lv_obj_t* _splashGif = nullptr;
-        lv_img_dsc_t _splashGifDsc = {};
 
         lv_disp_draw_buf_t _draw_buf;
         lv_disp_drv_t _disp_drv;
@@ -67,8 +65,6 @@ class DisplayMgr
         void Redraw();
         void Clear();
 
-        bool PlayGifFromSD(const char* path);
-        bool PlayGifFromMemory(const GIFMemory& gifMem);
         void StopGif();
 
         bool IsLvglInitialized() { return _lvglInitialized; }

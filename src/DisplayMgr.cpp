@@ -22,14 +22,14 @@
 #include "esp32s3/rom/cache.h"
 extern "C" int Cache_WriteBack_Addr(uint32_t addr, uint32_t size);
 #endif
-#if LV_USE_GIF
-#include <src/extra/libs/gif/lv_gif.h>
-#endif
+#include <AnimatedGIF.h>
 
 #define TEST_LOG(fmt, ...) UartLogf("[DisplayMgr] " fmt "\n", ##__VA_ARGS__)
 #define TEST_LINE() UartLogf("[DisplayMgr] %s\n", __func__)
 
 static constexpr uint32_t GIF_TASK_STACK_WORDS = 8192;
+static constexpr UBaseType_t SPLASH_GIF_TASK_PRIORITY = 6;
+static constexpr UBaseType_t LVGL_REUSED_TASK_PRIORITY = 4;
 
 static SemaphoreHandle_t s_vsyncSem = nullptr;
 static volatile uint32_t s_vsyncCount = 0;
@@ -37,7 +37,6 @@ static volatile uint32_t s_swapReqCount = 0;
 static volatile uint32_t s_swapDoneCount = 0;
 static volatile uint32_t s_swapSkipTimeoutCount = 0;
 static volatile uint32_t s_replayBypassCount = 0;
-static volatile uint32_t s_swapForcedOnTimeoutCount = 0;
 static volatile uint32_t s_panelRestartCount = 0;
 static volatile uint32_t s_singleFlushAreaCount = 0;
 static volatile uint32_t s_singleFlushFrameCount = 0;
@@ -83,9 +82,7 @@ static constexpr TickType_t LVGL_TASK_PERIOD_TICKS = pdMS_TO_TICKS(20);
 #endif
 static constexpr uint32_t PERIODIC_FULL_SYNC_INTERVAL_FRAMES = DISPLAY_PERIODIC_FULL_SYNC_INTERVAL;
 static constexpr uint8_t VSYNC_TIMEOUT_RESTART_THRESHOLD = 3;
-static constexpr uint32_t SPLASH_GIF_TIMER_PERIOD_MS = 1;
-static constexpr uint32_t SPLASH_LVGL_HANDLER_MAX_SLEEP_MS = 5;
-static constexpr uint32_t SPLASH_DIRECT_GIF_SPEED_FACTOR = 4;
+static constexpr uint32_t SPLASH_ANIMATED_GIF_SPEED_FACTOR = 10;
 #ifndef DISPLAY_PCLK_DERATE_PERCENT
 #define DISPLAY_PCLK_DERATE_PERCENT 90U
 #endif
@@ -690,25 +687,220 @@ static void show_gauge_screen_locked(SystemAPI* system)
     s_goodbyeScreenActive = false;
 }
 
-static void splash_gif_event_cb(lv_event_t* e)
+struct SplashAnimatedGifFileHandle {
+    File file;
+};
+
+struct SplashAnimatedGifDrawContext {
+    uint16_t* fb = nullptr;
+    int32_t dstX = 0;
+    int32_t dstY = 0;
+    bool canvasFullyVisible = false;
+    lv_area_t dirtyRect = {0, 0, 0, 0};
+    bool haveDirtyRect = false;
+    uint64_t drawUs = 0;
+    uint32_t lineCount = 0;
+    uint16_t frameWidth = 0;
+    uint16_t frameHeight = 0;
+    int16_t frameX = 0;
+    int16_t frameY = 0;
+    uint8_t disposal = 0;
+    uint8_t hasTransparency = 0;
+};
+
+static inline void splash_copy_row_reversed_rgb565(uint16_t* dstEnd, const uint16_t* src, int32_t pixelCount)
 {
-    if (!e) return;
-    if (lv_event_get_code(e) == LV_EVENT_READY) {
-        s_splashGifReady = true;
+    while (pixelCount >= 2) {
+        uint32_t pair = 0;
+        memcpy(&pair, src, sizeof(pair));
+        pair = (pair << 16) | (pair >> 16);
+        memcpy(dstEnd - 1, &pair, sizeof(pair));
+        src += 2;
+        dstEnd -= 2;
+        pixelCount -= 2;
+    }
+
+    if (pixelCount == 1) {
+        *dstEnd = *src;
     }
 }
 
-static uint32_t splash_direct_gif_stream_pos(gd_GIF* gif)
+static bool make_splash_screen_area(int32_t dstX, int32_t dstY, int32_t x, int32_t y, int32_t w, int32_t h, lv_area_t* out)
 {
-    if (!gif) return 0;
+    if (!out || w <= 0 || h <= 0) return false;
 
-    if (gif->is_file) {
-        uint32_t pos = 0;
-        lv_fs_tell(&gif->fd, &pos);
-        return pos;
+    int32_t x1 = dstX + x;
+    int32_t y1 = dstY + y;
+    int32_t x2 = x1 + w - 1;
+    int32_t y2 = y1 + h - 1;
+
+    if (x1 < 0) x1 = 0;
+    if (y1 < 0) y1 = 0;
+    if (x2 >= SCREEN_WIDTH) x2 = SCREEN_WIDTH - 1;
+    if (y2 >= SCREEN_HEIGHT) y2 = SCREEN_HEIGHT - 1;
+    if (x1 > x2 || y1 > y2) return false;
+
+    out->x1 = (lv_coord_t)x1;
+    out->y1 = (lv_coord_t)y1;
+    out->x2 = (lv_coord_t)x2;
+    out->y2 = (lv_coord_t)y2;
+    return true;
+}
+
+static void writeback_splash_rect(uint16_t* fb, const lv_area_t* rect)
+{
+    if (!fb || !rect) return;
+    lv_area_t cacheArea = DISPLAY_ROTATE_180 ? rotate_area_180(rect) : *rect;
+    cache_writeback_area(fb, &cacheArea);
+}
+
+static void* splash_animated_gif_open_file(const char* fname, int32_t* pSize)
+{
+    if (!fname) return nullptr;
+
+    auto* handle = new SplashAnimatedGifFileHandle();
+    if (!handle) return nullptr;
+
+    handle->file = SD.open(fname, FILE_READ);
+    if (!handle->file || handle->file.isDirectory()) {
+        delete handle;
+        return nullptr;
     }
 
-    return gif->f_rw_p;
+    if (pSize) {
+        *pSize = (int32_t)handle->file.size();
+    }
+    return handle;
+}
+
+static void splash_animated_gif_close_file(void* pHandle)
+{
+    auto* handle = static_cast<SplashAnimatedGifFileHandle*>(pHandle);
+    if (!handle) return;
+    if (handle->file) {
+        handle->file.close();
+    }
+    delete handle;
+}
+
+static int32_t splash_animated_gif_read_file(GIFFILE* pFile, uint8_t* pBuf, int32_t iLen)
+{
+    if (!pFile || !pFile->fHandle || !pBuf || iLen <= 0) return 0;
+
+    auto* handle = static_cast<SplashAnimatedGifFileHandle*>(pFile->fHandle);
+    if (!handle || !handle->file) return 0;
+
+    int32_t bytesToRead = iLen;
+    const int32_t remaining = pFile->iSize - pFile->iPos;
+    if (remaining <= 1) {
+        return 0;
+    }
+    if (remaining < bytesToRead) {
+        bytesToRead = remaining - 1;
+    }
+    if (bytesToRead <= 0) {
+        return 0;
+    }
+
+    bytesToRead = (int32_t)handle->file.read(pBuf, (size_t)bytesToRead);
+    pFile->iPos = (int32_t)handle->file.position();
+    return bytesToRead;
+}
+
+static int32_t splash_animated_gif_seek_file(GIFFILE* pFile, int32_t iPosition)
+{
+    if (!pFile || !pFile->fHandle) return -1;
+
+    auto* handle = static_cast<SplashAnimatedGifFileHandle*>(pFile->fHandle);
+    if (!handle || !handle->file) return -1;
+
+    if (iPosition < 0) {
+        iPosition = 0;
+    }
+    handle->file.seek((uint32_t)iPosition);
+    pFile->iPos = (int32_t)handle->file.position();
+    return pFile->iPos;
+}
+
+static void splash_animated_gif_draw(GIFDRAW* pDraw)
+{
+    if (!pDraw || !pDraw->pUser || !pDraw->pPixels) return;
+
+    auto* ctx = static_cast<SplashAnimatedGifDrawContext*>(pDraw->pUser);
+    if (!ctx || !ctx->fb) return;
+
+    if (pDraw->y == 0) {
+        ctx->drawUs = 0;
+        ctx->lineCount = 0;
+        ctx->frameWidth = (uint16_t)pDraw->iWidth;
+        ctx->frameHeight = (uint16_t)pDraw->iHeight;
+        ctx->frameX = (int16_t)pDraw->iX;
+        ctx->frameY = (int16_t)pDraw->iY;
+        ctx->disposal = pDraw->ucDisposalMethod;
+        ctx->hasTransparency = pDraw->ucHasTransparency;
+        ctx->haveDirtyRect = make_splash_screen_area(
+            ctx->dstX,
+            ctx->dstY,
+            pDraw->iX,
+            pDraw->iY,
+            pDraw->iWidth,
+            pDraw->iHeight,
+            &ctx->dirtyRect
+        );
+    }
+
+    const uint64_t drawStartUs = (uint64_t)esp_timer_get_time();
+
+    if (ctx->canvasFullyVisible) {
+        const int32_t screenY = ctx->dstY + pDraw->iY + pDraw->y;
+        const int32_t dstX = ctx->dstX + pDraw->iX;
+        const int32_t drawWidth = pDraw->iWidth;
+        const uint16_t* src = reinterpret_cast<const uint16_t*>(pDraw->pPixels);
+
+        if (!DISPLAY_ROTATE_180) {
+            uint16_t* dst = &ctx->fb[(size_t)screenY * SCREEN_WIDTH + (size_t)dstX];
+            memcpy(dst, src, (size_t)drawWidth * sizeof(uint16_t));
+        } else {
+            uint16_t* dstEnd = &ctx->fb[(size_t)(SCREEN_HEIGHT - 1 - screenY) * SCREEN_WIDTH +
+                                        (size_t)(SCREEN_WIDTH - 1 - dstX)];
+            splash_copy_row_reversed_rgb565(dstEnd, src, drawWidth);
+        }
+
+        ctx->lineCount++;
+        ctx->drawUs += (uint64_t)esp_timer_get_time() - drawStartUs;
+        return;
+    }
+
+    const int32_t screenY = ctx->dstY + pDraw->iY + pDraw->y;
+    const int32_t screenX0 = ctx->dstX + pDraw->iX;
+    int32_t drawWidth = pDraw->iWidth;
+    if (screenY >= 0 && screenY < SCREEN_HEIGHT && drawWidth > 0) {
+        int32_t clipLeft = 0;
+        int32_t dstX = screenX0;
+        if (dstX < 0) {
+            clipLeft = -dstX;
+            dstX = 0;
+        }
+        if ((dstX + drawWidth - clipLeft) > SCREEN_WIDTH) {
+            drawWidth = SCREEN_WIDTH - dstX + clipLeft;
+        }
+        drawWidth -= clipLeft;
+
+        if (drawWidth > 0) {
+            const uint16_t* src = reinterpret_cast<const uint16_t*>(pDraw->pPixels) + clipLeft;
+            if (!DISPLAY_ROTATE_180) {
+                uint16_t* dst = &ctx->fb[(size_t)screenY * SCREEN_WIDTH + (size_t)dstX];
+                memcpy(dst, src, (size_t)drawWidth * sizeof(uint16_t));
+            } else {
+                uint16_t* dstEnd = &ctx->fb[(size_t)(SCREEN_HEIGHT - 1 - screenY) * SCREEN_WIDTH +
+                                            (size_t)(SCREEN_WIDTH - 1 - dstX)];
+                splash_copy_row_reversed_rgb565(dstEnd, src, drawWidth);
+            }
+            ctx->lineCount++;
+        }
+    }
+
+    ctx->drawUs += (uint64_t)esp_timer_get_time() - drawStartUs;
 }
 
 static bool IRAM_ATTR on_vsync_callback_common(
@@ -1044,7 +1236,6 @@ void DisplayMgr::StartLVGL() {
     _disp_drv.user_data = this;
     _disp_drv.full_refresh = 0;
     _disp_drv.direct_mode = 0;
-    // _disp_drv.antialiasing = 0;
 
     lv_disp_drv_register(&_disp_drv);
     TEST_LOG("lv_disp_drv_register done");
@@ -1385,81 +1576,10 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
     lv_disp_flush_ready(drv);
 }
 
-bool DisplayMgr::PlayGifFromSD(const char* path)
-{
-    TEST_LOG("PlayGifFromSD path=%s", path ? path : "(null)");
-    if (!_lvglInitialized || path == nullptr || path[0] == '\0') return false;
-
-    String lvPath(path);
-    String sdPath = lvPath;
-    if (sdPath.startsWith("S:")) {
-        sdPath = sdPath.substring(2);
-    }
-    if (!sdPath.startsWith("/")) {
-        sdPath = "/" + sdPath;
-    }
-
-    if (!SD.exists(sdPath.c_str())) {
-        TEST_LOG("GIF not found on SD: %s", sdPath.c_str());
-        return false;
-    }
-
-    lv_obj_t* screen = lv_scr_act();
-    if (_splashGif != nullptr) {
-        lv_obj_del(_splashGif);
-        _splashGif = nullptr;
-    }
-
-    _splashGif = lv_gif_create(screen);
-    if (_splashGif == nullptr) {
-        Serial.println("[DisplayMgr] lv_gif_create failed");
-        return false;
-    }
-    lv_obj_add_event_cb(_splashGif, splash_gif_event_cb, LV_EVENT_READY, nullptr);
-
-    lv_gif_set_src(_splashGif, lvPath.c_str());
-#if LV_USE_GIF
-    lv_timer_set_period(((lv_gif_t*)_splashGif)->timer, SPLASH_GIF_TIMER_PERIOD_MS);
+#if defined(__GNUC__)
+#pragma GCC push_options
+#pragma GCC optimize ("O3")
 #endif
-    lv_obj_center(_splashGif);
-    TEST_LOG("GIF started: %s", lvPath.c_str());
-    return true;
-}
-
-bool DisplayMgr::PlayGifFromMemory(const GIFMemory& gifMem)
-{
-    TEST_LOG("PlayGifFromMemory size=%u", (unsigned int)gifMem.size);
-    if (!_lvglInitialized || gifMem.data == nullptr || gifMem.size == 0) return false;
-
-    lv_obj_t* screen = lv_scr_act();
-    if (_splashGif != nullptr) {
-        lv_obj_del(_splashGif);
-        _splashGif = nullptr;
-    }
-
-    _splashGif = lv_gif_create(screen);
-    if (_splashGif == nullptr) {
-        Serial.println("[DisplayMgr] lv_gif_create failed");
-        return false;
-    }
-    lv_obj_add_event_cb(_splashGif, splash_gif_event_cb, LV_EVENT_READY, nullptr);
-
-    _splashGifDsc.header.always_zero = 0;
-    _splashGifDsc.header.cf = LV_IMG_CF_RAW;
-    _splashGifDsc.header.w = 1;
-    _splashGifDsc.header.h = 1;
-    _splashGifDsc.data_size = gifMem.size;
-    _splashGifDsc.data = gifMem.data;
-
-    lv_gif_set_src(_splashGif, &_splashGifDsc);
-#if LV_USE_GIF
-    lv_timer_set_period(((lv_gif_t*)_splashGif)->timer, SPLASH_GIF_TIMER_PERIOD_MS);
-#endif
-    lv_obj_center(_splashGif);
-    TEST_LOG("GIF started from PSRAM: %u bytes", (unsigned int)gifMem.size);
-    return true;
-}
-
 void DisplayMgr::PlayGifTask(void* pvParameters)
 {
     DisplayMgr* self = static_cast<DisplayMgr*>(pvParameters);
@@ -1480,6 +1600,11 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
         return;
     }
 
+    self->gfx->setFrameBuffer(self->_fb_buf[self->_frontFbIndex]);
+    self->gfx->fillScreen(0x0000);
+    self->gfx->flush();
+    TEST_LOG("splash pre-clear done");
+
     self->StartLVGL();
     if (!self->_lvglInitialized) {
         Serial.println("[DisplayMgr] Critical: StartLVGL failed in PlayGifTask");
@@ -1488,110 +1613,33 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
         return;
     }
 
-    if (system->LockLvgl(pdMS_TO_TICKS(100))) {
-        lv_obj_t* screen = lv_scr_act();
-        if (screen) {
-            lv_obj_clean(screen);
-            lv_obj_set_style_bg_color(screen, lv_color_black(), LV_PART_MAIN);
-            lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
-        }
-        if (self->_splashGif) {
-            lv_obj_del(self->_splashGif);
-            self->_splashGif = nullptr;
-        }
-        system->UnlockLvgl();
-    }
-
-    auto clear_framebuffer_black = [&](uint16_t* fb) {
-        if (!fb || self->_fb_pixels == 0) return;
-        memset(fb, 0, self->_fb_pixels * sizeof(uint16_t));
-        cache_writeback_span(fb, self->_fb_pixels * sizeof(uint16_t));
-    };
-
     auto prepare_splash_buffers = [&]() {
-        clear_framebuffer_black(self->_fb_buf[self->_frontFbIndex]);
-        if (self->_fb_buf[self->_backFbIndex] &&
-            self->_fb_buf[self->_backFbIndex] != self->_fb_buf[self->_frontFbIndex]) {
-            clear_framebuffer_black(self->_fb_buf[self->_backFbIndex]);
+        const size_t bufferSize = self->_fb_pixels * sizeof(uint16_t);
+        for (size_t i = 0; i < 2; ++i) {
+            if (self->_fb_buf[i]) {
+                memset(self->_fb_buf[i], 0, bufferSize);
+                cache_writeback_span(self->_fb_buf[i], bufferSize);
+            }
         }
         self->gfx->setFrameBuffer(self->_fb_buf[self->_frontFbIndex]);
         s_dirtyAreaCount = 0;
         s_flushFrameStarted = false;
     };
 
-    auto make_gif_area = [&](int32_t x, int32_t y, int32_t w, int32_t h, lv_area_t* out) -> bool {
-        if (!out || w <= 0 || h <= 0) return false;
-
-        int32_t x1 = x;
-        int32_t y1 = y;
-        int32_t x2 = x + w - 1;
-        int32_t y2 = y + h - 1;
-
-        if (x1 < 0) x1 = 0;
-        if (y1 < 0) y1 = 0;
-        if (x2 >= SCREEN_WIDTH) x2 = SCREEN_WIDTH - 1;
-        if (y2 >= SCREEN_HEIGHT) y2 = SCREEN_HEIGHT - 1;
-        if (x1 > x2 || y1 > y2) return false;
-
-        out->x1 = (lv_coord_t)x1;
-        out->y1 = (lv_coord_t)y1;
-        out->x2 = (lv_coord_t)x2;
-        out->y2 = (lv_coord_t)y2;
-        return true;
-    };
-
-    auto blit_splash_canvas = [&](gd_GIF* gif, uint16_t* fb, const lv_area_t* srcRect) {
-        if (!gif || !fb || !srcRect) return;
-
-        const int32_t dstX = (SCREEN_WIDTH - (int32_t)gif->width) / 2;
-        const int32_t dstY = (SCREEN_HEIGHT - (int32_t)gif->height) / 2;
-        const uint8_t* canvas = gif->canvas;
-
-        for (int32_t sy = srcRect->y1; sy <= srcRect->y2; ++sy) {
-            int32_t dy = dstY + sy;
-            if (dy < 0 || dy >= SCREEN_HEIGHT) continue;
-
-            if (!DISPLAY_ROTATE_180) {
-                uint16_t* dstRow = &fb[(size_t)dy * SCREEN_WIDTH];
-                for (int32_t sx = srcRect->x1; sx <= srcRect->x2; ++sx) {
-                    int32_t dx = dstX + sx;
-                    if (dx < 0 || dx >= SCREEN_WIDTH) continue;
-
-                    size_t srcOff = ((size_t)sy * gif->width + (size_t)sx) * 3U;
-                    uint16_t color = (uint16_t)(canvas[srcOff] | ((uint16_t)canvas[srcOff + 1] << 8));
-                    dstRow[dx] = (canvas[srcOff + 2] != 0U) ? color : 0x0000U;
-                }
-            } else {
-                uint16_t* dstRow = &fb[(size_t)(SCREEN_HEIGHT - 1 - dy) * SCREEN_WIDTH];
-                for (int32_t sx = srcRect->x1; sx <= srcRect->x2; ++sx) {
-                    int32_t dx = dstX + sx;
-                    if (dx < 0 || dx >= SCREEN_WIDTH) continue;
-
-                    size_t srcOff = ((size_t)sy * gif->width + (size_t)sx) * 3U;
-                    uint16_t color = (uint16_t)(canvas[srcOff] | ((uint16_t)canvas[srcOff + 1] << 8));
-                    dstRow[SCREEN_WIDTH - 1 - dx] = (canvas[srcOff + 2] != 0U) ? color : 0x0000U;
-                }
-            }
-        }
-
-        lv_area_t logicalArea = {
-            .x1 = (lv_coord_t)(dstX + srcRect->x1),
-            .y1 = (lv_coord_t)(dstY + srcRect->y1),
-            .x2 = (lv_coord_t)(dstX + srcRect->x2),
-            .y2 = (lv_coord_t)(dstY + srcRect->y2),
-        };
-        if ((logicalArea.x1 <= logicalArea.x2) && (logicalArea.y1 <= logicalArea.y2)) {
-            lv_area_t cacheArea = DISPLAY_ROTATE_180 ? rotate_area_180(&logicalArea) : logicalArea;
-            cache_writeback_area(fb, &cacheArea);
-        }
-    };
-
     auto present_splash_frame = [&]() -> bool {
         return (self->_fb_buf[self->_frontFbIndex] != nullptr);
     };
 
+    auto alloc_splash_buffer = [&](size_t bytes) -> uint8_t* {
+        uint8_t* buf = (uint8_t*)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!buf) {
+            buf = (uint8_t*)heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
+        }
+        return buf;
+    };
+
     prepare_splash_buffers();
-    TEST_LOG("splash direct-player buffers prepared");
+    TEST_LOG("splash AnimatedGIF buffers prepared");
 
     GIFMemory gifMem = {};
     if (system->LockGif(pdMS_TO_TICKS(100))) {
@@ -1602,9 +1650,16 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
         system->UnlockGif();
     }
 
-    gd_GIF* directGif = nullptr;
-    String lvPath = self->_pendingGifPath;
-    String sdPath = lvPath;
+    AnimatedGIF* splashGif = new AnimatedGIF();
+    if (!splashGif) {
+        Serial.println("[DisplayMgr] Critical: AnimatedGIF alloc failed");
+        s_splashActive = false;
+        vTaskDelete(NULL);
+        return;
+    }
+    splashGif->begin(GIF_PALETTE_RGB565_LE);
+
+    String sdPath = self->_pendingGifPath;
     if (sdPath.startsWith("S:")) {
         sdPath = sdPath.substring(2);
     }
@@ -1612,28 +1667,97 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
         sdPath = "/" + sdPath;
     }
 
+    bool splashOpened = false;
     if (gifMem.data && gifMem.size) {
-        directGif = gd_open_gif_data(gifMem.data);
-        if (directGif) {
-            TEST_LOG("Direct GIF opened from PSRAM: %u bytes", (unsigned int)gifMem.size);
+        splashOpened = splashGif->open((uint8_t*)gifMem.data, (int)gifMem.size, splash_animated_gif_draw) != 0;
+        if (splashOpened) {
+            TEST_LOG("AnimatedGIF opened from PSRAM: %u bytes", (unsigned int)gifMem.size);
+            Serial.printf("[DisplayMgr] Splash GIF source: PSRAM (%u bytes)\n", (unsigned int)gifMem.size);
         }
     }
-    if (!directGif && SD.exists(sdPath.c_str())) {
-        directGif = gd_open_gif_file(lvPath.c_str());
-        if (directGif) {
-            TEST_LOG("Direct GIF opened from SD: %s", lvPath.c_str());
+    if (!splashOpened && SD.exists(sdPath.c_str())) {
+        splashOpened = splashGif->open(
+            sdPath.c_str(),
+            splash_animated_gif_open_file,
+            splash_animated_gif_close_file,
+            splash_animated_gif_read_file,
+            splash_animated_gif_seek_file,
+            splash_animated_gif_draw
+        ) != 0;
+        if (splashOpened) {
+            TEST_LOG("AnimatedGIF opened from SD: %s", sdPath.c_str());
+            Serial.printf("[DisplayMgr] Splash GIF source: SD (%s)\n", sdPath.c_str());
         }
     }
 
-    if (!directGif) {
-        TEST_LOG("Direct GIF open failed: %s", self->_pendingGifPath.c_str());
+    uint8_t* splashFrameBuf = nullptr;
+    uint8_t* splashTurboBuf = nullptr;
+    bool turboEnabled = false;
+    int32_t splashGifDstX = 0;
+    int32_t splashGifDstY = 0;
+    SplashAnimatedGifDrawContext drawCtx = {};
+
+    if (!splashOpened) {
+        TEST_LOG("AnimatedGIF open failed: %s", self->_pendingGifPath.c_str());
+        Serial.printf("[DisplayMgr] Splash GIF open failed: %s\n", self->_pendingGifPath.c_str());
+    } else {
+        const int canvasW = splashGif->getCanvasWidth();
+        const int canvasH = splashGif->getCanvasHeight();
+        const size_t canvasPixels = (size_t)canvasW * (size_t)canvasH;
+        splashGifDstX = (SCREEN_WIDTH - canvasW) / 2;
+        splashGifDstY = (SCREEN_HEIGHT - canvasH) / 2;
+
+        const size_t splashFrameBufBytes = canvasPixels * sizeof(uint16_t);
+        splashFrameBuf = alloc_splash_buffer(splashFrameBufBytes);
+        if (splashFrameBuf) {
+            memset(splashFrameBuf, 0, splashFrameBufBytes);
+            splashGif->setDrawType(GIF_DRAW_COOKED);
+            splashGif->setFrameBuf(splashFrameBuf);
+
+            const size_t turboBytes = (size_t)TURBO_BUFFER_SIZE + canvasPixels;
+            splashTurboBuf = alloc_splash_buffer(turboBytes);
+            if (splashTurboBuf) {
+                memset(splashTurboBuf, 0, turboBytes);
+                splashGif->setTurboBuf(splashTurboBuf);
+                turboEnabled = true;
+            }
+
+            TEST_LOG(
+                "AnimatedGIF configured canvas=%dx%d mode=COOKED turbo=%s",
+                canvasW,
+                canvasH,
+                turboEnabled ? "ON" : "OFF"
+            );
+        } else {
+            Serial.println("[DisplayMgr] Splash GIF buffer alloc failed; splash playback disabled");
+            TEST_LOG("AnimatedGIF frame buffer alloc failed");
+            splashGif->close();
+            splashOpened = false;
+        }
+
+        drawCtx.fb = self->_fb_buf[self->_frontFbIndex];
+        drawCtx.dstX = splashGifDstX;
+        drawCtx.dstY = splashGifDstY;
+        drawCtx.canvasFullyVisible =
+            (splashGifDstX >= 0) &&
+            (splashGifDstY >= 0) &&
+            ((splashGifDstX + canvasW) <= SCREEN_WIDTH) &&
+            ((splashGifDstY + canvasH) <= SCREEN_HEIGHT);
     }
 
     TickType_t startTick = xTaskGetTickCount();
     const TickType_t minSplashDuration = pdMS_TO_TICKS(1200);
     const TickType_t maxSplashDuration = pdMS_TO_TICKS(12000);
-    uint32_t prevStreamPos = splash_direct_gif_stream_pos(directGif);
-    uint32_t renderedFrames = 0;
+    constexpr uint32_t SPLASH_PROFILE_LOG_FRAMES = 10U;
+    uint32_t profiledFrames = 0;
+    uint64_t splashDecodeUsTotal = 0;
+    uint64_t splashDrawUsTotal = 0;
+    uint64_t splashWorkUsTotal = 0;
+    uint64_t splashPacedUsTotal = 0;
+    uint32_t splashDecodeUsMax = 0;
+    uint32_t splashDrawUsMax = 0;
+    uint32_t splashWorkUsMax = 0;
+
     while (true) {
         if (ulTaskNotifyTake(pdTRUE, 0)) {
             Serial.println("[DisplayMgr] Splash interrupted by notify");
@@ -1643,7 +1767,7 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
         TickType_t elapsed = xTaskGetTickCount() - startTick;
         if (s_splashGifReady) {
             if (elapsed >= minSplashDuration) {
-                Serial.println("[DisplayMgr] Splash finished by direct GIF completion");
+                Serial.println("[DisplayMgr] Splash finished by AnimatedGIF completion");
                 break;
             }
 
@@ -1663,85 +1787,135 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
             break;
         }
 
-        if (!directGif) {
+        if (!splashOpened) {
             if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20))) {
-                Serial.println("[DisplayMgr] Splash interrupted without direct GIF");
+                Serial.println("[DisplayMgr] Splash interrupted without GIF decoder");
             }
             break;
         }
 
-        lv_area_t prevFrameRect = {};
-        bool havePrevFrameRect = make_gif_area(
-            (int32_t)directGif->fx,
-            (int32_t)directGif->fy,
-            (int32_t)directGif->fw,
-            (int32_t)directGif->fh,
-            &prevFrameRect
-        );
-        uint8_t prevDisposal = directGif->gce.disposal;
+        drawCtx.drawUs = 0;
+        drawCtx.lineCount = 0;
+        drawCtx.haveDirtyRect = false;
+        drawCtx.frameWidth = 0;
+        drawCtx.frameHeight = 0;
+        drawCtx.frameX = 0;
+        drawCtx.frameY = 0;
+        drawCtx.disposal = 0;
+        drawCtx.hasTransparency = 0;
 
-        int frameStatus = gd_get_frame(directGif);
-        if (frameStatus == 0) {
-            s_splashGifReady = true;
-            continue;
+        int frameDelayMs = 0;
+        const uint64_t workStartUs = (uint64_t)esp_timer_get_time();
+        const int playStatus = splashGif->playFrame(false, &frameDelayMs, &drawCtx);
+        uint32_t workUs = (uint32_t)((uint64_t)esp_timer_get_time() - workStartUs);
+        uint32_t drawUs = (uint32_t)drawCtx.drawUs;
+        if (drawUs > workUs) {
+            drawUs = workUs;
         }
-        if (frameStatus < 0) {
-            TEST_LOG("Direct GIF decode error");
+        uint32_t decodeUs = workUs - drawUs;
+
+        const bool frameRendered = drawCtx.haveDirtyRect && (drawCtx.lineCount > 0U);
+        if (frameRendered && drawCtx.fb) {
+            writeback_splash_rect(drawCtx.fb, &drawCtx.dirtyRect);
+            present_splash_frame();
+
+            profiledFrames++;
+            splashDecodeUsTotal += decodeUs;
+            splashDrawUsTotal += drawUs;
+            splashWorkUsTotal += workUs;
+            if (decodeUs > splashDecodeUsMax) splashDecodeUsMax = decodeUs;
+            if (drawUs > splashDrawUsMax) splashDrawUsMax = drawUs;
+            if (workUs > splashWorkUsMax) splashWorkUsMax = workUs;
+        }
+
+        if (playStatus < 0) {
+            Serial.printf("[DisplayMgr] AnimatedGIF decode error: %d\n", splashGif->getLastError());
+            TEST_LOG("AnimatedGIF decode error=%d", splashGif->getLastError());
             break;
         }
 
-        uint32_t streamPos = splash_direct_gif_stream_pos(directGif);
-        if (renderedFrames > 0U && streamPos < prevStreamPos) {
+        if (playStatus == 0) {
             s_splashGifReady = true;
+        }
+
+        if (!frameRendered) {
+            if (s_splashGifReady) {
+                continue;
+            }
+            if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1))) {
+                Serial.println("[DisplayMgr] Splash interrupted during empty frame wait");
+                break;
+            }
             continue;
         }
-        prevStreamPos = streamPos;
 
-        uint32_t frameStartMs = (uint32_t)(esp_timer_get_time() / 1000ULL);
-        gd_render_frame(directGif, directGif->canvas);
-
-        lv_area_t dirtyRect = {};
-        bool haveDirtyRect = make_gif_area(
-            (int32_t)directGif->fx,
-            (int32_t)directGif->fy,
-            (int32_t)directGif->fw,
-            (int32_t)directGif->fh,
-            &dirtyRect
-        );
-        if (havePrevFrameRect && prevDisposal == 2U) {
-            if (haveDirtyRect) {
-                dirtyRect = area_union(&dirtyRect, &prevFrameRect);
-            } else {
-                dirtyRect = prevFrameRect;
-                haveDirtyRect = true;
-            }
+        if (SPLASH_ANIMATED_GIF_SPEED_FACTOR > 1U) {
+            frameDelayMs /= (int)SPLASH_ANIMATED_GIF_SPEED_FACTOR;
+        }
+        if (frameDelayMs <= 0) {
+            frameDelayMs = 10;
         }
 
-        uint16_t* drawFb = self->_fb_buf[self->_frontFbIndex];
-        if (haveDirtyRect && drawFb) {
-            blit_splash_canvas(directGif, drawFb, &dirtyRect);
-        }
-        present_splash_frame();
-        renderedFrames++;
+        const uint32_t frameElapsedMs = (uint32_t)((workUs + 999ULL) / 1000ULL);
+        const uint32_t waitMs = (frameElapsedMs < (uint32_t)frameDelayMs) ? ((uint32_t)frameDelayMs - frameElapsedMs) : 1U;
+        const uint32_t pacedUs = workUs + (waitMs * 1000U);
+        splashPacedUsTotal += pacedUs;
 
-        uint32_t frameDelayMs = (uint32_t)directGif->gce.delay * 10U;
-        if (SPLASH_DIRECT_GIF_SPEED_FACTOR > 1U) {
-            frameDelayMs /= SPLASH_DIRECT_GIF_SPEED_FACTOR;
-        }
-        if (frameDelayMs == 0U) {
-            frameDelayMs = 10U;
+        if (profiledFrames <= SPLASH_PROFILE_LOG_FRAMES) {
+            Serial.printf(
+                "[DisplayMgr][GIFPROF] f=%u rect=%ux%u@%d,%d delay_ms=%u decode_us=%u draw_us=%u work_us=%u paced_us=%u disp=%u trans=%u turbo=%u\n",
+                (unsigned int)profiledFrames,
+                (unsigned int)drawCtx.frameWidth,
+                (unsigned int)drawCtx.frameHeight,
+                (int)drawCtx.frameX,
+                (int)drawCtx.frameY,
+                (unsigned int)frameDelayMs,
+                (unsigned int)decodeUs,
+                (unsigned int)drawUs,
+                (unsigned int)workUs,
+                (unsigned int)pacedUs,
+                (unsigned int)drawCtx.disposal,
+                (unsigned int)drawCtx.hasTransparency,
+                turboEnabled ? 1U : 0U
+            );
         }
 
-        uint32_t frameElapsedMs = (uint32_t)((esp_timer_get_time() / 1000ULL) - frameStartMs);
-        uint32_t waitMs = (frameElapsedMs < frameDelayMs) ? (frameDelayMs - frameElapsedMs) : 1U;
+        if (s_splashGifReady) {
+            continue;
+        }
+
         if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(waitMs))) {
             Serial.println("[DisplayMgr] Splash interrupted during frame wait");
             break;
         }
     }
 
-    if (directGif) {
-        gd_close_gif(directGif);
+    if (splashOpened) {
+        if (profiledFrames > 0U) {
+            Serial.printf(
+                "[DisplayMgr][GIFPROF] avg decode_us=%u draw_us=%u work_us=%u paced_us=%u max decode_us=%u draw_us=%u work_us=%u frames=%u turbo=%u\n",
+                (unsigned int)(splashDecodeUsTotal / profiledFrames),
+                (unsigned int)(splashDrawUsTotal / profiledFrames),
+                (unsigned int)(splashWorkUsTotal / profiledFrames),
+                (unsigned int)(splashPacedUsTotal / profiledFrames),
+                (unsigned int)splashDecodeUsMax,
+                (unsigned int)splashDrawUsMax,
+                (unsigned int)splashWorkUsMax,
+                (unsigned int)profiledFrames,
+                turboEnabled ? 1U : 0U
+            );
+        }
+        splashGif->close();
+    }
+    delete splashGif;
+    splashGif = nullptr;
+    if (splashTurboBuf) {
+        heap_caps_free(splashTurboBuf);
+        splashTurboBuf = nullptr;
+    }
+    if (splashFrameBuf) {
+        heap_caps_free(splashFrameBuf);
+        splashFrameBuf = nullptr;
     }
 
     bool uiReady = false;
@@ -1749,10 +1923,6 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
         if(system->LockLvgl(pdMS_TO_TICKS(100))) {
             TEST_LOG("LockLvgl acquired for UI transition, try=%d", i);
             lv_obj_t* screen = lv_scr_act();
-            if (self->_splashGif) {
-                lv_obj_del(self->_splashGif);
-                self->_splashGif = nullptr;
-            }
             show_gauge_screen_locked(system);
 
             lv_obj_invalidate(screen);
@@ -1785,10 +1955,14 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
     self->_gifTaskHandler = nullptr;
     self->_splashFinished = true;
     s_splashActive = false;
-    vTaskPrioritySet(self->_lvglTaskHandler, 4);
+    vTaskPrioritySet(self->_lvglTaskHandler, LVGL_REUSED_TASK_PRIORITY);
     Serial.println("[DisplayMgr] Reusing GifTask as LvglTask");
     DisplayMgr::HandleLvglTask(self);
 }
+
+#if defined(__GNUC__)
+#pragma GCC pop_options
+#endif
 
 void DisplayMgr::Subscribe(void* pvParameters)
 {
@@ -1807,7 +1981,7 @@ void DisplayMgr::Subscribe(void* pvParameters)
                     if (self->_gifTaskHandler == nullptr) {
                         TEST_LOG("Starting LVGL GIF Task: %s", self->_pendingGifPath.c_str());
                         BaseType_t ret = xTaskCreatePinnedToCore(
-                            DisplayMgr::PlayGifTask, "GifTask", GIF_TASK_STACK_WORDS, self, 5, &self->_gifTaskHandler, 1
+                            DisplayMgr::PlayGifTask, "GifTask", GIF_TASK_STACK_WORDS, self, SPLASH_GIF_TASK_PRIORITY, &self->_gifTaskHandler, 1
                         );
                         if (ret != pdPASS) {
                             Serial.println("[DisplayMgr] Critical: GifTask create failed");
@@ -1884,16 +2058,6 @@ void DisplayMgr::HandleLvglTask(void *pvParameters)
     TickType_t lastMonTick = xLastWakeTime;
     TickType_t lastUiTick = xLastWakeTime;
     TickType_t lastSyncLogTick = xLastWakeTime;
-    uint32_t prevReq = 0;
-    uint32_t prevDone = 0;
-    uint32_t prevSkip = 0;
-    uint32_t prevForced = 0;
-    uint32_t prevBypass = 0;
-    uint32_t prevVsync = 0;
-    uint32_t prevSingleArea = 0;
-    uint32_t prevSingleFrame = 0;
-    uint32_t prevSinglePixel = 0;
-    uint64_t prevSingleCopyUs = 0;
     bool prevDebugBusy = false;
     Serial.println("[DisplayMgr] LvglTask started");
 
@@ -1932,60 +2096,23 @@ void DisplayMgr::HandleLvglTask(void *pvParameters)
             if (!s_splashActive && !debugBusy &&
                 (now - lastMonTick) >= MONITOR_UPDATE_PERIOD_TICKS &&
                 (s_monitorResumeTick == 0 || now >= s_monitorResumeTick)) {
-                // if (lv_anim_count_running() == 0) {
-                    size_t total = heap_caps_get_total_size(MALLOC_CAP_8BIT);
-                    size_t free = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-                    int32_t ram = (total > 0) ? (int32_t)(((total - free) * 100U) / total) : 0;
+                size_t total = heap_caps_get_total_size(MALLOC_CAP_8BIT);
+                size_t free = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+                int32_t ram = (total > 0) ? (int32_t)(((total - free) * 100U) / total) : 0;
 
-                    uint8_t core0 = 0;
-                    uint8_t core1 = 0;
-                    if (sample_cpu_usage(&core0, &core1)) {
-                        update_system_monitor(ram, core0, core1);
-                    } else if (s_cpuUsageValid) {
-                        update_system_monitor(ram, s_cpuFilteredUsage0, s_cpuFilteredUsage1);
-                    } else {
-                        update_system_monitor(ram, 0, 0);
-                    }
-                    lastMonTick = now;
-                // }
+                uint8_t core0 = 0;
+                uint8_t core1 = 0;
+                if (sample_cpu_usage(&core0, &core1)) {
+                    update_system_monitor(ram, core0, core1);
+                } else if (s_cpuUsageValid) {
+                    update_system_monitor(ram, s_cpuFilteredUsage0, s_cpuFilteredUsage1);
+                } else {
+                    update_system_monitor(ram, 0, 0);
+                }
+                lastMonTick = now;
             }
 
             if ((now - lastSyncLogTick) >= pdMS_TO_TICKS(2000)) {
-                uint32_t req = s_swapReqCount;
-                uint32_t done = s_swapDoneCount;
-                uint32_t skip = s_swapSkipTimeoutCount;
-                uint32_t bypass = s_replayBypassCount;
-                uint32_t forced = s_swapForcedOnTimeoutCount;
-                uint32_t vs = s_vsyncCount;
-                uint32_t sfArea = s_singleFlushAreaCount;
-                uint32_t sfFrame = s_singleFlushFrameCount;
-                uint32_t sfPixel = s_singleFlushPixelCount;
-                uint64_t sfCopyUs = s_singleFlushCopyTimeUs;
-                uint32_t sfMaxUs = s_singleFlushMaxCopyUs;
-                // Serial.printf("[DisplayMgr][SYNC] req:+%u done:+%u skip:+%u forced:+%u bypass:+%u vsync:+%u\n",
-                //               (unsigned int)(req - prevReq),
-                //               (unsigned int)(done - prevDone),
-                //               (unsigned int)(skip - prevSkip),
-                //               (unsigned int)(forced - prevForced),
-                //               (unsigned int)(bypass - prevBypass),
-                //               (unsigned int)(vs - prevVsync));
-                // Serial.printf("[DisplayMgr][FLUSH1] mode:%s frame:+%u area:+%u px:+%u copy_us:+%llu max_us:%u\n",
-                //               s_usePseudoDoubleBuffer ? "DBL" : "SGL",
-                //               (unsigned int)(sfFrame - prevSingleFrame),
-                //               (unsigned int)(sfArea - prevSingleArea),
-                //               (unsigned int)(sfPixel - prevSinglePixel),
-                //               (unsigned long long)(sfCopyUs - prevSingleCopyUs),
-                //               (unsigned int)sfMaxUs);
-                prevReq = req;
-                prevDone = done;
-                prevSkip = skip;
-                prevForced = forced;
-                prevBypass = bypass;
-                prevVsync = vs;
-                prevSingleArea = sfArea;
-                prevSingleFrame = sfFrame;
-                prevSinglePixel = sfPixel;
-                prevSingleCopyUs = sfCopyUs;
                 s_singleFlushMaxCopyUs = 0;
                 lastSyncLogTick = now;
             }
