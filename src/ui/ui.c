@@ -12,6 +12,9 @@ static lv_obj_t * icon_frost = NULL;
 static lv_obj_t * clock_label = NULL;
 static lv_obj_t * outside_temp_label = NULL;
 static lv_obj_t * main_test_panel = NULL;
+static bool outside_temp_rendered_valid = false;
+static int32_t outside_temp_rendered_value = 1000;
+static bool frost_icon_rendered_visible = false;
 
 static monitor_item_t cpu_core1, cpu_core2, ram_usage;
 static lv_timer_t * monitor_ceremony_timer = NULL;
@@ -26,6 +29,12 @@ static lv_timer_t * needle_ceremony_delay_timer = NULL;
 static bool needle_ceremony_active = false;
 static bool needle_ceremony_pending = false;
 static uint32_t needle_ceremony_start_ms = 0;
+static bool coolant_needle_animating = false;
+static bool battery_needle_animating = false;
+static bool coolant_pending_valid = false;
+static int32_t coolant_pending_value = 0;
+static bool battery_pending_valid = false;
+static int32_t battery_pending_value = 0;
 static bool obd_connected_latched = false;
 static bool coolant_valid_latched = false;
 static int32_t coolant_value_latched = 0;
@@ -58,6 +67,10 @@ static const uint32_t DEBUG_LOG_FLUSH_BATCH = 8;
 static const uint32_t DEBUG_LOG_QUEUE_DEPTH = 96;
 static const uint32_t DEBUG_LOG_TEXT_MAX_CHARS = 6000;
 static const uint32_t DEBUG_LOG_ENQUEUE_MAX_PER_SEC = 12;
+static const uint32_t NEEDLE_RUNTIME_ANIM_MS = 220;
+static const int32_t COOLANT_NEEDLE_IGNORE_DELTA = 1;
+static const int32_t COOLANT_NEEDLE_INSTANT_DELTA = 2;
+static const int32_t BATTERY_NEEDLE_INSTANT_DELTA = 1;
 
 static portMUX_TYPE debug_log_budget_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t debug_log_budget_window_ms = 0;
@@ -66,6 +79,8 @@ static uint16_t debug_log_budget_dropped = 0;
 
 static void set_coolant_gauge_instant(int32_t val);
 static void set_battery_gauge_instant(int32_t val);
+static void apply_coolant_gauge_value(int32_t val, bool force_anim);
+static void apply_battery_gauge_value(int32_t val, bool force_anim);
 static void start_needle_ceremony(void);
 static void apply_latched_obd_needles(void);
 static void needle_ceremony_delay_timer_cb(lv_timer_t * t);
@@ -497,6 +512,71 @@ static void needle_anim_exec_cb(void * var, int32_t v)
     lv_img_set_angle((lv_obj_t *)var, (int16_t)(v % 3600));
 }
 
+static int32_t needle_abs_delta(int32_t a, int32_t b)
+{
+    int32_t delta = a - b;
+    return (delta < 0) ? -delta : delta;
+}
+
+static int32_t needle_shortest_angle_delta(int32_t start_angle, int32_t target_angle)
+{
+    int32_t diff = (target_angle % 3600) - (start_angle % 3600);
+    if (diff > 1800) diff -= 3600;
+    else if (diff < -1800) diff += 3600;
+    return diff;
+}
+
+static void coolant_needle_anim_ready_cb(lv_anim_t * a)
+{
+    LV_UNUSED(a);
+    coolant_needle_animating = false;
+
+    if (!coolant_pending_valid) return;
+
+    int32_t next = coolant_pending_value;
+    coolant_pending_valid = false;
+    apply_coolant_gauge_value(next, false);
+}
+
+static void battery_needle_anim_ready_cb(lv_anim_t * a)
+{
+    LV_UNUSED(a);
+    battery_needle_animating = false;
+
+    if (!battery_pending_valid) return;
+
+    int32_t next = battery_pending_value;
+    battery_pending_valid = false;
+    apply_battery_gauge_value(next, false);
+}
+
+static bool start_needle_runtime_anim(
+    lv_obj_t * needle_obj,
+    int32_t target_angle,
+    lv_anim_ready_cb_t ready_cb
+)
+{
+    if (!needle_obj) return false;
+
+    int32_t start_angle = lv_img_get_angle(needle_obj);
+    int32_t diff = needle_shortest_angle_delta(start_angle, target_angle);
+    if (diff == 0) {
+        lv_img_set_angle(needle_obj, (int16_t)(target_angle % 3600));
+        return false;
+    }
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, needle_obj);
+    lv_anim_set_exec_cb(&a, (lv_anim_exec_xcb_t)needle_anim_exec_cb);
+    lv_anim_set_ready_cb(&a, ready_cb);
+    lv_anim_set_values(&a, start_angle, start_angle + diff);
+    lv_anim_set_time(&a, NEEDLE_RUNTIME_ANIM_MS);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+    return true;
+}
+
 static void set_monitor_item_instant(monitor_item_t * item, int32_t usage)
 {
     if (!item || !item->bar || !item->label_val) return;
@@ -578,62 +658,20 @@ static int32_t battery_to_angle(int32_t val)
 
 void update_coolant_gauge(int32_t val)
 {
-    if (!target_needle) return;
-
-    val = clamp_coolant(val);
-    if (val == coolant_rendered_value) return;
-    coolant_rendered_value = val;
-
-    int32_t target_angle = coolant_to_angle(val);
-    int32_t start_angle = lv_img_get_angle(target_needle);
-
-    int32_t diff = (target_angle % 3600) - (start_angle % 3600);
-    if (diff > 1800) diff -= 3600;
-    else if (diff < -1800) diff += 3600;
-
-    lv_anim_del(target_needle, (lv_anim_exec_xcb_t)needle_anim_exec_cb);
-
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, target_needle);
-    lv_anim_set_exec_cb(&a, (lv_anim_exec_xcb_t)needle_anim_exec_cb);
-    lv_anim_set_values(&a, start_angle, start_angle + diff);
-    lv_anim_set_time(&a, 600);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
-    lv_anim_start(&a);
+    apply_coolant_gauge_value(val, false);
 }
 
 void update_battery_gauge(int32_t val)
 {
-    if (!target_batt_needle) return;
-
-    val = clamp_battery(val);
-    if (val == battery_rendered_value) return;
-    battery_rendered_value = val;
-
-    int32_t target_angle = battery_to_angle(val);
-    int32_t start_angle = lv_img_get_angle(target_batt_needle);
-
-    int32_t diff = (target_angle % 3600) - (start_angle % 3600);
-    if (diff > 1800) diff -= 3600;
-    else if (diff < -1800) diff += 3600;
-
-    lv_anim_del(target_batt_needle, (lv_anim_exec_xcb_t)needle_anim_exec_cb);
-
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, target_batt_needle);
-    lv_anim_set_exec_cb(&a, (lv_anim_exec_xcb_t)needle_anim_exec_cb);
-    lv_anim_set_values(&a, start_angle, start_angle + diff);
-    lv_anim_set_time(&a, 600);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
-    lv_anim_start(&a);
+    apply_battery_gauge_value(val, false);
 }
 
 static void set_coolant_gauge_instant(int32_t val)
 {
     if (!target_needle) return;
     val = clamp_coolant(val);
+    coolant_needle_animating = false;
+    coolant_pending_valid = false;
     coolant_rendered_value = val;
     lv_anim_del(target_needle, (lv_anim_exec_xcb_t)needle_anim_exec_cb);
     lv_img_set_angle(target_needle, (int16_t)(coolant_to_angle(val) % 3600));
@@ -643,17 +681,88 @@ static void set_battery_gauge_instant(int32_t val)
 {
     if (!target_batt_needle) return;
     val = clamp_battery(val);
+    battery_needle_animating = false;
+    battery_pending_valid = false;
     battery_rendered_value = val;
     lv_anim_del(target_batt_needle, (lv_anim_exec_xcb_t)needle_anim_exec_cb);
     lv_img_set_angle(target_batt_needle, (int16_t)(battery_to_angle(val) % 3600));
 }
 
+static void apply_coolant_gauge_value(int32_t val, bool force_anim)
+{
+    if (!target_needle) return;
+
+    val = clamp_coolant(val);
+    if (coolant_rendered_value >= 0) {
+        int32_t basis = coolant_pending_valid ? coolant_pending_value : coolant_rendered_value;
+        int32_t delta = needle_abs_delta(val, basis);
+        if (delta == 0) return;
+        if (coolant_needle_animating) {
+            if (delta <= COOLANT_NEEDLE_IGNORE_DELTA) return;
+            coolant_pending_value = val;
+            coolant_pending_valid = true;
+            return;
+        }
+        if (!force_anim) {
+            if (delta <= COOLANT_NEEDLE_IGNORE_DELTA) return;
+            if (delta <= COOLANT_NEEDLE_INSTANT_DELTA) {
+                set_coolant_gauge_instant(val);
+                return;
+            }
+        }
+    }
+
+    coolant_pending_valid = false;
+    coolant_rendered_value = val;
+    coolant_needle_animating = start_needle_runtime_anim(
+        target_needle,
+        coolant_to_angle(val),
+        coolant_needle_anim_ready_cb
+    );
+    if (!coolant_needle_animating) {
+        lv_img_set_angle(target_needle, (int16_t)(coolant_to_angle(val) % 3600));
+    }
+}
+
+static void apply_battery_gauge_value(int32_t val, bool force_anim)
+{
+    if (!target_batt_needle) return;
+
+    val = clamp_battery(val);
+    if (battery_rendered_value >= 0) {
+        int32_t basis = battery_pending_valid ? battery_pending_value : battery_rendered_value;
+        int32_t delta = needle_abs_delta(val, basis);
+        if (delta == 0) return;
+        if (battery_needle_animating) {
+            if (delta <= BATTERY_NEEDLE_INSTANT_DELTA) return;
+            battery_pending_value = val;
+            battery_pending_valid = true;
+            return;
+        }
+        if (!force_anim && delta <= BATTERY_NEEDLE_INSTANT_DELTA) {
+            set_battery_gauge_instant(val);
+            return;
+        }
+    }
+
+    battery_pending_valid = false;
+    battery_rendered_value = val;
+    battery_needle_animating = start_needle_runtime_anim(
+        target_batt_needle,
+        battery_to_angle(val),
+        battery_needle_anim_ready_cb
+    );
+    if (!battery_needle_animating) {
+        lv_img_set_angle(target_batt_needle, (int16_t)(battery_to_angle(val) % 3600));
+    }
+}
+
 static void apply_latched_obd_needles(void)
 {
-    if (coolant_valid_latched) update_coolant_gauge(coolant_value_latched);
+    if (coolant_valid_latched) apply_coolant_gauge_value(coolant_value_latched, true);
     else set_coolant_gauge_instant(0);
 
-    if (battery_valid_latched) update_battery_gauge(battery_value_latched);
+    if (battery_valid_latched) apply_battery_gauge_value(battery_value_latched, true);
     else set_battery_gauge_instant(0);
 }
 
@@ -710,6 +819,10 @@ static void start_needle_ceremony(void)
     needle_ceremony_pending = false;
     needle_ceremony_active = true;
     needle_ceremony_start_ms = lv_tick_get();
+    coolant_needle_animating = false;
+    battery_needle_animating = false;
+    coolant_pending_valid = false;
+    battery_pending_valid = false;
     set_coolant_gauge_instant(0);
     set_battery_gauge_instant(0);
     needle_ceremony_timer = lv_timer_create(needle_ceremony_timer_cb, 8, NULL);
@@ -936,22 +1049,37 @@ void update_outside_temp(int32_t temp_c, bool valid)
     if (!outside_temp_label) return;
 
     if (!valid) {
-        if (strcmp(lv_label_get_text(outside_temp_label), "--\xC2\xB0" "C") != 0) {
+        if (outside_temp_rendered_valid ||
+            strcmp(lv_label_get_text(outside_temp_label), "--\xC2\xB0" "C") != 0) {
             lv_label_set_text(outside_temp_label, "--\xC2\xB0" "C");
         }
+        outside_temp_rendered_valid = false;
+        outside_temp_rendered_value = 1000;
         if (icon_frost) {
-            lv_obj_add_flag(icon_frost, LV_OBJ_FLAG_HIDDEN);
+            if (frost_icon_rendered_visible) {
+                lv_obj_add_flag(icon_frost, LV_OBJ_FLAG_HIDDEN);
+                frost_icon_rendered_visible = false;
+            }
         }
         return;
     }
 
     if (temp_c > 99) temp_c = 99;
     if (temp_c < -9) temp_c = -9;
-    lv_label_set_text_fmt(outside_temp_label, "%d\xC2\xB0" "C", (int)temp_c);
+
+    if (!outside_temp_rendered_valid || outside_temp_rendered_value != temp_c) {
+        lv_label_set_text_fmt(outside_temp_label, "%d\xC2\xB0" "C", (int)temp_c);
+        outside_temp_rendered_valid = true;
+        outside_temp_rendered_value = temp_c;
+    }
 
     if (icon_frost) {
-        if (temp_c < 10) lv_obj_clear_flag(icon_frost, LV_OBJ_FLAG_HIDDEN);
-        else lv_obj_add_flag(icon_frost, LV_OBJ_FLAG_HIDDEN);
+        bool showFrost = (temp_c < 10);
+        if (showFrost != frost_icon_rendered_visible) {
+            if (showFrost) lv_obj_clear_flag(icon_frost, LV_OBJ_FLAG_HIDDEN);
+            else lv_obj_add_flag(icon_frost, LV_OBJ_FLAG_HIDDEN);
+            frost_icon_rendered_visible = showFrost;
+        }
     }
 }
 
@@ -1042,6 +1170,10 @@ void UiResetRuntimeState(void)
     monitor_ceremony_active = false;
     needle_ceremony_active = false;
     needle_ceremony_pending = false;
+    coolant_needle_animating = false;
+    battery_needle_animating = false;
+    coolant_pending_valid = false;
+    battery_pending_valid = false;
 
     monitor_ceremony_start_ms = 0;
     needle_ceremony_start_ms = 0;
@@ -1057,6 +1189,8 @@ void UiResetRuntimeState(void)
     battery_value_latched = 0;
     coolant_rendered_value = -1;
     battery_rendered_value = -1;
+    coolant_pending_value = 0;
+    battery_pending_value = 0;
 
     target_needle = NULL;
     target_batt_needle = NULL;
@@ -1066,6 +1200,9 @@ void UiResetRuntimeState(void)
     icon_frost = NULL;
     clock_label = NULL;
     outside_temp_label = NULL;
+    outside_temp_rendered_valid = false;
+    outside_temp_rendered_value = 1000;
+    frost_icon_rendered_visible = false;
     main_test_panel = NULL;
     debug_container = NULL;
     debug_swipe_zone = NULL;

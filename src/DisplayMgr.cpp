@@ -74,9 +74,11 @@ static bool s_forceFullInvalidatePending = false;
 static uint32_t s_diagLastLogMs = 0;
 static uint32_t s_successfulPseudoSwapFrameCount = 0;
 
-static constexpr TickType_t MONITOR_UPDATE_PERIOD_TICKS = pdMS_TO_TICKS(200);
+static constexpr TickType_t MONITOR_UPDATE_PERIOD_TICKS = pdMS_TO_TICKS(500);
 static constexpr TickType_t UI_SHARED_UPDATE_PERIOD_TICKS = pdMS_TO_TICKS(100);
-static constexpr TickType_t LVGL_TASK_PERIOD_TICKS = pdMS_TO_TICKS(20);
+static constexpr uint32_t LVGL_TASK_MIN_SLEEP_MS = 1U;
+static constexpr uint32_t LVGL_TASK_MAX_SLEEP_MS = 8U;
+static constexpr uint32_t LVGL_TASK_LOCK_FAIL_SLEEP_MS = 2U;
 #ifndef DISPLAY_PERIODIC_FULL_SYNC_INTERVAL
 #define DISPLAY_PERIODIC_FULL_SYNC_INTERVAL 120U
 #endif
@@ -526,15 +528,19 @@ static bool sample_cpu_usage(uint8_t* core0_usage, uint8_t* core1_usage)
     s_cpuPrevIdle1 = nowIdle1;
     s_cpuPrevSampleTick = nowTick;
 
-    // Keep peak as a monotonic baseline for stability.
-    // Decaying peak tracks short-term noise and amplifies jitter in usage ratio.
+    // Keep a monotonic "fully idle" baseline.
+    // With the 500 ms sample period, this gives a more useful instantaneous load
+    // than a decaying baseline, which tends to chase the current sample and
+    // eventually drives the displayed usage toward 0%.
     if (dIdle0 > s_cpuPeakIdle0) s_cpuPeakIdle0 = dIdle0;
     if (dIdle1 > s_cpuPeakIdle1) s_cpuPeakIdle1 = dIdle1;
     if (s_cpuPeakIdle0 == 0) s_cpuPeakIdle0 = 1;
     if (s_cpuPeakIdle1 == 0) s_cpuPeakIdle1 = 1;
 
-    uint32_t u0 = 100U - ((dIdle0 * 100U) / s_cpuPeakIdle0);
-    uint32_t u1 = 100U - ((dIdle1 * 100U) / s_cpuPeakIdle1);
+    uint32_t idle0Pct = (uint32_t)(((uint64_t)dIdle0 * 100ULL + ((uint64_t)s_cpuPeakIdle0 / 2ULL)) / (uint64_t)s_cpuPeakIdle0);
+    uint32_t idle1Pct = (uint32_t)(((uint64_t)dIdle1 * 100ULL + ((uint64_t)s_cpuPeakIdle1 / 2ULL)) / (uint64_t)s_cpuPeakIdle1);
+    uint32_t u0 = (idle0Pct >= 100U) ? 0U : (100U - idle0Pct);
+    uint32_t u1 = (idle1Pct >= 100U) ? 0U : (100U - idle1Pct);
     if (u0 > 100U) u0 = 100U;
     if (u1 > 100U) u1 = 100U;
 
@@ -551,18 +557,8 @@ static bool sample_cpu_usage(uint8_t* core0_usage, uint8_t* core1_usage)
         return false;
     }
 
-    // Strong low-pass filter + per-sample slew limiter to suppress rapid oscillation.
-    const uint32_t filtDen = 16U;
-    const uint32_t filtAlpha = 1U; // 6.25% new sample
-    uint32_t next0 = ((uint32_t)s_cpuFilteredUsage0 * (filtDen - filtAlpha) + (u0 * filtAlpha) + (filtDen / 2U)) / filtDen;
-    uint32_t next1 = ((uint32_t)s_cpuFilteredUsage1 * (filtDen - filtAlpha) + (u1 * filtAlpha) + (filtDen / 2U)) / filtDen;
-    const uint32_t maxStep = 5U;
-    if (next0 > ((uint32_t)s_cpuFilteredUsage0 + maxStep)) next0 = (uint32_t)s_cpuFilteredUsage0 + maxStep;
-    if ((next0 + maxStep) < (uint32_t)s_cpuFilteredUsage0) next0 = (uint32_t)s_cpuFilteredUsage0 - maxStep;
-    if (next1 > ((uint32_t)s_cpuFilteredUsage1 + maxStep)) next1 = (uint32_t)s_cpuFilteredUsage1 + maxStep;
-    if ((next1 + maxStep) < (uint32_t)s_cpuFilteredUsage1) next1 = (uint32_t)s_cpuFilteredUsage1 - maxStep;
-    s_cpuFilteredUsage0 = (uint8_t)next0;
-    s_cpuFilteredUsage1 = (uint8_t)next1;
+    s_cpuFilteredUsage0 = (uint8_t)u0;
+    s_cpuFilteredUsage1 = (uint8_t)u1;
     s_cpuUsageValid = true;
 
     *core0_usage = s_cpuFilteredUsage0;
@@ -1194,7 +1190,7 @@ void DisplayMgr::StartLVGL() {
     static lv_color_t* sram_work_buf2 = nullptr;
     static uint32_t sram_lines = 0;
     if (!sram_work_buf1 || !sram_work_buf2) {
-        const uint32_t lineOptions[] = {180, 160, 140, 112};
+        const uint32_t lineOptions[] = {240, 220, 200, 180, 160, 140, 112};
         for (size_t i = 0; i < (sizeof(lineOptions) / sizeof(lineOptions[0])); ++i) {
             uint32_t lines = lineOptions[i];
             size_t bufSize = SCREEN_WIDTH * lines * sizeof(lv_color_t);
@@ -2054,16 +2050,21 @@ void DisplayMgr::HandleLvglTask(void *pvParameters)
         vTaskDelete(NULL);
         return;
     }
-    TickType_t xLastWakeTime = xTaskGetTickCount();
-    TickType_t lastMonTick = xLastWakeTime;
-    TickType_t lastUiTick = xLastWakeTime;
-    TickType_t lastSyncLogTick = xLastWakeTime;
+    TickType_t now = xTaskGetTickCount();
+    TickType_t lastMonTick = now;
+    TickType_t lastUiTick = now;
+    TickType_t lastSyncLogTick = now;
     bool prevDebugBusy = false;
     Serial.println("[DisplayMgr] LvglTask started");
 
     while (true) {
+        TickType_t sleepTicks = pdMS_TO_TICKS(LVGL_TASK_LOCK_FAIL_SLEEP_MS);
+        if (sleepTicks == 0) {
+            sleepTicks = 1;
+        }
+
         if (system->LockLvgl(pdMS_TO_TICKS(5))) {
-            lv_timer_handler();
+            uint32_t nextDelayMs = lv_timer_handler();
             if (s_forceFullInvalidatePending && !s_splashActive) {
                 lv_obj_t* screen = lv_scr_act();
                 if (screen) {
@@ -2119,9 +2120,21 @@ void DisplayMgr::HandleLvglTask(void *pvParameters)
             prevDebugBusy = debugBusy;
 
             system->UnlockLvgl();
+
+            if (nextDelayMs == 0U) {
+                sleepTicks = pdMS_TO_TICKS(LVGL_TASK_MIN_SLEEP_MS);
+            } else {
+                if (nextDelayMs > LVGL_TASK_MAX_SLEEP_MS) {
+                    nextDelayMs = LVGL_TASK_MAX_SLEEP_MS;
+                }
+                sleepTicks = pdMS_TO_TICKS(nextDelayMs);
+            }
+            if (sleepTicks == 0) {
+                sleepTicks = 1;
+            }
         }
 
-        vTaskDelayUntil(&xLastWakeTime, LVGL_TASK_PERIOD_TICKS);
+        vTaskDelay(sleepTicks);
     }
 }
 
