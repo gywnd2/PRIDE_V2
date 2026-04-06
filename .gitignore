@@ -40,6 +40,22 @@
 # debug information files
 *.dwo
 
+# PlatformIO / IDE generated files
+.pio/
+.vscode/
+compile_commands.json
+
+# Local build logs / scratch files
+build_out.txt
+build_err.txt
+*.hold
+
+# Local media / backup artifacts
+/*.gif
+/assets/
+/assets - */
+/scripts/reencode_gif.py
+
 # Local Wi-Fi credentials (do not commit)
 wifi_credentials.txt
 include/WifiCredentialsLocal.h

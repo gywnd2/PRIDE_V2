@@ -74,10 +74,10 @@ static bool s_forceFullInvalidatePending = false;
 static uint32_t s_diagLastLogMs = 0;
 static uint32_t s_successfulPseudoSwapFrameCount = 0;
 
-static constexpr TickType_t MONITOR_UPDATE_PERIOD_TICKS = pdMS_TO_TICKS(500);
+static constexpr TickType_t MONITOR_UPDATE_PERIOD_TICKS = pdMS_TO_TICKS(1000);
 static constexpr TickType_t UI_SHARED_UPDATE_PERIOD_TICKS = pdMS_TO_TICKS(100);
 static constexpr uint32_t LVGL_TASK_MIN_SLEEP_MS = 1U;
-static constexpr uint32_t LVGL_TASK_MAX_SLEEP_MS = 8U;
+static constexpr uint32_t LVGL_TASK_MAX_SLEEP_MS = 4U;
 static constexpr uint32_t LVGL_TASK_LOCK_FAIL_SLEEP_MS = 2U;
 #ifndef DISPLAY_PERIODIC_FULL_SYNC_INTERVAL
 #define DISPLAY_PERIODIC_FULL_SYNC_INTERVAL 120U
@@ -529,7 +529,7 @@ static bool sample_cpu_usage(uint8_t* core0_usage, uint8_t* core1_usage)
     s_cpuPrevSampleTick = nowTick;
 
     // Keep a monotonic "fully idle" baseline.
-    // With the 500 ms sample period, this gives a more useful instantaneous load
+    // With the 1 second sample period, this gives a more useful instantaneous load
     // than a decaying baseline, which tends to chase the current sample and
     // eventually drives the displayed usage toward 0%.
     if (dIdle0 > s_cpuPeakIdle0) s_cpuPeakIdle0 = dIdle0;

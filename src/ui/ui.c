@@ -67,7 +67,7 @@ static const uint32_t DEBUG_LOG_FLUSH_BATCH = 8;
 static const uint32_t DEBUG_LOG_QUEUE_DEPTH = 96;
 static const uint32_t DEBUG_LOG_TEXT_MAX_CHARS = 6000;
 static const uint32_t DEBUG_LOG_ENQUEUE_MAX_PER_SEC = 12;
-static const uint32_t NEEDLE_RUNTIME_ANIM_MS = 220;
+static const uint32_t NEEDLE_RUNTIME_ANIM_MS = 300;
 static const int32_t COOLANT_NEEDLE_IGNORE_DELTA = 1;
 static const int32_t COOLANT_NEEDLE_INSTANT_DELTA = 2;
 static const int32_t BATTERY_NEEDLE_INSTANT_DELTA = 1;
@@ -572,7 +572,7 @@ static bool start_needle_runtime_anim(
     lv_anim_set_ready_cb(&a, ready_cb);
     lv_anim_set_values(&a, start_angle, start_angle + diff);
     lv_anim_set_time(&a, NEEDLE_RUNTIME_ANIM_MS);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
     lv_anim_start(&a);
     return true;
 }
