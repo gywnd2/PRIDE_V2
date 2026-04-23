@@ -8,6 +8,8 @@
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 
+class SystemAPI;
+
 #define RPM_REQ_RETRY_MAX 2
 #define BT_CONNECTION_CHECK_INTERVAL 1
 #define OBD_SIMUL_QUERY_TIME 50  // 시뮬레이션 모드 시 대기 시간
@@ -87,6 +89,7 @@ private:
     void PostEvent(ObdMgrEventType type);
     bool StartConnectTask();
     bool StartQueryTask();
+    void FinalizeServiceOdoSession(SystemAPI* system);
 
 protected:
     void QueryCoolant(uint16_t &coolant_temp);

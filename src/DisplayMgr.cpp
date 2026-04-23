@@ -5,6 +5,8 @@
 #include <SD.h>
 #include <ui.h>
 #include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
 #include "esp_heap_caps.h"
 #include "freertos/task.h"
 #include "esp_lcd_panel_rgb.h"
@@ -24,8 +26,12 @@ extern "C" int Cache_WriteBack_Addr(uint32_t addr, uint32_t size);
 #endif
 #include <AnimatedGIF.h>
 
-#define TEST_LOG(fmt, ...) UartLogf("[DisplayMgr] " fmt "\n", ##__VA_ARGS__)
-#define TEST_LINE() UartLogf("[DisplayMgr] %s\n", __func__)
+static void display_logf(const char* fmt, ...);
+static void display_serial_printf(const char* fmt, ...);
+static void display_serial_println(const char* line);
+
+#define TEST_LOG(fmt, ...) display_logf("[DisplayMgr] " fmt, ##__VA_ARGS__)
+#define TEST_LINE() display_logf("[DisplayMgr] %s", __func__)
 
 static constexpr uint32_t GIF_TASK_STACK_WORDS = 8192;
 static constexpr UBaseType_t SPLASH_GIF_TASK_PRIORITY = 6;
@@ -107,6 +113,77 @@ static constexpr uint32_t DISPLAY_FRAME_PERIOD_MS =
 static constexpr uint32_t DISPLAY_VSYNC_WAIT_BUDGET_MS =
     ((DISPLAY_FRAME_PERIOD_MS + 12U) < 40U) ? 40U : (DISPLAY_FRAME_PERIOD_MS + 12U);
 static constexpr bool DISPLAY_ROTATE_180 = true;
+
+static void trim_display_log_line(char* line)
+{
+    if (!line) return;
+    size_t len = strlen(line);
+    while (len > 0) {
+        char c = line[len - 1];
+        if (c != '\n' && c != '\r') break;
+        line[len - 1] = '\0';
+        len--;
+    }
+}
+
+static void append_display_log_line(const char* line)
+{
+    if (!line || line[0] == '\0') return;
+    SystemAPI* system = SystemAPI::getInstance();
+    if (!system) return;
+    system->AppendDisplayLog(line);
+}
+
+static void display_logf(const char* fmt, ...)
+{
+    if (!fmt) return;
+
+    char line[512] = {0};
+    va_list args;
+    va_start(args, fmt);
+    int written = vsnprintf(line, sizeof(line), fmt, args);
+    va_end(args);
+    if (written < 0) return;
+
+    trim_display_log_line(line);
+    if (line[0] == '\0') return;
+
+    UartLogf("%s\n", line);
+    append_display_log_line(line);
+}
+
+static void display_serial_printf(const char* fmt, ...)
+{
+    if (!fmt) return;
+
+    char line[512] = {0};
+    va_list args;
+    va_start(args, fmt);
+    int written = vsnprintf(line, sizeof(line), fmt, args);
+    va_end(args);
+    if (written < 0) return;
+
+    Serial.print(line);
+    trim_display_log_line(line);
+    append_display_log_line(line);
+}
+
+static void display_serial_println(const char* line)
+{
+    if (!line) return;
+    Serial.println(line);
+    append_display_log_line(line);
+}
+
+DisplayMgr::DisplayMgr()
+{
+    display_serial_println("====DisplayMgr Instance Created");
+}
+
+DisplayMgr::~DisplayMgr()
+{
+    display_serial_println("~~~~DisplayMgr Instance Deleted");
+}
 
 #if defined(BOARD_HAS_TOUCH)
 #ifndef GT911_I2C_CONFIG_SDA_IO_NUM
@@ -207,7 +284,7 @@ static bool init_touch_panel()
 
         s_touchPanel = new TouchLib(Wire, TOUCH_I2C_SDA_PIN, TOUCH_I2C_SCL_PIN, addr, TOUCH_RST_PIN);
         if (!s_touchPanel) {
-            Serial.println("[DisplayMgr] touch alloc failed");
+            display_serial_println("[DisplayMgr] touch alloc failed");
             break;
         }
 
@@ -219,7 +296,7 @@ static bool init_touch_panel()
     }
 
     if (!s_touchReady) {
-        Serial.printf("[DisplayMgr] touch init failed (sda=%d scl=%d tried=0x%02X,0x%02X)\n",
+        display_serial_printf("[DisplayMgr] touch init failed (sda=%d scl=%d tried=0x%02X,0x%02X)\n",
                       (int)TOUCH_I2C_SDA_PIN,
                       (int)TOUCH_I2C_SCL_PIN,
                       (unsigned int)TOUCH_GT911_ADDR,
@@ -228,7 +305,7 @@ static bool init_touch_panel()
         return false;
     }
 
-    Serial.printf("[DisplayMgr] touch init done (sda=%d scl=%d addr=0x%02X clk=%u)\n",
+    display_serial_printf("[DisplayMgr] touch init done (sda=%d scl=%d addr=0x%02X clk=%u)\n",
                   (int)TOUCH_I2C_SDA_PIN,
                   (int)TOUCH_I2C_SCL_PIN,
                   (unsigned int)s_touchAddrInUse,
@@ -409,7 +486,7 @@ static void display_diag_log(const char* tag)
     if ((nowMs - s_diagLastLogMs) < 500U) return;
     s_diagLastLogMs = nowMs;
 
-    Serial.printf(
+    display_serial_printf(
         "[DisplayMgr][DIAG] %s req=%u done=%u skip=%u restart=%u bypass=%u dirty=%u backSync=%d frameFull=%d sceneReset=%d vsync=%u\n",
         tag ? tag : "(null)",
         (unsigned int)s_swapReqCount,
@@ -472,7 +549,7 @@ static void register_idle_hooks_once()
     esp_err_t e1 = esp_register_freertos_idle_hook_for_cpu(idle_hook_cpu1, 1);
     if (e0 == ESP_OK && e1 == ESP_OK) {
         s_idleHooksRegistered = true;
-        Serial.println("[DisplayMgr] Idle hooks registered for CPU monitor");
+        display_serial_println("[DisplayMgr] Idle hooks registered for CPU monitor");
     } else {
         TEST_LOG("Idle hook register failed: e0=%d e1=%d", (int)e0, (int)e1);
     }
@@ -581,6 +658,9 @@ static void apply_shared_ui_state(const UiSharedState& s)
 
     if (s.obdStatus == OBD_CONNECTED) update_obd_icon_connected();
     else update_obd_icon_disconnected();
+
+    update_service_icon(s.serviceDue);
+    update_oil_percent((int32_t)s.oilPercent);
 
     update_obd_gauges(
         s.obdStatus == OBD_CONNECTED,
@@ -1043,14 +1123,14 @@ void DisplayMgr::Init()
     );
 
     if (!this->rgbPanel) {
-        Serial.println("[DisplayMgr] Critical: rgbPanel allocation failed");
+        display_serial_println("[DisplayMgr] Critical: rgbPanel allocation failed");
         return;
     }
     TEST_LOG("rgbPanel allocated: %p", this->rgbPanel);
 
     gfx = new Arduino_RGB_Display(SCREEN_WIDTH, SCREEN_HEIGHT, rgbPanel, 0, false);
     if (!gfx) {
-        Serial.println("[DisplayMgr] Critical: gfx allocation failed");
+        display_serial_println("[DisplayMgr] Critical: gfx allocation failed");
         return;
     }
     TEST_LOG("gfx allocated: %p", gfx);
@@ -1086,7 +1166,7 @@ void DisplayMgr::Init()
             if (fbErr == ESP_OK && hwFb0 && hwFb1 && hwFb0 != hwFb1) {
                 _fb_buf[0] = (uint16_t*)hwFb0;
                 _fb_buf[1] = (uint16_t*)hwFb1;
-                Serial.println("[DisplayMgr] Hardware double-FB detected from RGB panel");
+                display_serial_println("[DisplayMgr] Hardware double-FB detected from RGB panel");
             } else {
                 TEST_LOG("Hardware double-FB unavailable (err=%d, fb0=%p, fb1=%p)",
                          (int)fbErr, hwFb0, hwFb1);
@@ -1095,7 +1175,7 @@ void DisplayMgr::Init()
 #endif
 
         if (!_fb_buf[0]) {
-            Serial.println("[DisplayMgr] Critical: front framebuffer is null");
+            display_serial_println("[DisplayMgr] Critical: front framebuffer is null");
             _gfxInitialized = false;
         } else {
             memset(_fb_buf[0], 0, bufferSize);
@@ -1113,7 +1193,7 @@ void DisplayMgr::Init()
         }
 
         if (!s_vsyncSem) {
-            Serial.println("[DisplayMgr] Warning: VSYNC semaphore creation failed");
+            display_serial_println("[DisplayMgr] Warning: VSYNC semaphore creation failed");
         } else if (rgbPanel && rgbPanel->getPanelHandle()) {
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
             esp_lcd_rgb_panel_event_callbacks_t cbs = {};
@@ -1123,7 +1203,7 @@ void DisplayMgr::Init()
             );
             if (err == ESP_OK) {
                 s_strictVsyncSync = true;
-                Serial.println("[DisplayMgr] VSYNC callback registered (IDF5 API)");
+                display_serial_println("[DisplayMgr] VSYNC callback registered (IDF5 API)");
             } else {
                 TEST_LOG("VSYNC callback register failed: %d", (int)err);
             }
@@ -1133,9 +1213,9 @@ void DisplayMgr::Init()
                 panel->on_frame_trans_done = on_vsync_callback;
                 panel->user_ctx = s_vsyncSem;
                 s_strictVsyncSync = false;
-                Serial.println("[DisplayMgr] VSYNC callback registered (IDF4 internal)");
+                display_serial_println("[DisplayMgr] VSYNC callback registered (IDF4 internal)");
             } else {
-                Serial.println("[DisplayMgr] VSYNC callback register failed: panel null");
+                display_serial_println("[DisplayMgr] VSYNC callback register failed: panel null");
             }
 #endif
         }
@@ -1150,7 +1230,7 @@ void DisplayMgr::Init()
             TEST_LOG("backlight enabled");
         }
     } else {
-        Serial.println("[DisplayMgr] Critical: gfx->begin failed");
+        display_serial_println("[DisplayMgr] Critical: gfx->begin failed");
     }
 
     BaseType_t taskRet = xTaskCreatePinnedToCore(
@@ -1163,7 +1243,7 @@ void DisplayMgr::Init()
         1
     );
     if (taskRet != pdPASS) {
-        Serial.println("[DisplayMgr] Critical: DisplaySub task create failed");
+        display_serial_println("[DisplayMgr] Critical: DisplaySub task create failed");
     } else {
         TEST_LOG("DisplaySub task started");
     }
@@ -1176,7 +1256,7 @@ void DisplayMgr::StartLVGL() {
         return;
     }
     if (!_gfxInitialized || !gfx) {
-        Serial.println("[DisplayMgr] StartLVGL skipped: gfx is not initialized");
+        display_serial_println("[DisplayMgr] StartLVGL skipped: gfx is not initialized");
         return;
     }
 
@@ -1243,12 +1323,12 @@ void DisplayMgr::StartLVGL() {
         indev_drv.type = LV_INDEV_TYPE_POINTER;
         indev_drv.read_cb = lvgl_touch_read_cb;
         lv_indev_t* indev = lv_indev_drv_register(&indev_drv);
-        Serial.printf("[DisplayMgr] LVGL touch indev register %s (addr=0x%02X)\n",
+        display_serial_printf("[DisplayMgr] LVGL touch indev register %s (addr=0x%02X)\n",
                       indev ? "ok" : "fail",
                       (unsigned int)s_touchAddrInUse);
         TEST_LOG("lv_indev_drv_register done (touch)");
     } else {
-        Serial.println("[DisplayMgr] touch init failed; LVGL touch input disabled");
+        display_serial_println("[DisplayMgr] touch init failed; LVGL touch input disabled");
         TEST_LOG("touch init failed; LVGL touch input disabled");
     }
 #endif
@@ -1270,7 +1350,7 @@ void DisplayMgr::StartLVGL() {
     #endif
 
     _lvglInitialized = true;
-    Serial.println("[DisplayMgr] LVGL Started with SRAM Partial Draw Buffer + VSYNC sync");
+    display_serial_println("[DisplayMgr] LVGL Started with SRAM Partial Draw Buffer + VSYNC sync");
 
     size_t total_psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
     size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
@@ -1351,7 +1431,7 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
                 }
             } else if (!s_loggedNullFrontFb) {
                 s_loggedNullFrontFb = true;
-                Serial.println("[DisplayMgr] Warning: front FB is null in flush");
+                display_serial_println("[DisplayMgr] Warning: front FB is null in flush");
             }
 
             if (lv_disp_flush_is_last(drv)) {
@@ -1435,7 +1515,7 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
             cache_writeback_area(fb, &writeArea);
         } else if (!s_loggedNullBackFb) {
             s_loggedNullBackFb = true;
-            Serial.println("[DisplayMgr] Warning: back FB is null in flush");
+            display_serial_println("[DisplayMgr] Warning: back FB is null in flush");
         }
 
         if (lv_disp_flush_is_last(drv)) {
@@ -1582,7 +1662,7 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
     SystemAPI* system = SystemAPI::getInstance();
     TEST_LINE();
     if (!self || !system) {
-        Serial.println("[DisplayMgr] Critical: PlayGifTask self/system null");
+        display_serial_println("[DisplayMgr] Critical: PlayGifTask self/system null");
         vTaskDelete(NULL);
         return;
     }
@@ -1590,7 +1670,7 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
     s_splashGifReady = false;
 
     if (!self->_gfxInitialized || !self->gfx || !self->_fb_buf[self->_frontFbIndex]) {
-        Serial.println("[DisplayMgr] Critical: PlayGifTask entered without valid gfx/front FB");
+        display_serial_println("[DisplayMgr] Critical: PlayGifTask entered without valid gfx/front FB");
         s_splashActive = false;
         vTaskDelete(NULL);
         return;
@@ -1603,7 +1683,7 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
 
     self->StartLVGL();
     if (!self->_lvglInitialized) {
-        Serial.println("[DisplayMgr] Critical: StartLVGL failed in PlayGifTask");
+        display_serial_println("[DisplayMgr] Critical: StartLVGL failed in PlayGifTask");
         s_splashActive = false;
         vTaskDelete(NULL);
         return;
@@ -1648,7 +1728,7 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
 
     AnimatedGIF* splashGif = new AnimatedGIF();
     if (!splashGif) {
-        Serial.println("[DisplayMgr] Critical: AnimatedGIF alloc failed");
+        display_serial_println("[DisplayMgr] Critical: AnimatedGIF alloc failed");
         s_splashActive = false;
         vTaskDelete(NULL);
         return;
@@ -1668,7 +1748,7 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
         splashOpened = splashGif->open((uint8_t*)gifMem.data, (int)gifMem.size, splash_animated_gif_draw) != 0;
         if (splashOpened) {
             TEST_LOG("AnimatedGIF opened from PSRAM: %u bytes", (unsigned int)gifMem.size);
-            Serial.printf("[DisplayMgr] Splash GIF source: PSRAM (%u bytes)\n", (unsigned int)gifMem.size);
+            display_serial_printf("[DisplayMgr] Splash GIF source: PSRAM (%u bytes)\n", (unsigned int)gifMem.size);
         }
     }
     if (!splashOpened && SD.exists(sdPath.c_str())) {
@@ -1682,7 +1762,7 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
         ) != 0;
         if (splashOpened) {
             TEST_LOG("AnimatedGIF opened from SD: %s", sdPath.c_str());
-            Serial.printf("[DisplayMgr] Splash GIF source: SD (%s)\n", sdPath.c_str());
+            display_serial_printf("[DisplayMgr] Splash GIF source: SD (%s)\n", sdPath.c_str());
         }
     }
 
@@ -1695,7 +1775,7 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
 
     if (!splashOpened) {
         TEST_LOG("AnimatedGIF open failed: %s", self->_pendingGifPath.c_str());
-        Serial.printf("[DisplayMgr] Splash GIF open failed: %s\n", self->_pendingGifPath.c_str());
+        display_serial_printf("[DisplayMgr] Splash GIF open failed: %s\n", self->_pendingGifPath.c_str());
     } else {
         const int canvasW = splashGif->getCanvasWidth();
         const int canvasH = splashGif->getCanvasHeight();
@@ -1725,7 +1805,7 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
                 turboEnabled ? "ON" : "OFF"
             );
         } else {
-            Serial.println("[DisplayMgr] Splash GIF buffer alloc failed; splash playback disabled");
+            display_serial_println("[DisplayMgr] Splash GIF buffer alloc failed; splash playback disabled");
             TEST_LOG("AnimatedGIF frame buffer alloc failed");
             splashGif->close();
             splashOpened = false;
@@ -1756,14 +1836,14 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
 
     while (true) {
         if (ulTaskNotifyTake(pdTRUE, 0)) {
-            Serial.println("[DisplayMgr] Splash interrupted by notify");
+            display_serial_println("[DisplayMgr] Splash interrupted by notify");
             break;
         }
 
         TickType_t elapsed = xTaskGetTickCount() - startTick;
         if (s_splashGifReady) {
             if (elapsed >= minSplashDuration) {
-                Serial.println("[DisplayMgr] Splash finished by AnimatedGIF completion");
+                display_serial_println("[DisplayMgr] Splash finished by AnimatedGIF completion");
                 break;
             }
 
@@ -1772,20 +1852,20 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
                 waitTicks = pdMS_TO_TICKS(20);
             }
             if (ulTaskNotifyTake(pdTRUE, waitTicks)) {
-                Serial.println("[DisplayMgr] Splash interrupted while holding final frame");
+                display_serial_println("[DisplayMgr] Splash interrupted while holding final frame");
                 break;
             }
             continue;
         }
 
         if (elapsed >= maxSplashDuration) {
-            Serial.println("[DisplayMgr] Splash finished by timeout");
+            display_serial_println("[DisplayMgr] Splash finished by timeout");
             break;
         }
 
         if (!splashOpened) {
             if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20))) {
-                Serial.println("[DisplayMgr] Splash interrupted without GIF decoder");
+                display_serial_println("[DisplayMgr] Splash interrupted without GIF decoder");
             }
             break;
         }
@@ -1825,7 +1905,7 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
         }
 
         if (playStatus < 0) {
-            Serial.printf("[DisplayMgr] AnimatedGIF decode error: %d\n", splashGif->getLastError());
+            display_serial_printf("[DisplayMgr] AnimatedGIF decode error: %d\n", splashGif->getLastError());
             TEST_LOG("AnimatedGIF decode error=%d", splashGif->getLastError());
             break;
         }
@@ -1839,7 +1919,7 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
                 continue;
             }
             if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1))) {
-                Serial.println("[DisplayMgr] Splash interrupted during empty frame wait");
+                display_serial_println("[DisplayMgr] Splash interrupted during empty frame wait");
                 break;
             }
             continue;
@@ -1858,7 +1938,7 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
         splashPacedUsTotal += pacedUs;
 
         if (profiledFrames <= SPLASH_PROFILE_LOG_FRAMES) {
-            Serial.printf(
+            display_serial_printf(
                 "[DisplayMgr][GIFPROF] f=%u rect=%ux%u@%d,%d delay_ms=%u decode_us=%u draw_us=%u work_us=%u paced_us=%u disp=%u trans=%u turbo=%u\n",
                 (unsigned int)profiledFrames,
                 (unsigned int)drawCtx.frameWidth,
@@ -1881,14 +1961,14 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
         }
 
         if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(waitMs))) {
-            Serial.println("[DisplayMgr] Splash interrupted during frame wait");
+            display_serial_println("[DisplayMgr] Splash interrupted during frame wait");
             break;
         }
     }
 
     if (splashOpened) {
         if (profiledFrames > 0U) {
-            Serial.printf(
+            display_serial_printf(
                 "[DisplayMgr][GIFPROF] avg decode_us=%u draw_us=%u work_us=%u paced_us=%u max decode_us=%u draw_us=%u work_us=%u frames=%u turbo=%u\n",
                 (unsigned int)(splashDecodeUsTotal / profiledFrames),
                 (unsigned int)(splashDrawUsTotal / profiledFrames),
@@ -1930,7 +2010,7 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
             );
             wait_for_vsync_edge(pdMS_TO_TICKS(DISPLAY_VSYNC_WAIT_BUDGET_MS));
             system->UnlockLvgl();
-            Serial.println("[DisplayMgr] LVGL UI Created");
+            display_serial_println("[DisplayMgr] LVGL UI Created");
             uiReady = true;
             break;
         }
@@ -1938,7 +2018,7 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
     }
 
     if (!uiReady) {
-        Serial.println("[DisplayMgr] LVGL UI transition timeout");
+        display_serial_println("[DisplayMgr] LVGL UI transition timeout");
     }
 
     // Reclaim PSRAM used by splash GIF as soon as splash phase is done.
@@ -1952,7 +2032,7 @@ void DisplayMgr::PlayGifTask(void* pvParameters)
     self->_splashFinished = true;
     s_splashActive = false;
     vTaskPrioritySet(self->_lvglTaskHandler, LVGL_REUSED_TASK_PRIORITY);
-    Serial.println("[DisplayMgr] Reusing GifTask as LvglTask");
+    display_serial_println("[DisplayMgr] Reusing GifTask as LvglTask");
     DisplayMgr::HandleLvglTask(self);
 }
 
@@ -1980,7 +2060,7 @@ void DisplayMgr::Subscribe(void* pvParameters)
                             DisplayMgr::PlayGifTask, "GifTask", GIF_TASK_STACK_WORDS, self, SPLASH_GIF_TASK_PRIORITY, &self->_gifTaskHandler, 1
                         );
                         if (ret != pdPASS) {
-                            Serial.println("[DisplayMgr] Critical: GifTask create failed");
+                            display_serial_println("[DisplayMgr] Critical: GifTask create failed");
                         } else {
                             TEST_LOG("GifTask created");
                         }
@@ -1989,6 +2069,7 @@ void DisplayMgr::Subscribe(void* pvParameters)
                 }
                 case DISPLAY_SHOW_GOODBYE:
                 {
+                    system->FinishDisplayLogSession();
                     TEST_LOG("DISPLAY_SHOW_GOODBYE");
                     bool applied = false;
                     for (int i = 0; i < 3; ++i) {
@@ -2046,7 +2127,7 @@ void DisplayMgr::HandleLvglTask(void *pvParameters)
     SystemAPI* system = SystemAPI::getInstance();
     TEST_LINE();
     if (!self || !system) {
-        Serial.println("[DisplayMgr] Critical: HandleLvglTask self/system null");
+        display_serial_println("[DisplayMgr] Critical: HandleLvglTask self/system null");
         vTaskDelete(NULL);
         return;
     }
@@ -2055,7 +2136,7 @@ void DisplayMgr::HandleLvglTask(void *pvParameters)
     TickType_t lastUiTick = now;
     TickType_t lastSyncLogTick = now;
     bool prevDebugBusy = false;
-    Serial.println("[DisplayMgr] LvglTask started");
+    display_serial_println("[DisplayMgr] LvglTask started");
 
     while (true) {
         TickType_t sleepTicks = pdMS_TO_TICKS(LVGL_TASK_LOCK_FAIL_SLEEP_MS);

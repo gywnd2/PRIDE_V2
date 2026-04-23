@@ -48,8 +48,8 @@ class DisplayMgr
         TaskHandle_t _lvglTaskHandler = nullptr;
 
     public:
-        DisplayMgr() { Serial.println("====DisplayMgr Instance Created"); }
-        ~DisplayMgr() { Serial.println("~~~~DisplayMgr Instance Deleted"); }
+        DisplayMgr();
+        ~DisplayMgr();
 
         void Init();
         void StartLVGL();

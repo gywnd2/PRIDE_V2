@@ -9,12 +9,30 @@ static lv_obj_t * icon_bt = NULL;
 static lv_obj_t * icon_obd = NULL;
 static lv_obj_t * icon_wifi = NULL;
 static lv_obj_t * icon_frost = NULL;
+static lv_obj_t * icon_service = NULL;
+static lv_obj_t * icon_cold = NULL;
+static lv_obj_t * icon_overheat = NULL;
+
 static lv_obj_t * clock_label = NULL;
 static lv_obj_t * outside_temp_label = NULL;
+static lv_obj_t * oil_percent_label = NULL;
+static lv_obj_t * oil_life_bar = NULL;
 static lv_obj_t * main_test_panel = NULL;
 static bool outside_temp_rendered_valid = false;
 static int32_t outside_temp_rendered_value = 1000;
 static bool frost_icon_rendered_visible = false;
+static bool service_icon_rendered_visible = false;
+static bool cold_icon_rendered_visible = false;
+static bool overheat_icon_rendered_visible = false;
+static bool service_icon_requested_visible = false;
+static bool needle_ceremony_warning_icons_active = false;
+static lv_timer_t * startup_warning_icon_timer = NULL;
+static bool startup_warning_icon_sequence_active = false;
+static uint8_t startup_warning_icon_sequence_phase = 0;
+static lv_timer_t * oil_life_ceremony_timer = NULL;
+static bool oil_life_ceremony_active = false;
+static uint32_t oil_life_ceremony_start_ms = 0;
+static int32_t oil_percent_requested_value = 100;
 
 static monitor_item_t cpu_core1, cpu_core2, ram_usage;
 static lv_timer_t * monitor_ceremony_timer = NULL;
@@ -68,6 +86,9 @@ static const uint32_t DEBUG_LOG_QUEUE_DEPTH = 96;
 static const uint32_t DEBUG_LOG_TEXT_MAX_CHARS = 6000;
 static const uint32_t DEBUG_LOG_ENQUEUE_MAX_PER_SEC = 12;
 static const uint32_t NEEDLE_RUNTIME_ANIM_MS = 300;
+static const uint32_t STARTUP_WARNING_ICON_STEP_MS = 500;
+static const uint32_t OIL_LIFE_CEREMONY_PHASE_MS = 1500;
+static const uint32_t OIL_LIFE_CEREMONY_TIMER_MS = 16;
 static const int32_t COOLANT_NEEDLE_IGNORE_DELTA = 1;
 static const int32_t COOLANT_NEEDLE_INSTANT_DELTA = 2;
 static const int32_t BATTERY_NEEDLE_INSTANT_DELTA = 1;
@@ -83,6 +104,19 @@ static void apply_coolant_gauge_value(int32_t val, bool force_anim);
 static void apply_battery_gauge_value(int32_t val, bool force_anim);
 static void start_needle_ceremony(void);
 static void apply_latched_obd_needles(void);
+static void set_icon_rendered_visible(lv_obj_t * icon, bool * rendered_visible, bool visible);
+static void set_needle_ceremony_warning_icons(bool visible);
+static void start_startup_warning_icon_sequence(void);
+static void startup_warning_icon_sequence_timer_cb(lv_timer_t * t);
+static void finish_startup_warning_icon_sequence(void);
+static void apply_latched_warning_icon_states(void);
+static bool get_latched_frost_visible(void);
+static void update_coolant_warning_icons(bool valid, int32_t coolant_val);
+static int32_t clamp_percent(int32_t percent);
+static void set_oil_percent_display(int32_t percent, lv_anim_enable_t anim);
+static void start_oil_life_ceremony(void);
+static void finish_oil_life_ceremony(void);
+static void oil_life_ceremony_timer_cb(lv_timer_t * t);
 static void needle_ceremony_delay_timer_cb(lv_timer_t * t);
 static bool get_active_touch_point(lv_event_t * e, lv_point_t * p);
 static void debug_invalidate_full_screen(void);
@@ -656,6 +690,129 @@ static int32_t battery_to_angle(int32_t val)
     return GAUGE_START_ANGLE + (clamp_battery(val) * GAUGE_MOVE_RANGE / 20) + GAUGE_MIN_ROT;
 }
 
+static void set_icon_rendered_visible(lv_obj_t * icon, bool * rendered_visible, bool visible)
+{
+    if (!icon || !rendered_visible) return;
+    if (*rendered_visible == visible) return;
+
+    if (visible) lv_obj_clear_flag(icon, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(icon, LV_OBJ_FLAG_HIDDEN);
+    *rendered_visible = visible;
+}
+
+static bool get_latched_frost_visible(void)
+{
+    return outside_temp_rendered_valid && outside_temp_rendered_value < 10;
+}
+
+static void update_coolant_warning_icons(bool valid, int32_t coolant_val)
+{
+    if (needle_ceremony_warning_icons_active) {
+        set_icon_rendered_visible(icon_cold, &cold_icon_rendered_visible, true);
+    } else if (!valid) {
+        set_icon_rendered_visible(icon_cold, &cold_icon_rendered_visible, false);
+    }
+
+    if (!valid) {
+        if (!startup_warning_icon_sequence_active) {
+            set_icon_rendered_visible(icon_overheat, &overheat_icon_rendered_visible, false);
+        }
+        return;
+    }
+
+    coolant_val = clamp_coolant(coolant_val);
+    if (!needle_ceremony_warning_icons_active) {
+        set_icon_rendered_visible(
+            icon_cold,
+            &cold_icon_rendered_visible,
+            coolant_val <= COOLANT_COLD_THRESHOLD_C
+        );
+    }
+    if (!startup_warning_icon_sequence_active) {
+        set_icon_rendered_visible(
+            icon_overheat,
+            &overheat_icon_rendered_visible,
+            coolant_val >= COOLANT_OVERHEAT_THRESHOLD_C
+        );
+    }
+}
+
+static void set_needle_ceremony_warning_icons(bool visible)
+{
+    needle_ceremony_warning_icons_active = visible;
+    set_icon_rendered_visible(icon_cold, &cold_icon_rendered_visible, visible);
+}
+
+static void apply_latched_warning_icon_states(void)
+{
+    set_icon_rendered_visible(icon_frost, &frost_icon_rendered_visible, get_latched_frost_visible());
+    set_icon_rendered_visible(icon_service, &service_icon_rendered_visible, service_icon_requested_visible);
+    update_coolant_warning_icons(
+        obd_connected_latched && coolant_valid_latched,
+        coolant_value_latched
+    );
+}
+
+static void set_startup_warning_icon_sequence_phase(uint8_t phase)
+{
+    set_icon_rendered_visible(icon_frost, &frost_icon_rendered_visible, phase == 0);
+    set_icon_rendered_visible(icon_service, &service_icon_rendered_visible, phase == 1);
+    set_icon_rendered_visible(icon_overheat, &overheat_icon_rendered_visible, phase == 2);
+}
+
+static void finish_startup_warning_icon_sequence(void)
+{
+    if (startup_warning_icon_timer) {
+        lv_timer_del(startup_warning_icon_timer);
+        startup_warning_icon_timer = NULL;
+    }
+
+    startup_warning_icon_sequence_active = false;
+    startup_warning_icon_sequence_phase = 0;
+    set_icon_rendered_visible(icon_frost, &frost_icon_rendered_visible, false);
+    set_icon_rendered_visible(icon_service, &service_icon_rendered_visible, false);
+    set_icon_rendered_visible(icon_overheat, &overheat_icon_rendered_visible, false);
+    apply_latched_warning_icon_states();
+}
+
+static void startup_warning_icon_sequence_timer_cb(lv_timer_t * t)
+{
+    LV_UNUSED(t);
+    if (!startup_warning_icon_sequence_active) {
+        finish_startup_warning_icon_sequence();
+        return;
+    }
+
+    startup_warning_icon_sequence_phase++;
+    if (startup_warning_icon_sequence_phase >= 3) {
+        finish_startup_warning_icon_sequence();
+        return;
+    }
+
+    set_startup_warning_icon_sequence_phase(startup_warning_icon_sequence_phase);
+}
+
+static void start_startup_warning_icon_sequence(void)
+{
+    if (startup_warning_icon_timer) {
+        lv_timer_del(startup_warning_icon_timer);
+        startup_warning_icon_timer = NULL;
+    }
+
+    startup_warning_icon_sequence_active = true;
+    startup_warning_icon_sequence_phase = 0;
+    set_startup_warning_icon_sequence_phase(startup_warning_icon_sequence_phase);
+
+    startup_warning_icon_timer = lv_timer_create(
+        startup_warning_icon_sequence_timer_cb,
+        STARTUP_WARNING_ICON_STEP_MS,
+        NULL
+    );
+    if (!startup_warning_icon_timer) {
+        finish_startup_warning_icon_sequence();
+    }
+}
+
 void update_coolant_gauge(int32_t val)
 {
     apply_coolant_gauge_value(val, false);
@@ -783,6 +940,7 @@ static void needle_ceremony_timer_cb(lv_timer_t * t)
         }
         set_coolant_gauge_instant(0);
         set_battery_gauge_instant(0);
+        set_needle_ceremony_warning_icons(false);
         apply_latched_obd_needles();
         return;
     }
@@ -825,7 +983,13 @@ static void start_needle_ceremony(void)
     battery_pending_valid = false;
     set_coolant_gauge_instant(0);
     set_battery_gauge_instant(0);
+    set_needle_ceremony_warning_icons(true);
     needle_ceremony_timer = lv_timer_create(needle_ceremony_timer_cb, 8, NULL);
+    if (!needle_ceremony_timer) {
+        needle_ceremony_active = false;
+        set_needle_ceremony_warning_icons(false);
+        apply_latched_obd_needles();
+    }
 }
 
 static void needle_ceremony_delay_timer_cb(lv_timer_t * t)
@@ -846,6 +1010,7 @@ void update_obd_gauges(bool obd_connected, bool coolant_valid, int32_t coolant_v
         coolant_valid_latched = true;
         coolant_value_latched = clamp_coolant(coolant_val);
     }
+    update_coolant_warning_icons(obd_connected && coolant_valid, coolant_val);
 
     if (battery_valid) {
         battery_valid_latched = true;
@@ -937,13 +1102,132 @@ void create_gauge_set(lv_obj_t* parent, bool is_coolant, int32_t x, int32_t y)
     }
 }
 
-lv_obj_t* create_icon(lv_obj_t* parent, const void* src, int32_t x, int32_t y)
+lv_obj_t* create_icon(lv_obj_t* parent, const void* src, int32_t x, int32_t y, uint16_t zoom)
 {
     lv_obj_t* img = lv_img_create(parent);
     lv_img_set_src(img, src);
     lv_img_set_pivot(img, 0, 0);
+    lv_img_set_zoom(img, zoom);
     lv_obj_set_pos(img, x, y);
     return img;
+}
+
+static int32_t clamp_percent(int32_t percent)
+{
+    if (percent < 0) percent = 0;
+    else if (percent > 100) percent = 100;
+    return percent;
+}
+
+static void set_oil_percent_display(int32_t percent, lv_anim_enable_t anim)
+{
+    percent = clamp_percent(percent);
+
+    if (oil_percent_label) {
+        lv_label_set_text_fmt(oil_percent_label, "%d%%", (int)percent);
+    }
+    if (oil_life_bar) {
+        lv_bar_set_value(oil_life_bar, percent, anim);
+    }
+}
+
+void update_oil_percent(int32_t percent)
+{
+    oil_percent_requested_value = clamp_percent(percent);
+    if (oil_life_ceremony_active) return;
+
+    set_oil_percent_display(oil_percent_requested_value, LV_ANIM_OFF);
+}
+
+static void finish_oil_life_ceremony(void)
+{
+    if (oil_life_ceremony_timer) {
+        lv_timer_del(oil_life_ceremony_timer);
+        oil_life_ceremony_timer = NULL;
+    }
+
+    oil_life_ceremony_active = false;
+    oil_life_ceremony_start_ms = 0;
+    set_oil_percent_display(oil_percent_requested_value, LV_ANIM_ON);
+}
+
+static void oil_life_ceremony_timer_cb(lv_timer_t * t)
+{
+    LV_UNUSED(t);
+    if (!oil_life_ceremony_active) {
+        finish_oil_life_ceremony();
+        return;
+    }
+
+    const uint32_t total_ms = OIL_LIFE_CEREMONY_PHASE_MS * 2U;
+    uint32_t elapsed = lv_tick_elaps(oil_life_ceremony_start_ms);
+    if (elapsed >= total_ms) {
+        set_oil_percent_display(0, LV_ANIM_OFF);
+        finish_oil_life_ceremony();
+        return;
+    }
+
+    int32_t percent = 0;
+    if (elapsed < OIL_LIFE_CEREMONY_PHASE_MS) {
+        percent = (int32_t)((elapsed * 100U) / OIL_LIFE_CEREMONY_PHASE_MS);
+    } else {
+        uint32_t down_elapsed = elapsed - OIL_LIFE_CEREMONY_PHASE_MS;
+        percent = 100 - (int32_t)((down_elapsed * 100U) / OIL_LIFE_CEREMONY_PHASE_MS);
+    }
+    set_oil_percent_display(percent, LV_ANIM_OFF);
+}
+
+static void start_oil_life_ceremony(void)
+{
+    if (oil_life_ceremony_timer) {
+        lv_timer_del(oil_life_ceremony_timer);
+        oil_life_ceremony_timer = NULL;
+    }
+
+    oil_life_ceremony_active = true;
+    oil_life_ceremony_start_ms = lv_tick_get();
+    set_oil_percent_display(0, LV_ANIM_OFF);
+
+    oil_life_ceremony_timer = lv_timer_create(
+        oil_life_ceremony_timer_cb,
+        OIL_LIFE_CEREMONY_TIMER_MS,
+        NULL
+    );
+    if (!oil_life_ceremony_timer) {
+        finish_oil_life_ceremony();
+    }
+}
+
+static void create_center_status_bar(lv_obj_t* parent)
+{
+    oil_percent_label = lv_label_create(parent);
+    lv_obj_set_width(oil_percent_label, CENTER_STATUS_LABEL_WIDTH);
+    lv_obj_set_pos(oil_percent_label, CENTER_STATUS_LABEL_X, CENTER_STATUS_LABEL_Y);
+    lv_obj_set_style_text_color(oil_percent_label, lv_color_white(), 0);
+    lv_obj_set_style_text_font(oil_percent_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_align(oil_percent_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_clear_flag(oil_percent_label, LV_OBJ_FLAG_SCROLLABLE);
+    update_oil_percent(100);
+
+    oil_life_bar = lv_bar_create(parent);
+    lv_obj_set_size(oil_life_bar, CENTER_STATUS_BAR_WIDTH, CENTER_STATUS_BAR_HEIGHT);
+    lv_obj_set_pos(oil_life_bar, CENTER_STATUS_BAR_X, CENTER_STATUS_BAR_Y);
+    lv_bar_set_range(oil_life_bar, 0, 100);
+    lv_obj_set_style_bg_color(oil_life_bar, lv_color_hex(0x07141C), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(oil_life_bar, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(oil_life_bar, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(oil_life_bar, 3, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(oil_life_bar, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(oil_life_bar, lv_color_hex(0x18B7FF), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_grad_color(oil_life_bar, lv_color_hex(0x0B4D78), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_grad_dir(oil_life_bar, LV_GRAD_DIR_VER, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(oil_life_bar, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_border_width(oil_life_bar, 0, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(oil_life_bar, 3, LV_PART_INDICATOR);
+    lv_obj_clear_flag(oil_life_bar, LV_OBJ_FLAG_SCROLLABLE);
+    set_oil_percent_display(oil_percent_requested_value, LV_ANIM_OFF);
+
+    create_icon(parent, &oil, OIL_ICON_X, OIL_ICON_Y, OIL_ICON_SCALE);
 }
 
 void create_monitor_item(lv_obj_t * parent, monitor_item_t * item, const char * name, lv_color_t color, int32_t ignored)
@@ -1026,12 +1310,25 @@ void create_gauge()
 
     create_gauge_set(gauge_cont, true, COOLANT_GAUGE_X_POS, COOLANT_GAUGE_Y_POS);
     create_gauge_set(gauge_cont, false, BATTERY_GAUGE_X_POS, BATTERY_GAUGE_Y_POS);
+    create_center_status_bar(gauge_cont);
 
-    icon_bt = create_icon(lv_scr_act(), &btOff, BT_X_POS, BT_Y_POS);
-    icon_obd = create_icon(lv_scr_act(), &obdOff, OBD_X_POS, OBD_Y_POS);
-    icon_wifi = create_icon(lv_scr_act(), &wifi_off, WIFI_X_POS, WIFI_Y_POS);
-    icon_frost = create_icon(lv_scr_act(), &frost, FROST_X_POS, FROST_Y_POS);
+    icon_bt = create_icon(lv_scr_act(), &btOff, BT_X_POS, BT_Y_POS, LV_IMG_ZOOM_NONE);
+    icon_obd = create_icon(lv_scr_act(), &obdOff, OBD_X_POS, OBD_Y_POS, LV_IMG_ZOOM_NONE);
+    icon_wifi = create_icon(lv_scr_act(), &wifi_off, WIFI_X_POS, WIFI_Y_POS, LV_IMG_ZOOM_NONE);
+    icon_frost = create_icon(lv_scr_act(), &frost, FROST_X_POS, FROST_Y_POS, LV_IMG_ZOOM_NONE);
+    icon_service = create_icon(lv_scr_act(), &service, SERVICE_X_POS, SERVICE_Y_POS, SERVICE_SCALE);
+    icon_cold = create_icon(lv_scr_act(), &cold, COLD_X_POS, COLD_Y_POS, COLD_SCALE);
+    icon_overheat = create_icon(lv_scr_act(), &overheat, OVERHEAT_X_POS, OVERHEAT_Y_POS, OVERHEAT_SCALE);
     lv_obj_add_flag(icon_frost, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(icon_service, LV_OBJ_FLAG_HIDDEN);
+    if (!needle_ceremony_warning_icons_active) {
+        lv_obj_add_flag(icon_cold, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_add_flag(icon_overheat, LV_OBJ_FLAG_HIDDEN);
+    frost_icon_rendered_visible = false;
+    service_icon_rendered_visible = false;
+    cold_icon_rendered_visible = needle_ceremony_warning_icons_active;
+    overheat_icon_rendered_visible = false;
 }
 
 void update_clock_text(const char* text)
@@ -1055,11 +1352,8 @@ void update_outside_temp(int32_t temp_c, bool valid)
         }
         outside_temp_rendered_valid = false;
         outside_temp_rendered_value = 1000;
-        if (icon_frost) {
-            if (frost_icon_rendered_visible) {
-                lv_obj_add_flag(icon_frost, LV_OBJ_FLAG_HIDDEN);
-                frost_icon_rendered_visible = false;
-            }
+        if (!startup_warning_icon_sequence_active) {
+            set_icon_rendered_visible(icon_frost, &frost_icon_rendered_visible, false);
         }
         return;
     }
@@ -1073,14 +1367,17 @@ void update_outside_temp(int32_t temp_c, bool valid)
         outside_temp_rendered_value = temp_c;
     }
 
-    if (icon_frost) {
+    if (!startup_warning_icon_sequence_active) {
         bool showFrost = (temp_c < 10);
-        if (showFrost != frost_icon_rendered_visible) {
-            if (showFrost) lv_obj_clear_flag(icon_frost, LV_OBJ_FLAG_HIDDEN);
-            else lv_obj_add_flag(icon_frost, LV_OBJ_FLAG_HIDDEN);
-            frost_icon_rendered_visible = showFrost;
-        }
+        set_icon_rendered_visible(icon_frost, &frost_icon_rendered_visible, showFrost);
     }
+}
+
+void update_service_icon(bool visible)
+{
+    service_icon_requested_visible = visible;
+    if (startup_warning_icon_sequence_active) return;
+    set_icon_rendered_visible(icon_service, &service_icon_rendered_visible, visible);
 }
 
 static const void* get_wifi_icon_from_rssi(int32_t rssi)
@@ -1162,6 +1459,14 @@ void UiResetRuntimeState(void)
         lv_timer_del(needle_ceremony_delay_timer);
         needle_ceremony_delay_timer = NULL;
     }
+    if (startup_warning_icon_timer) {
+        lv_timer_del(startup_warning_icon_timer);
+        startup_warning_icon_timer = NULL;
+    }
+    if (oil_life_ceremony_timer) {
+        lv_timer_del(oil_life_ceremony_timer);
+        oil_life_ceremony_timer = NULL;
+    }
     if (debug_log_flush_timer) {
         lv_timer_del(debug_log_flush_timer);
         debug_log_flush_timer = NULL;
@@ -1170,6 +1475,10 @@ void UiResetRuntimeState(void)
     monitor_ceremony_active = false;
     needle_ceremony_active = false;
     needle_ceremony_pending = false;
+    needle_ceremony_warning_icons_active = false;
+    startup_warning_icon_sequence_active = false;
+    startup_warning_icon_sequence_phase = 0;
+    oil_life_ceremony_active = false;
     coolant_needle_animating = false;
     battery_needle_animating = false;
     coolant_pending_valid = false;
@@ -1177,6 +1486,7 @@ void UiResetRuntimeState(void)
 
     monitor_ceremony_start_ms = 0;
     needle_ceremony_start_ms = 0;
+    oil_life_ceremony_start_ms = 0;
 
     pending_ram_percent = 0;
     pending_core1_percent = 0;
@@ -1198,11 +1508,21 @@ void UiResetRuntimeState(void)
     icon_obd = NULL;
     icon_wifi = NULL;
     icon_frost = NULL;
+    icon_service = NULL;
+    icon_cold = NULL;
+    icon_overheat = NULL;
     clock_label = NULL;
     outside_temp_label = NULL;
+    oil_percent_label = NULL;
+    oil_life_bar = NULL;
     outside_temp_rendered_valid = false;
     outside_temp_rendered_value = 1000;
     frost_icon_rendered_visible = false;
+    service_icon_rendered_visible = false;
+    cold_icon_rendered_visible = false;
+    overheat_icon_rendered_visible = false;
+    service_icon_requested_visible = false;
+    oil_percent_requested_value = 100;
     main_test_panel = NULL;
     debug_container = NULL;
     debug_swipe_zone = NULL;
@@ -1467,11 +1787,14 @@ void GaugeInit()
     // DisplayColorTest();
     UiResetRuntimeState();
     needle_ceremony_pending = true;
+    needle_ceremony_warning_icons_active = true;
 
     create_outside_temp();
     create_clock();
     create_sys_monitor_panel();
     create_gauge();
+    start_startup_warning_icon_sequence();
+    start_oil_life_ceremony();
     //create_weather();
     create_debug_screen();
 

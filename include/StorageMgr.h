@@ -9,6 +9,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
+static constexpr const char* SERVICE_ODO_DIR = "/db";
+static constexpr const char* SERVICE_ODO_FILE_PATH = "/db/odo.txt";
+static constexpr uint32_t SERVICE_ODO_THRESHOLD_KM = 7000U;
+
 struct GIFMemory
 {
     uint8_t* data = nullptr;
@@ -31,11 +35,15 @@ class StorageMgr
         File OpenFile(const char* path, const char* mode);
         TaskHandle_t taskHandler = nullptr;
         SemaphoreHandle_t _logMutex = nullptr;
+        File _activeLogFile;
         String _activeLogPath;
         uint32_t _activeLogIndex = 0;
+        uint32_t _runtimeLogLineNumber = 0;
+        bool _runtimeLogSessionClosed = false;
 
         bool EnsureLogDir();
-        bool PrepareNextLogFileLocked();
+        bool EnsureDbDir();
+        bool PrepareNextRuntimeLogFileLocked();
 
         static void Subscribe(void* pvParameters);
 
@@ -57,7 +65,10 @@ class StorageMgr
         File SDOpen(const char* path, const char* mode = "r");
         size_t SDReadAll(const char* path, uint8_t* buffer, size_t maxLen);
         bool SDRemove(const char* path);
-        bool AppendRuntimeLogLine(const char* line);
+        bool ReadServiceOdoKm(uint32_t* outKm);
+        bool AddServiceOdoKm(uint32_t deltaKm, uint32_t* totalOut = nullptr);
+        bool AppendDisplayRuntimeLogLine(const char* line);
+        void FinishRuntimeLogSession();
         String GetActiveLogPath() const { return _activeLogPath; }
 
         GIFMemory LoadGifToPSRAM(const char* path);

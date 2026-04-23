@@ -75,7 +75,8 @@ typedef enum
     STORAGE_WRITE,
     STORAGE_LOAD_TO_PSRAM,
     STORAGE_CLEAR_LOADED_PSRAM,
-    STORAGE_APPEND_LOG
+    STORAGE_APPEND_DISPLAY_LOG,
+    STORAGE_FINISH_DISPLAY_LOG_SESSION
 } STORAGE_EVENT_TYPE;
 
 typedef struct {
@@ -103,6 +104,10 @@ typedef struct {
 
     bool outsideTempValid;
     int16_t outsideTempC;
+
+    bool serviceDue;
+    uint32_t serviceOdoKm;
+    uint8_t oilPercent;
 } UiSharedState;
 
 // ----------------------------------------------------------------
@@ -223,7 +228,12 @@ public:
     void PublishObdCoolant(uint16_t coolant);
     void PublishObdBatteryVoltage(uint16_t voltage);
     void PublishObdOutsideTemp(int16_t tempC, bool valid = true);
-    void AppendStorageLog(const char* line);
+    void PublishServiceDue(bool due);
+    void PublishServiceOdoKm(uint32_t totalKm);
+    void AppendDisplayLog(const char* line);
+    void FinishDisplayLogSession();
+    bool RefreshServiceDueFromStorage();
+    bool AddServiceOdoDistance(uint32_t deltaKm, uint32_t* totalOut = nullptr);
     bool GetUiSharedSnapshot(UiSharedState* out, TickType_t waitTime = 0);
     bool GetUiWifiState(bool* connected, int32_t* rssi = nullptr, TickType_t waitTime = 0);
     bool GetUiClockText(char* out, size_t outLen, TickType_t waitTime = 0);

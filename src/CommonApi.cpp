@@ -22,6 +22,14 @@ static void trim_trailing_newline(char* text)
     }
 }
 
+static uint8_t service_odo_to_oil_percent(uint32_t totalKm)
+{
+    if (totalKm >= SERVICE_ODO_THRESHOLD_KM) return 0;
+
+    uint32_t remainingKm = SERVICE_ODO_THRESHOLD_KM - totalKm;
+    return (uint8_t)(((remainingKm * 100U) + (SERVICE_ODO_THRESHOLD_KM / 2U)) / SERVICE_ODO_THRESHOLD_KM);
+}
+
 #ifndef UART_LOG_MAX_PER_SEC
 #define UART_LOG_MAX_PER_SEC 48U
 #endif
@@ -102,6 +110,7 @@ void SystemAPI::Init()
     isGifLoaded = false;
     memset(&uiState, 0, sizeof(uiState));
     uiState.wifiRssi = -100;
+    uiState.oilPercent = 100;
 
     if (_gifMutex == NULL) {
         _gifMutex = xSemaphoreCreateMutex();
@@ -204,7 +213,7 @@ bool DisplayEventSubscriber::ReceiveEvent(DisplayEventData* event, TickType_t wa
 // ----------------------------------------------------------------
 
 StorageEventSubscriber::StorageEventSubscriber() {
-    _queue = xQueueCreate(64, sizeof(StorageEventData));
+    _queue = xQueueCreate(48, sizeof(StorageEventData));
 }
 
 StorageEventSubscriber::~StorageEventSubscriber() {
@@ -216,7 +225,8 @@ void StorageEventSubscriber::SetEvent(STORAGE_EVENT_TYPE type, const String& pat
     evt.type = type;
     strncpy(evt.filePath, path.c_str(), sizeof(evt.filePath) - 1);
     evt.filePath[sizeof(evt.filePath) - 1] = '\0';
-    TickType_t wait = (type == STORAGE_APPEND_LOG) ? pdMS_TO_TICKS(40) : 0;
+    TickType_t wait = (type == STORAGE_APPEND_DISPLAY_LOG ||
+                       type == STORAGE_FINISH_DISPLAY_LOG_SESSION) ? pdMS_TO_TICKS(40) : 0;
     BaseType_t ok = xQueueSend(_queue, &evt, wait);
     if (ok != pdTRUE) {
         TEST_LOG("storage queue full, drop type=%d path=%s", (int)type, evt.filePath);
@@ -271,9 +281,39 @@ GIFMemory* SystemAPI::GetPsramObjPtr() {
     return &gifObj;
 }
 
-void SystemAPI::AppendStorageLog(const char* line) {
+void SystemAPI::AppendDisplayLog(const char* line) {
     if (!storageMgr || !line || line[0] == '\0') return;
-    storageSubscriber.SetEvent(STORAGE_APPEND_LOG, String(line));
+    storageSubscriber.SetEvent(STORAGE_APPEND_DISPLAY_LOG, String(line));
+}
+
+void SystemAPI::FinishDisplayLogSession() {
+    if (!storageMgr) return;
+    storageSubscriber.SetEvent(STORAGE_FINISH_DISPLAY_LOG_SESSION);
+}
+
+bool SystemAPI::RefreshServiceDueFromStorage() {
+    if (!storageMgr) {
+        PublishServiceDue(false);
+        return false;
+    }
+
+    uint32_t totalKm = 0;
+    bool ok = storageMgr->ReadServiceOdoKm(&totalKm);
+    if (ok) PublishServiceOdoKm(totalKm);
+    else PublishServiceOdoKm(0);
+    return ok;
+}
+
+bool SystemAPI::AddServiceOdoDistance(uint32_t deltaKm, uint32_t* totalOut) {
+    if (!storageMgr) return false;
+
+    uint32_t totalKm = 0;
+    bool ok = storageMgr->AddServiceOdoKm(deltaKm, &totalKm);
+    if (ok) {
+        PublishServiceOdoKm(totalKm);
+        if (totalOut) *totalOut = totalKm;
+    }
+    return ok;
 }
 
 void SystemAPI::PublishWifiState(bool connected, int32_t rssi) {
@@ -340,6 +380,22 @@ void SystemAPI::PublishObdOutsideTemp(int16_t tempC, bool valid) {
     if (LockUiState(pdMS_TO_TICKS(20))) {
         uiState.outsideTempC = tempC;
         uiState.outsideTempValid = valid;
+        UnlockUiState();
+    }
+}
+
+void SystemAPI::PublishServiceDue(bool due) {
+    if (LockUiState(pdMS_TO_TICKS(20))) {
+        uiState.serviceDue = due;
+        UnlockUiState();
+    }
+}
+
+void SystemAPI::PublishServiceOdoKm(uint32_t totalKm) {
+    if (LockUiState(pdMS_TO_TICKS(20))) {
+        uiState.serviceOdoKm = totalKm;
+        uiState.serviceDue = totalKm >= SERVICE_ODO_THRESHOLD_KM;
+        uiState.oilPercent = service_odo_to_oil_percent(totalKm);
         UnlockUiState();
     }
 }

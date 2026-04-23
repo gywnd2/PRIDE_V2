@@ -1,14 +1,20 @@
 #include <StorageMgr.h>
 #include <CommonApi.h>
 #include <time.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <string.h>
 
 #define TEST_LOG(fmt, ...) UartLogf("[StorageMgr] " fmt "\n", ##__VA_ARGS__)
 #define TEST_LINE() UartLogf("[StorageMgr] %s\n", __func__)
 
 static constexpr const char* STORAGE_LOG_DIR = "/log";
-static constexpr const char* STORAGE_RUNTIME_LOG_FILE = "/log/runtime.log";
 
-static bool format_wall_clock(char* out, size_t out_len)
+#ifndef FILE_APPEND
+#define FILE_APPEND "a"
+#endif
+
+static bool format_runtime_time_header(char* out, size_t out_len)
 {
     if (!out || out_len == 0) return false;
     time_t now = time(nullptr);
@@ -21,14 +27,53 @@ static bool format_wall_clock(char* out, size_t out_len)
     int year = tm_local.tm_year + 1900;
     if (year < 2024) return false;
 
-    snprintf(out, out_len, "%04d-%02d-%02d %02d:%02d:%02d",
-             year,
-             tm_local.tm_mon + 1,
-             tm_local.tm_mday,
+    snprintf(out, out_len, "[%02d-%02d-%02d]",
              tm_local.tm_hour,
              tm_local.tm_min,
              tm_local.tm_sec);
     return true;
+}
+
+static void copy_trimmed_log_line(char* out, size_t out_len, const char* line)
+{
+    if (!out || out_len == 0) return;
+    out[0] = '\0';
+    if (!line) return;
+
+    strncpy(out, line, out_len - 1);
+    out[out_len - 1] = '\0';
+
+    size_t len = strlen(out);
+    while (len > 0) {
+        char c = out[len - 1];
+        if (c != '\n' && c != '\r') break;
+        out[len - 1] = '\0';
+        len--;
+    }
+}
+
+static bool parse_runtime_log_index(const char* name, uint32_t* outIndex)
+{
+    if (!name || !outIndex) return false;
+
+    String base = String(name);
+    int slash = base.lastIndexOf('/');
+    if (slash >= 0) {
+        base = base.substring(slash + 1);
+    }
+
+    static constexpr const char* PREFIX = "runtime_";
+    static constexpr const char* SUFFIX = ".log";
+    if (!base.startsWith(PREFIX) || !base.endsWith(SUFFIX)) return false;
+
+    String numberText = base.substring(strlen(PREFIX), base.length() - strlen(SUFFIX));
+    if (numberText.length() == 0) return false;
+    for (size_t i = 0; i < numberText.length(); ++i) {
+        if (!isdigit((unsigned char)numberText[i])) return false;
+    }
+
+    *outIndex = (uint32_t)strtoul(numberText.c_str(), nullptr, 10);
+    return *outIndex > 0;
 }
 
 void StorageMgr::Init()
@@ -47,16 +92,19 @@ void StorageMgr::Init()
             _logMutex = xSemaphoreCreateMutex();
         }
         TEST_LOG("log mutex=%p", _logMutex);
-        if (_logMutex && xSemaphoreTake(_logMutex, pdMS_TO_TICKS(300)) == pdTRUE) {
-            PrepareNextLogFileLocked();
-            xSemaphoreGive(_logMutex);
-        }
 
         this->ScanDirectory("/", 0);
         TEST_LOG("ScanDirectory finished, entries=%u", (unsigned int)this->fileList.size());
 
         SystemAPI* system = SystemAPI::getInstance();
         TEST_LOG("SystemAPI ptr=%p", system);
+        uint32_t serviceOdoKm = 0;
+        if (this->ReadServiceOdoKm(&serviceOdoKm)) {
+            system->PublishServiceOdoKm(serviceOdoKm);
+            TEST_LOG("service odo=%u km due=%d",
+                     (unsigned int)serviceOdoKm,
+                     serviceOdoKm >= SERVICE_ODO_THRESHOLD_KM ? 1 : 0);
+        }
         if (system->LockGif(pdMS_TO_TICKS(500))) {
             TEST_LOG("LockGif acquired");
             GIFMemory* objPtr = system->GetPsramObjPtr();
@@ -177,11 +225,16 @@ void StorageMgr::Subscribe(void* pvParameters)
                     }
                     break;
                 }
-                case STORAGE_EVENT_TYPE::STORAGE_APPEND_LOG:
+                case STORAGE_EVENT_TYPE::STORAGE_APPEND_DISPLAY_LOG:
                 {
-                    if (!self->AppendRuntimeLogLine(event.filePath)) {
-                        TEST_LOG("log append failed");
+                    if (!self->AppendDisplayRuntimeLogLine(event.filePath)) {
+                        TEST_LOG("display log append failed");
                     }
+                    break;
+                }
+                case STORAGE_EVENT_TYPE::STORAGE_FINISH_DISPLAY_LOG_SESSION:
+                {
+                    self->FinishRuntimeLogSession();
                     break;
                 }
                 default:
@@ -282,34 +335,145 @@ bool StorageMgr::EnsureLogDir()
     return ok;
 }
 
-bool StorageMgr::PrepareNextLogFileLocked()
+bool StorageMgr::EnsureDbDir()
 {
-    if (_activeLogPath.length() > 0) return true;
+    if (SD.exists(SERVICE_ODO_DIR)) return true;
+    bool ok = SD.mkdir(SERVICE_ODO_DIR);
+    TEST_LOG("db dir create %s (ok=%d)", SERVICE_ODO_DIR, ok ? 1 : 0);
+    return ok;
+}
+
+bool StorageMgr::ReadServiceOdoKm(uint32_t* outKm)
+{
+    if (!outKm) return false;
+    *outKm = 0;
+    if (_logMutex == nullptr) return false;
+    if (xSemaphoreTake(_logMutex, pdMS_TO_TICKS(120)) != pdTRUE) return false;
+
+    bool ok = false;
+    do {
+        if (!EnsureDbDir()) break;
+        if (!SD.exists(SERVICE_ODO_FILE_PATH)) {
+            ok = true;
+            break;
+        }
+
+        File f = SD.open(SERVICE_ODO_FILE_PATH, FILE_READ);
+        if (!f) break;
+        if (f.isDirectory()) {
+            f.close();
+            break;
+        }
+
+        char buf[32] = {0};
+        size_t len = f.readBytes(buf, sizeof(buf) - 1);
+        f.close();
+        buf[len] = '\0';
+
+        char* end = nullptr;
+        unsigned long value = strtoul(buf, &end, 10);
+        if (end == buf) break;
+
+        *outKm = (uint32_t)value;
+        ok = true;
+    } while (false);
+
+    xSemaphoreGive(_logMutex);
+    return ok;
+}
+
+bool StorageMgr::AddServiceOdoKm(uint32_t deltaKm, uint32_t* totalOut)
+{
+    if (totalOut) *totalOut = 0;
+    if (_logMutex == nullptr) return false;
+    if (xSemaphoreTake(_logMutex, pdMS_TO_TICKS(180)) != pdTRUE) return false;
+
+    bool ok = false;
+    uint32_t total = 0;
+    do {
+        if (!EnsureDbDir()) break;
+
+        if (SD.exists(SERVICE_ODO_FILE_PATH)) {
+            File readFile = SD.open(SERVICE_ODO_FILE_PATH, FILE_READ);
+            if (!readFile) break;
+            if (readFile.isDirectory()) {
+                readFile.close();
+                break;
+            }
+
+            char buf[32] = {0};
+            size_t len = readFile.readBytes(buf, sizeof(buf) - 1);
+            readFile.close();
+            buf[len] = '\0';
+
+            char* end = nullptr;
+            unsigned long value = strtoul(buf, &end, 10);
+            if (end == buf) break;
+            total = (uint32_t)value;
+        }
+
+        if (UINT32_MAX - total < deltaKm) total = UINT32_MAX;
+        else total += deltaKm;
+
+        if (SD.exists(SERVICE_ODO_FILE_PATH) && !SD.remove(SERVICE_ODO_FILE_PATH)) {
+            break;
+        }
+
+        File writeFile = SD.open(SERVICE_ODO_FILE_PATH, FILE_WRITE);
+        if (!writeFile) break;
+        writeFile.print(total);
+        writeFile.close();
+
+        if (totalOut) *totalOut = total;
+        TEST_LOG("service odo updated delta=%u total=%u",
+                 (unsigned int)deltaKm,
+                 (unsigned int)total);
+        ok = true;
+    } while (false);
+
+    xSemaphoreGive(_logMutex);
+    return ok;
+}
+
+bool StorageMgr::PrepareNextRuntimeLogFileLocked()
+{
+    if (_runtimeLogSessionClosed) return false;
+    if (_activeLogPath.length() > 0 && _activeLogFile) return true;
+    if (_activeLogPath.length() > 0 && !_activeLogFile) _activeLogPath = "";
     if (!EnsureLogDir()) return false;
 
-    _activeLogPath = String(STORAGE_RUNTIME_LOG_FILE);
-    _activeLogIndex = 0;
+    uint32_t maxIndex = 0;
+    File dir = SD.open(STORAGE_LOG_DIR);
+    if (dir && dir.isDirectory()) {
+        while (true) {
+            File entry = dir.openNextFile();
+            if (!entry) break;
 
-    File f = SD.open(_activeLogPath.c_str(), FILE_WRITE);
-    if (!f) {
-        TEST_LOG("failed to open runtime log file: %s", _activeLogPath.c_str());
+            uint32_t index = 0;
+            if (!entry.isDirectory() && parse_runtime_log_index(entry.name(), &index)) {
+                if (index > maxIndex) maxIndex = index;
+            }
+            entry.close();
+        }
+        dir.close();
+    }
+
+    _activeLogIndex = maxIndex + 1U;
+    _runtimeLogLineNumber = 0;
+    _activeLogPath = String(STORAGE_LOG_DIR) + "/runtime_" + String(_activeLogIndex) + ".log";
+
+    _activeLogFile = SD.open(_activeLogPath.c_str(), FILE_APPEND);
+    if (!_activeLogFile) {
+        TEST_LOG("failed to open display runtime log file: %s", _activeLogPath.c_str());
         _activeLogPath = "";
         return false;
     }
 
-    char wall_clock[32] = {0};
-    if (format_wall_clock(wall_clock, sizeof(wall_clock))) {
-        f.printf("\n[BOOT] start=%s ms=%lu\n", wall_clock, (unsigned long)millis());
-    } else {
-        f.printf("\n[BOOT] start_ms=%lu\n", (unsigned long)millis());
-    }
-    f.close();
-
-    TEST_LOG("runtime log file=%s", _activeLogPath.c_str());
+    TEST_LOG("display runtime log file=%s", _activeLogPath.c_str());
     return true;
 }
 
-bool StorageMgr::AppendRuntimeLogLine(const char* line)
+bool StorageMgr::AppendDisplayRuntimeLogLine(const char* line)
 {
     if (!line || line[0] == '\0') return false;
     if (_logMutex == nullptr) return false;
@@ -317,28 +481,51 @@ bool StorageMgr::AppendRuntimeLogLine(const char* line)
 
     bool ok = false;
     do {
-        if (!PrepareNextLogFileLocked()) break;
-
-        File f = SD.open(_activeLogPath.c_str(), FILE_WRITE);
-        if (!f) {
-            TEST_LOG("failed to open runtime log file: %s", _activeLogPath.c_str());
+        if (_runtimeLogSessionClosed) {
+            ok = true;
             break;
         }
-        char wall_clock[32] = {0};
-        if (format_wall_clock(wall_clock, sizeof(wall_clock))) {
-            f.printf("[%s][ms=%lu] %s\n",
-                     wall_clock,
-                     (unsigned long)millis(),
-                     line);
-        } else {
-            f.printf("[ms=%lu] %s\n", (unsigned long)millis(), line);
+        if (!PrepareNextRuntimeLogFileLocked()) break;
+
+        char trimmedLine[480] = {0};
+        copy_trimmed_log_line(trimmedLine, sizeof(trimmedLine), line);
+        if (trimmedLine[0] == '\0') {
+            ok = true;
+            break;
         }
-        f.close();
+
+        char header[24] = {0};
+        if (!format_runtime_time_header(header, sizeof(header))) {
+            _runtimeLogLineNumber++;
+            snprintf(header, sizeof(header), "[%u]", (unsigned int)_runtimeLogLineNumber);
+        } else {
+            _runtimeLogLineNumber++;
+        }
+
+        _activeLogFile.printf("%s %s\n", header, trimmedLine);
+        _activeLogFile.flush();
         ok = true;
     } while (false);
 
     xSemaphoreGive(_logMutex);
     return ok;
+}
+
+void StorageMgr::FinishRuntimeLogSession()
+{
+    if (_logMutex == nullptr) return;
+    if (xSemaphoreTake(_logMutex, pdMS_TO_TICKS(120)) != pdTRUE) return;
+
+    if (_activeLogFile) {
+        _activeLogFile.flush();
+        _activeLogFile.close();
+    }
+    _runtimeLogSessionClosed = true;
+    _activeLogPath = "";
+    _activeLogIndex = 0;
+    _runtimeLogLineNumber = 0;
+
+    xSemaphoreGive(_logMutex);
 }
 
 GIFMemory StorageMgr::LoadGifToPSRAM(const char* path) {

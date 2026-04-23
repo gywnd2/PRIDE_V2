@@ -5,14 +5,6 @@
 #define TEST_LOG(fmt, ...) UartLogf("[ObdMgr] " fmt "\n", ##__VA_ARGS__)
 #define TEST_LINE() UartLogf("[ObdMgr] %s\n", __func__)
 
-#ifndef OBD_ODO_STATE_FILE_LOG_ENABLE
-#ifdef OBD_RPM_STATE_FILE_LOG_ENABLE
-#define OBD_ODO_STATE_FILE_LOG_ENABLE OBD_RPM_STATE_FILE_LOG_ENABLE
-#else
-#define OBD_ODO_STATE_FILE_LOG_ENABLE 0
-#endif
-#endif
-
 String ObdStatusStr[8] =
 {
     "BT Init Failed",
@@ -28,8 +20,6 @@ String ObdStatusStr[8] =
 static portMUX_TYPE s_obdBusyMux = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t s_lastOdoLogMs = 0;
 static int8_t s_lastOdoLogState = ELM_GENERAL_ERROR;
-static uint32_t s_lastOdoStorageLogMs = 0;
-static int8_t s_lastOdoStorageLogState = ELM_GENERAL_ERROR;
 static constexpr uint16_t ELM_INIT_TIMEOUT_MS = 600;
 static constexpr uint16_t ELM_PID_TIMEOUT_MS = 1500;
 static constexpr uint16_t ELM_QUERY_WAIT_INTERVAL_MS = 30;
@@ -64,18 +54,6 @@ bool ShouldLogOdometer(int8_t state)
     if (state != s_lastOdoLogState || (now - s_lastOdoLogMs) >= minIntervalMs) {
         s_lastOdoLogState = state;
         s_lastOdoLogMs = now;
-        return true;
-    }
-    return false;
-}
-
-bool ShouldStoreOdometerLog(int8_t state)
-{
-    const uint32_t now = millis();
-    const uint32_t minIntervalMs = (state == ELM_SUCCESS) ? 5000U : 1500U;
-    if (state != s_lastOdoStorageLogState || (now - s_lastOdoStorageLogMs) >= minIntervalMs) {
-        s_lastOdoStorageLogState = state;
-        s_lastOdoStorageLogMs = now;
         return true;
     }
     return false;
@@ -236,6 +214,30 @@ void ObdMgr::Init(void)
     }
 }
 
+void ObdMgr::FinalizeServiceOdoSession(SystemAPI* system)
+{
+    if (!system || !_odometerStartValid) return;
+    if (_odometerLastKm < _odometerStartKm) return;
+
+    uint32_t deltaKm = _odometerLastKm - _odometerStartKm;
+    if (deltaKm == 0) return;
+
+    uint32_t totalKm = 0;
+    if (system->AddServiceOdoDistance(deltaKm, &totalKm)) {
+        TEST_LOG("service odo finalized start=%u end=%u delta=%u total=%u",
+                 (unsigned int)_odometerStartKm,
+                 (unsigned int)_odometerLastKm,
+                 (unsigned int)deltaKm,
+                 (unsigned int)totalKm);
+        _odometerStartKm = _odometerLastKm;
+    } else {
+        TEST_LOG("service odo finalize failed start=%u end=%u delta=%u",
+                 (unsigned int)_odometerStartKm,
+                 (unsigned int)_odometerLastKm,
+                 (unsigned int)deltaKm);
+    }
+}
+
 void ObdMgr::EventTask(void *param)
 {
     TEST_LINE();
@@ -272,6 +274,7 @@ void ObdMgr::EventTask(void *param)
                 system->btSubscriber.SetEvent(BT_REQUEST_DISCONNECT);
 
                 if (!self->_goodbyeScreenActive) {
+                    self->FinalizeServiceOdoSession(system);
                     system->displaySubscriber.SetEvent(DISPLAY_SHOW_GOODBYE);
                     system->soundSubscriber.SetEvent(SOUND_PLAY_TRACK, 2);
                     self->_goodbyeScreenActive = true;
@@ -703,24 +706,6 @@ void ObdMgr::QueryOBDData(void *param)
                         }
                     }
                 }
-#if OBD_ODO_STATE_FILE_LOG_ENABLE
-                if (ShouldStoreOdometerLog(odoState)) {
-                    char odoLog[128] = {0};
-                    if (odoState == ELM_SUCCESS) {
-                        snprintf(odoLog, sizeof(odoLog),
-                                 "OBD ODO state=%d(%s) km=%u",
-                                 (int)odoState,
-                                 ElmStateToString(odoState),
-                                 (unsigned int)data.odometer_km);
-                    } else {
-                        snprintf(odoLog, sizeof(odoLog),
-                                 "OBD ODO state=%d(%s)",
-                                 (int)odoState,
-                                 ElmStateToString(odoState));
-                    }
-                    system->AppendStorageLog(odoLog);
-                }
-#endif
                 {
                     uint32_t elapsedSec = (millis() - self->_bootMs) / 1000U;
                     self->SetDriveTimeSec(elapsedSec);
