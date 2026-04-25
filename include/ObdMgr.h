@@ -90,6 +90,7 @@ private:
     bool StartConnectTask();
     bool StartQueryTask();
     void FinalizeServiceOdoSession(SystemAPI* system);
+    void HandleQueryLinkLoss(SystemAPI* system, const char* reason);
 
 protected:
     void QueryCoolant(uint16_t &coolant_temp);

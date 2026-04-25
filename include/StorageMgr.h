@@ -39,6 +39,7 @@ class StorageMgr
         String _activeLogPath;
         uint32_t _activeLogIndex = 0;
         uint32_t _runtimeLogLineNumber = 0;
+        bool _activeLogUsesRtcName = false;
         bool _runtimeLogSessionClosed = false;
 
         bool EnsureLogDir();

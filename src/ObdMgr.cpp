@@ -238,6 +238,31 @@ void ObdMgr::FinalizeServiceOdoSession(SystemAPI* system)
     }
 }
 
+void ObdMgr::HandleQueryLinkLoss(SystemAPI* system, const char* reason)
+{
+    _queryTaskRunning = false;
+    query_obd_data_task = NULL;
+
+    bool confirmedConnected = _hadPidSuccess && (GetOBDStatus() == OBD_CONNECTED);
+    TEST_LOG("query link loss: confirmed=%d had_pid=%d status=%d reason=%s",
+             confirmedConnected ? 1 : 0,
+             _hadPidSuccess ? 1 : 0,
+             GetOBDStatus(),
+             reason ? reason : "(null)");
+
+    if (confirmedConnected) {
+        PostEvent(OBD_MGR_EVENT_LINK_LOST);
+        return;
+    }
+
+    SetOBDStatus(OBD_DISCONNECTED);
+    if (system) {
+        system->btSubscriber.SetEvent(BT_REQUEST_DISCONNECT);
+    }
+    vTaskDelay(pdMS_TO_TICKS(OBD_RECONNECT_INTERVAL_MS));
+    PostEvent(OBD_MGR_EVENT_START_CONNECT);
+}
+
 void ObdMgr::EventTask(void *param)
 {
     TEST_LINE();
@@ -734,9 +759,7 @@ void ObdMgr::QueryOBDData(void *param)
                 } else if (IsObdLinkLostState(odoState)) {
                     LogPidError("0131", odoState, "link-lost");
                     self->UnlockObdQuery();
-                    self->_queryTaskRunning = false;
-                    self->query_obd_data_task = NULL;
-                    self->PostEvent(OBD_MGR_EVENT_LINK_LOST);
+                    self->HandleQueryLinkLoss(system, "odometer");
                     vTaskDelete(NULL);
                     return;
                 }
@@ -787,9 +810,7 @@ void ObdMgr::QueryOBDData(void *param)
         if (!system->GetOBDConnected())
         {
             Serial.println("[ObdMgr] BLE link lost. Terminating OBD query task.");
-            self->_queryTaskRunning = false;
-            self->query_obd_data_task = NULL;
-            self->PostEvent(OBD_MGR_EVENT_LINK_LOST);
+            self->HandleQueryLinkLoss(system, "ble-disconnect");
             vTaskDelete(NULL);
             return;
         }

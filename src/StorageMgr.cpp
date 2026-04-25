@@ -14,9 +14,9 @@ static constexpr const char* STORAGE_LOG_DIR = "/log";
 #define FILE_APPEND "a"
 #endif
 
-static bool format_runtime_time_header(char* out, size_t out_len)
+static bool get_synced_local_time(struct tm* out)
 {
-    if (!out || out_len == 0) return false;
+    if (!out) return false;
     time_t now = time(nullptr);
     if (now <= 0) return false;
 
@@ -27,10 +27,37 @@ static bool format_runtime_time_header(char* out, size_t out_len)
     int year = tm_local.tm_year + 1900;
     if (year < 2024) return false;
 
+    *out = tm_local;
+    return true;
+}
+
+static bool format_runtime_time_header(char* out, size_t out_len)
+{
+    if (!out || out_len == 0) return false;
+
+    struct tm tm_local = {};
+    if (!get_synced_local_time(&tm_local)) return false;
+
     snprintf(out, out_len, "[%02d-%02d-%02d]",
              tm_local.tm_hour,
              tm_local.tm_min,
              tm_local.tm_sec);
+    return true;
+}
+
+static bool format_runtime_date_path(char* out, size_t out_len)
+{
+    if (!out || out_len == 0) return false;
+
+    struct tm tm_local = {};
+    if (!get_synced_local_time(&tm_local)) return false;
+
+    int year = (tm_local.tm_year + 1900) % 100;
+    snprintf(out, out_len, "%s/runtime_%02d%02d%02d.log",
+             STORAGE_LOG_DIR,
+             year,
+             tm_local.tm_mon + 1,
+             tm_local.tm_mday);
     return true;
 }
 
@@ -438,34 +465,60 @@ bool StorageMgr::AddServiceOdoKm(uint32_t deltaKm, uint32_t* totalOut)
 bool StorageMgr::PrepareNextRuntimeLogFileLocked()
 {
     if (_runtimeLogSessionClosed) return false;
-    if (_activeLogPath.length() > 0 && _activeLogFile) return true;
+    char rtcPath[48] = {0};
+    bool rtcPathValid = format_runtime_date_path(rtcPath, sizeof(rtcPath));
+
+    if (_activeLogPath.length() > 0 && _activeLogFile) {
+        if (!_activeLogUsesRtcName && rtcPathValid) {
+            _activeLogFile.flush();
+            _activeLogFile.close();
+            _activeLogPath = String(rtcPath);
+            _activeLogUsesRtcName = true;
+            _activeLogFile = SD.open(_activeLogPath.c_str(), FILE_APPEND);
+            if (!_activeLogFile) {
+                TEST_LOG("failed to switch display runtime log file: %s", _activeLogPath.c_str());
+                _activeLogPath = "";
+                _activeLogUsesRtcName = false;
+                return false;
+            }
+            TEST_LOG("display runtime log file switched=%s", _activeLogPath.c_str());
+        }
+        return true;
+    }
     if (_activeLogPath.length() > 0 && !_activeLogFile) _activeLogPath = "";
     if (!EnsureLogDir()) return false;
 
-    uint32_t maxIndex = 0;
-    File dir = SD.open(STORAGE_LOG_DIR);
-    if (dir && dir.isDirectory()) {
-        while (true) {
-            File entry = dir.openNextFile();
-            if (!entry) break;
-
-            uint32_t index = 0;
-            if (!entry.isDirectory() && parse_runtime_log_index(entry.name(), &index)) {
-                if (index > maxIndex) maxIndex = index;
-            }
-            entry.close();
-        }
-        dir.close();
-    }
-
-    _activeLogIndex = maxIndex + 1U;
     _runtimeLogLineNumber = 0;
-    _activeLogPath = String(STORAGE_LOG_DIR) + "/runtime_" + String(_activeLogIndex) + ".log";
+    if (rtcPathValid) {
+        _activeLogPath = String(rtcPath);
+        _activeLogUsesRtcName = true;
+    } else {
+        uint32_t maxIndex = 0;
+        File dir = SD.open(STORAGE_LOG_DIR);
+        if (dir && dir.isDirectory()) {
+            while (true) {
+                File entry = dir.openNextFile();
+                if (!entry) break;
+
+                uint32_t index = 0;
+                if (!entry.isDirectory() && parse_runtime_log_index(entry.name(), &index)) {
+                    if (index > maxIndex) maxIndex = index;
+                }
+                entry.close();
+            }
+            dir.close();
+        }
+
+        _activeLogIndex = maxIndex + 1U;
+        _activeLogPath = String(STORAGE_LOG_DIR) + "/runtime_" + String(_activeLogIndex) + ".log";
+        _activeLogUsesRtcName = false;
+    }
 
     _activeLogFile = SD.open(_activeLogPath.c_str(), FILE_APPEND);
     if (!_activeLogFile) {
         TEST_LOG("failed to open display runtime log file: %s", _activeLogPath.c_str());
         _activeLogPath = "";
+        _activeLogUsesRtcName = false;
         return false;
     }
 
@@ -524,6 +577,7 @@ void StorageMgr::FinishRuntimeLogSession()
     _activeLogPath = "";
     _activeLogIndex = 0;
     _runtimeLogLineNumber = 0;
+    _activeLogUsesRtcName = false;
 
     xSemaphoreGive(_logMutex);
 }
