@@ -22,12 +22,18 @@ static void trim_trailing_newline(char* text)
     }
 }
 
-static uint8_t service_odo_to_oil_percent(uint32_t totalKm)
+static uint32_t normalize_service_oil_cycle(uint32_t cycleKm)
 {
-    if (totalKm >= SERVICE_ODO_THRESHOLD_KM) return 0;
+    return (cycleKm == 0U) ? SERVICE_OIL_CYCLE_DEFAULT_KM : cycleKm;
+}
 
-    uint32_t remainingKm = SERVICE_ODO_THRESHOLD_KM - totalKm;
-    return (uint8_t)(((remainingKm * 100U) + (SERVICE_ODO_THRESHOLD_KM / 2U)) / SERVICE_ODO_THRESHOLD_KM);
+static uint8_t service_odo_to_oil_percent(uint32_t totalKm, uint32_t cycleKm)
+{
+    cycleKm = normalize_service_oil_cycle(cycleKm);
+    if (totalKm >= cycleKm) return 0;
+
+    uint32_t remainingKm = cycleKm - totalKm;
+    return (uint8_t)(((remainingKm * 100U) + (cycleKm / 2U)) / cycleKm);
 }
 
 #ifndef UART_LOG_MAX_PER_SEC
@@ -111,6 +117,7 @@ void SystemAPI::Init()
     memset(&uiState, 0, sizeof(uiState));
     uiState.wifiRssi = -100;
     uiState.oilPercent = 100;
+    uiState.serviceOilCycleKm = SERVICE_OIL_CYCLE_DEFAULT_KM;
 
     if (_gifMutex == NULL) {
         _gifMutex = xSemaphoreCreateMutex();
@@ -316,6 +323,74 @@ bool SystemAPI::AddServiceOdoDistance(uint32_t deltaKm, uint32_t* totalOut) {
     return ok;
 }
 
+bool SystemAPI::ResetServiceOdo() {
+    if (!storageMgr) return false;
+
+    uint32_t totalKm = 0;
+    bool ok = storageMgr->ResetServiceOdoKm(&totalKm);
+    if (ok) {
+        if (obdMgr) {
+            obdMgr->ResetServiceOdoSessionBase();
+        }
+        PublishServiceOdoKm(totalKm);
+    }
+    return ok;
+}
+
+bool SystemAPI::GetServiceOilCycleKm(uint32_t* outKm) {
+    if (!outKm) return false;
+    *outKm = SERVICE_OIL_CYCLE_DEFAULT_KM;
+    if (!storageMgr) return false;
+
+    uint32_t cycleKm = SERVICE_OIL_CYCLE_DEFAULT_KM;
+    bool ok = storageMgr->ReadServiceOilCycleKm(&cycleKm);
+    *outKm = normalize_service_oil_cycle(cycleKm);
+    return ok;
+}
+
+bool SystemAPI::SetServiceOilCycleKm(uint32_t cycleKm) {
+    if (!storageMgr) return false;
+
+    uint32_t writtenKm = SERVICE_OIL_CYCLE_DEFAULT_KM;
+    bool ok = storageMgr->WriteServiceOilCycleKm(normalize_service_oil_cycle(cycleKm), &writtenKm);
+    if (ok) {
+        RefreshServiceDueFromStorage();
+    }
+    return ok;
+}
+
+bool SystemAPI::ResetServiceOilCycleKm() {
+    return SetServiceOilCycleKm(SERVICE_OIL_CYCLE_DEFAULT_KM);
+}
+
+extern "C" bool ui_reset_service_odo(void)
+{
+    SystemAPI* system = SystemAPI::getInstance();
+    if (!system) return false;
+    return system->ResetServiceOdo();
+}
+
+extern "C" bool ui_get_service_oil_cycle_km(uint32_t* outKm)
+{
+    SystemAPI* system = SystemAPI::getInstance();
+    if (!system) return false;
+    return system->GetServiceOilCycleKm(outKm);
+}
+
+extern "C" bool ui_set_service_oil_cycle_km(uint32_t cycleKm)
+{
+    SystemAPI* system = SystemAPI::getInstance();
+    if (!system) return false;
+    return system->SetServiceOilCycleKm(cycleKm);
+}
+
+extern "C" bool ui_reset_service_oil_cycle_km(void)
+{
+    SystemAPI* system = SystemAPI::getInstance();
+    if (!system) return false;
+    return system->ResetServiceOilCycleKm();
+}
+
 void SystemAPI::PublishWifiState(bool connected, int32_t rssi) {
     if (LockUiState(pdMS_TO_TICKS(20))) {
         uiState.wifiConnected = connected;
@@ -392,10 +467,17 @@ void SystemAPI::PublishServiceDue(bool due) {
 }
 
 void SystemAPI::PublishServiceOdoKm(uint32_t totalKm) {
+    uint32_t cycleKm = SERVICE_OIL_CYCLE_DEFAULT_KM;
+    if (storageMgr) {
+        storageMgr->ReadServiceOilCycleKm(&cycleKm);
+    }
+    cycleKm = normalize_service_oil_cycle(cycleKm);
+
     if (LockUiState(pdMS_TO_TICKS(20))) {
         uiState.serviceOdoKm = totalKm;
-        uiState.serviceDue = totalKm >= SERVICE_ODO_THRESHOLD_KM;
-        uiState.oilPercent = service_odo_to_oil_percent(totalKm);
+        uiState.serviceOilCycleKm = cycleKm;
+        uiState.serviceDue = totalKm >= cycleKm;
+        uiState.oilPercent = service_odo_to_oil_percent(totalKm, cycleKm);
         UnlockUiState();
     }
 }

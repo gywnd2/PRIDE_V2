@@ -849,6 +849,17 @@ int ObdMgr::GetOBDStatus()
     return status;
 }
 
+void ObdMgr::ResetServiceOdoSessionBase(void)
+{
+    if (_odometerLastKm > 0 || _odometerStartValid) {
+        _odometerStartKm = _odometerLastKm;
+        _odometerStartValid = true;
+    } else {
+        _odometerStartKm = 0;
+        _odometerStartValid = false;
+    }
+}
+
 void ObdMgr::SetRPM(unsigned short rpmValue)
 {
     if (LockData(pdMS_TO_TICKS(20))) {

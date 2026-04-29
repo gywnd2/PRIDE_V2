@@ -11,7 +11,9 @@
 
 static constexpr const char* SERVICE_ODO_DIR = "/db";
 static constexpr const char* SERVICE_ODO_FILE_PATH = "/db/odo.txt";
-static constexpr uint32_t SERVICE_ODO_THRESHOLD_KM = 7000U;
+static constexpr const char* SERVICE_OIL_CYCLE_FILE_PATH = "/db/oil_cycle.txt";
+static constexpr uint32_t SERVICE_OIL_CYCLE_DEFAULT_KM = 7000U;
+static constexpr uint32_t SERVICE_ODO_THRESHOLD_KM = SERVICE_OIL_CYCLE_DEFAULT_KM;
 
 struct GIFMemory
 {
@@ -68,6 +70,10 @@ class StorageMgr
         bool SDRemove(const char* path);
         bool ReadServiceOdoKm(uint32_t* outKm);
         bool AddServiceOdoKm(uint32_t deltaKm, uint32_t* totalOut = nullptr);
+        bool ResetServiceOdoKm(uint32_t* totalOut = nullptr);
+        bool ReadServiceOilCycleKm(uint32_t* outKm);
+        bool WriteServiceOilCycleKm(uint32_t cycleKm, uint32_t* writtenOut = nullptr);
+        bool ResetServiceOilCycleKm(uint32_t* writtenOut = nullptr);
         bool AppendDisplayRuntimeLogLine(const char* line);
         void FinishRuntimeLogSession();
         String GetActiveLogPath() const { return _activeLogPath; }

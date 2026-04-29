@@ -26,6 +26,37 @@ extern "C" {
 #define CENTER_STATUS_LABEL_WIDTH 70
 #define CENTER_STATUS_LABEL_X ((GAUGE_GAP_LEFT + GAUGE_GAP_RIGHT - CENTER_STATUS_LABEL_WIDTH) / 2)
 #define CENTER_STATUS_LABEL_Y (CENTER_STATUS_BAR_Y - 28)
+#define CENTER_STATUS_TOUCH_PADDING 8
+
+#define OIL_POPUP_WIDTH ((SCREEN_WIDTH * 3) / 4)
+#define OIL_POPUP_HEIGHT ((SCREEN_HEIGHT * 3) / 4)
+#define OIL_POPUP_BUTTON_WIDTH 126
+#define OIL_POPUP_BUTTON_HEIGHT 72
+#define OIL_POPUP_BUTTON_GAP 10
+#define OIL_POPUP_PRESS_ZOOM 276
+
+#define OIL_POPUP_KEYPAD_WIDTH 540
+#define OIL_POPUP_EDIT_DUE_WIDTH 190
+#define OIL_POPUP_EDIT_DUE_Y 4
+#define OIL_POPUP_EDIT_DUE_X_OFFSET (-(OIL_POPUP_KEYPAD_WIDTH / 2) + (OIL_POPUP_EDIT_DUE_WIDTH / 2))
+#define OIL_POPUP_EDIT_CLOSE_WIDTH 56
+#define OIL_POPUP_EDIT_CLOSE_HEIGHT 56
+#define OIL_POPUP_EDIT_CLOSE_Y (OIL_POPUP_EDIT_DUE_Y + ((72 - OIL_POPUP_EDIT_CLOSE_HEIGHT) / 2))
+#define OIL_POPUP_EDIT_CLOSE_X_OFFSET ((OIL_POPUP_KEYPAD_WIDTH / 2) - (OIL_POPUP_EDIT_CLOSE_WIDTH / 2))
+#define OIL_POPUP_EDIT_INPUT_ROW_Y 82
+#define OIL_POPUP_EDIT_INPUT_ROW_WIDTH OIL_POPUP_KEYPAD_WIDTH
+#define OIL_POPUP_EDIT_INPUT_ROW_HEIGHT 56
+#define OIL_POPUP_EDIT_OK_WIDTH 100
+#define OIL_POPUP_EDIT_CLEAR_WIDTH 100
+#define OIL_POPUP_EDIT_INPUT_GAP 10
+#define OIL_POPUP_EDIT_INPUT_WIDTH (OIL_POPUP_EDIT_INPUT_ROW_WIDTH - OIL_POPUP_EDIT_OK_WIDTH - OIL_POPUP_EDIT_CLEAR_WIDTH - (OIL_POPUP_EDIT_INPUT_GAP * 2))
+#define OIL_POPUP_KEYPAD_HEIGHT 160
+#define OIL_POPUP_KEYPAD_BOTTOM_OFFSET -4
+#define OIL_POPUP_KEY_WIDTH 100
+#define OIL_POPUP_KEY_HEIGHT 75
+#define OIL_POPUP_KEY_GAP 10
+#define OIL_CYCLE_DEFAULT_KM 7000U
+#define OIL_CYCLE_INPUT_MAX 10
 
 #define OIL_ICON_ORIGINAL_WIDTH 157
 #define OIL_ICON_SCALE 104
@@ -94,6 +125,11 @@ LV_IMG_DECLARE(service);
 LV_IMG_DECLARE(cold);
 LV_IMG_DECLARE(overheat);
 LV_IMG_DECLARE(oil);
+LV_IMG_DECLARE(oil_reset_prompt);
+LV_IMG_DECLARE(oil_popup_yes);
+LV_IMG_DECLARE(oil_popup_no);
+LV_IMG_DECLARE(oil_popup_edit);
+LV_IMG_DECLARE(oil_popup_due);
 
 typedef struct {
     lv_obj_t * bar;
@@ -131,6 +167,10 @@ void update_bt_icon_connected(void);
 void update_bt_icon_disconnected(void);
 void update_obd_icon_connected(void);
 void update_obd_icon_disconnected(void);
+bool ui_reset_service_odo(void);
+bool ui_get_service_oil_cycle_km(uint32_t* outKm);
+bool ui_set_service_oil_cycle_km(uint32_t cycleKm);
+bool ui_reset_service_oil_cycle_km(void);
 
 #ifdef __cplusplus
 } /*extern "C"*/

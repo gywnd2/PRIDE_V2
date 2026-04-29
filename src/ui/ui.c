@@ -1,5 +1,6 @@
 #include <ui.h>
 #include <string.h>
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 
@@ -17,6 +18,8 @@ static lv_obj_t * clock_label = NULL;
 static lv_obj_t * outside_temp_label = NULL;
 static lv_obj_t * oil_percent_label = NULL;
 static lv_obj_t * oil_life_bar = NULL;
+static lv_obj_t * oil_popup_overlay = NULL;
+static lv_obj_t * oil_cycle_input_label = NULL;
 static lv_obj_t * main_test_panel = NULL;
 static bool outside_temp_rendered_valid = false;
 static int32_t outside_temp_rendered_value = 1000;
@@ -33,6 +36,8 @@ static lv_timer_t * oil_life_ceremony_timer = NULL;
 static bool oil_life_ceremony_active = false;
 static uint32_t oil_life_ceremony_start_ms = 0;
 static int32_t oil_percent_requested_value = 100;
+static char oil_cycle_input_text[OIL_CYCLE_INPUT_MAX + 1] = "7000";
+static bool oil_cycle_input_replace_on_next_digit = false;
 
 static monitor_item_t cpu_core1, cpu_core2, ram_usage;
 static lv_timer_t * monitor_ceremony_timer = NULL;
@@ -43,7 +48,6 @@ static int32_t pending_core1_percent = 0;
 static int32_t pending_core2_percent = 0;
 
 static lv_timer_t * needle_ceremony_timer = NULL;
-static lv_timer_t * needle_ceremony_delay_timer = NULL;
 static bool needle_ceremony_active = false;
 static bool needle_ceremony_pending = false;
 static uint32_t needle_ceremony_start_ms = 0;
@@ -114,10 +118,24 @@ static bool get_latched_frost_visible(void);
 static void update_coolant_warning_icons(bool valid, int32_t coolant_val);
 static int32_t clamp_percent(int32_t percent);
 static void set_oil_percent_display(int32_t percent, lv_anim_enable_t anim);
+static void close_oil_popup_overlay(lv_obj_t * overlay);
+static void reset_oil_popup_content_refs(void);
+static void oil_popup_yes_button_event_cb(lv_event_t * e);
+static void oil_popup_no_button_event_cb(lv_event_t * e);
+static void oil_popup_edit_button_event_cb(lv_event_t * e);
+static void oil_popup_ok_button_event_cb(lv_event_t * e);
+static void oil_popup_clear_button_event_cb(lv_event_t * e);
+static void oil_popup_digit_button_event_cb(lv_event_t * e);
+static lv_obj_t * create_oil_popup_button_base(lv_obj_t * parent, int32_t width, int32_t height, lv_color_t bg_color, lv_color_t border_color);
+static lv_obj_t * create_oil_popup_image_button(lv_obj_t * parent, const void * label_src, lv_color_t bg_color, lv_color_t border_color);
+static lv_obj_t * create_oil_popup_text_button(lv_obj_t * parent, const char * text, int32_t width, int32_t height, lv_color_t bg_color, lv_color_t border_color, const lv_font_t * font);
+static void show_oil_popup(void);
+static void show_oil_popup_confirm_content(lv_obj_t * popup);
+static void show_oil_popup_edit_content(lv_obj_t * popup);
+static void oil_touch_area_event_cb(lv_event_t * e);
 static void start_oil_life_ceremony(void);
 static void finish_oil_life_ceremony(void);
 static void oil_life_ceremony_timer_cb(lv_timer_t * t);
-static void needle_ceremony_delay_timer_cb(lv_timer_t * t);
 static bool get_active_touch_point(lv_event_t * e, lv_point_t * p);
 static void debug_invalidate_full_screen(void);
 static void debug_show_panel(bool anim);
@@ -992,16 +1010,6 @@ static void start_needle_ceremony(void)
     }
 }
 
-static void needle_ceremony_delay_timer_cb(lv_timer_t * t)
-{
-    LV_UNUSED(t);
-    if (needle_ceremony_delay_timer) {
-        lv_timer_del(needle_ceremony_delay_timer);
-        needle_ceremony_delay_timer = NULL;
-    }
-    start_needle_ceremony();
-}
-
 void update_obd_gauges(bool obd_connected, bool coolant_valid, int32_t coolant_val, bool battery_valid, int32_t battery_val)
 {
     obd_connected_latched = obd_connected;
@@ -1112,6 +1120,166 @@ lv_obj_t* create_icon(lv_obj_t* parent, const void* src, int32_t x, int32_t y, u
     return img;
 }
 
+static void close_oil_popup_overlay(lv_obj_t * overlay)
+{
+    if (!overlay) return;
+    if (overlay == oil_popup_overlay) {
+        oil_popup_overlay = NULL;
+        reset_oil_popup_content_refs();
+    }
+    lv_obj_del_async(overlay);
+}
+
+static void reset_oil_popup_content_refs(void)
+{
+    oil_cycle_input_label = NULL;
+}
+
+static void oil_popup_yes_button_event_cb(lv_event_t * e)
+{
+    lv_obj_t * overlay = (lv_obj_t *)lv_event_get_user_data(e);
+    if (!overlay) return;
+
+    bool cycle_reset = ui_reset_service_oil_cycle_km();
+    bool odo_reset = ui_reset_service_odo();
+    if (cycle_reset && odo_reset) {
+        update_service_icon(false);
+        update_oil_percent(100);
+    }
+    close_oil_popup_overlay(overlay);
+}
+
+static void oil_popup_no_button_event_cb(lv_event_t * e)
+{
+    lv_obj_t * overlay = (lv_obj_t *)lv_event_get_user_data(e);
+    close_oil_popup_overlay(overlay);
+}
+
+static void apply_oil_popup_button_style(lv_obj_t * button, int32_t width, int32_t height, lv_color_t bg_color, lv_color_t border_color)
+{
+    static bool transition_ready = false;
+    static lv_style_transition_dsc_t press_transition;
+    static const lv_style_prop_t press_props[] = {
+        LV_STYLE_TRANSFORM_ZOOM,
+        LV_STYLE_BG_COLOR,
+        0
+    };
+
+    if (!transition_ready) {
+        lv_style_transition_dsc_init(
+            &press_transition,
+            press_props,
+            lv_anim_path_ease_out,
+            90,
+            0,
+            NULL
+        );
+        transition_ready = true;
+    }
+
+    lv_color_t pressed_bg = lv_color_lighten(bg_color, LV_OPA_20);
+    lv_obj_set_style_bg_color(button, bg_color, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(button, pressed_bg, LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(button, LV_OPA_COVER, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(button, LV_OPA_COVER, LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(button, 1, LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(button, 1, LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(button, border_color, LV_STATE_DEFAULT);
+    lv_obj_set_style_border_color(button, border_color, LV_STATE_PRESSED);
+    lv_obj_set_style_radius(button, 9, 0);
+    lv_obj_set_style_shadow_width(button, 0, 0);
+    lv_obj_set_style_outline_width(button, 0, 0);
+    lv_obj_set_style_pad_all(button, 0, 0);
+    lv_obj_set_style_transform_pivot_x(button, width / 2, 0);
+    lv_obj_set_style_transform_pivot_y(button, height / 2, 0);
+    lv_obj_set_style_transform_zoom(button, 256, LV_STATE_DEFAULT);
+    lv_obj_set_style_transform_zoom(button, OIL_POPUP_PRESS_ZOOM, LV_STATE_PRESSED);
+    lv_obj_set_style_transition(button, &press_transition, LV_STATE_DEFAULT);
+    lv_obj_set_style_transition(button, &press_transition, LV_STATE_PRESSED);
+    lv_obj_clear_flag(button, LV_OBJ_FLAG_SCROLLABLE);
+}
+
+static lv_obj_t * create_oil_popup_button_base(lv_obj_t * parent, int32_t width, int32_t height, lv_color_t bg_color, lv_color_t border_color)
+{
+    lv_obj_t * button = lv_btn_create(parent);
+    lv_obj_remove_style_all(button);
+    lv_obj_set_size(button, width, height);
+    lv_obj_add_flag(button, LV_OBJ_FLAG_CLICKABLE);
+    apply_oil_popup_button_style(button, width, height, bg_color, border_color);
+    return button;
+}
+
+static lv_obj_t * create_oil_popup_image_button(lv_obj_t * parent, const void * label_src, lv_color_t bg_color, lv_color_t border_color)
+{
+    lv_obj_t * button = create_oil_popup_button_base(parent, OIL_POPUP_BUTTON_WIDTH, OIL_POPUP_BUTTON_HEIGHT, bg_color, border_color);
+
+    lv_obj_t * label_img = lv_img_create(button);
+    lv_img_set_src(label_img, label_src);
+    lv_obj_center(label_img);
+
+    return button;
+}
+
+static lv_obj_t * create_oil_popup_text_button(lv_obj_t * parent, const char * text, int32_t width, int32_t height, lv_color_t bg_color, lv_color_t border_color, const lv_font_t * font)
+{
+    lv_obj_t * button = create_oil_popup_button_base(parent, width, height, bg_color, border_color);
+    lv_obj_t * label = lv_label_create(button);
+    lv_label_set_text(label, text ? text : "");
+    lv_obj_set_style_text_color(label, lv_color_white(), 0);
+    lv_obj_set_style_text_font(label, font ? font : &lv_font_montserrat_24, 0);
+    lv_obj_center(label);
+    return button;
+}
+
+static void update_oil_cycle_input_label(void)
+{
+    if (oil_cycle_input_label) {
+        lv_label_set_text(oil_cycle_input_label, oil_cycle_input_text);
+    }
+}
+
+static void oil_popup_digit_button_event_cb(lv_event_t * e)
+{
+    const char * digit = (const char *)lv_event_get_user_data(e);
+    if (!digit || digit[0] == '\0') return;
+
+    size_t len = strlen(oil_cycle_input_text);
+    if (oil_cycle_input_replace_on_next_digit || (len == 1 && oil_cycle_input_text[0] == '0')) {
+        oil_cycle_input_text[0] = digit[0];
+        oil_cycle_input_text[1] = '\0';
+        oil_cycle_input_replace_on_next_digit = false;
+    } else if (len < OIL_CYCLE_INPUT_MAX) {
+        oil_cycle_input_text[len] = digit[0];
+        oil_cycle_input_text[len + 1] = '\0';
+    }
+
+    update_oil_cycle_input_label();
+}
+
+static void oil_popup_clear_button_event_cb(lv_event_t * e)
+{
+    LV_UNUSED(e);
+    oil_cycle_input_text[0] = '0';
+    oil_cycle_input_text[1] = '\0';
+    oil_cycle_input_replace_on_next_digit = true;
+    update_oil_cycle_input_label();
+}
+
+static void oil_popup_ok_button_event_cb(lv_event_t * e)
+{
+    lv_obj_t * overlay = (lv_obj_t *)lv_event_get_user_data(e);
+    uint32_t cycleKm = (uint32_t)strtoul(oil_cycle_input_text, NULL, 10);
+    ui_set_service_oil_cycle_km(cycleKm);
+    close_oil_popup_overlay(overlay);
+}
+
+static void oil_popup_edit_button_event_cb(lv_event_t * e)
+{
+    lv_obj_t * popup = (lv_obj_t *)lv_event_get_user_data(e);
+    if (!popup) return;
+    show_oil_popup_edit_content(popup);
+}
+
 static int32_t clamp_percent(int32_t percent)
 {
     if (percent < 0) percent = 0;
@@ -1198,6 +1366,193 @@ static void start_oil_life_ceremony(void)
     }
 }
 
+static void show_oil_popup_confirm_content(lv_obj_t * popup)
+{
+    if (!popup) return;
+    reset_oil_popup_content_refs();
+    lv_obj_clean(popup);
+
+    lv_obj_t * prompt = lv_img_create(popup);
+    lv_img_set_src(prompt, &oil_reset_prompt);
+    lv_obj_align(prompt, LV_ALIGN_CENTER, 0, -42);
+
+    lv_obj_t * button_row = lv_obj_create(popup);
+    lv_obj_set_size(button_row, lv_pct(100), 90);
+    lv_obj_align(button_row, LV_ALIGN_BOTTOM_MID, 0, -24);
+    lv_obj_set_style_bg_opa(button_row, 0, 0);
+    lv_obj_set_style_border_width(button_row, 0, 0);
+    lv_obj_set_style_pad_all(button_row, 0, 0);
+    lv_obj_set_style_pad_column(button_row, OIL_POPUP_BUTTON_GAP, 0);
+    lv_obj_set_flex_flow(button_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(button_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(button_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t * yes_button = create_oil_popup_image_button(
+        button_row,
+        &oil_popup_yes,
+        lv_color_hex(0x1C84C6),
+        lv_color_hex(0x64C9FF)
+    );
+    lv_obj_add_event_cb(yes_button, oil_popup_yes_button_event_cb, LV_EVENT_CLICKED, oil_popup_overlay);
+
+    lv_obj_t * no_button = create_oil_popup_image_button(
+        button_row,
+        &oil_popup_no,
+        lv_color_hex(0x2B2B2B),
+        lv_color_hex(0x737373)
+    );
+    lv_obj_add_event_cb(no_button, oil_popup_no_button_event_cb, LV_EVENT_CLICKED, oil_popup_overlay);
+
+    lv_obj_t * edit_button = create_oil_popup_image_button(
+        button_row,
+        &oil_popup_edit,
+        lv_color_hex(0x2B2B2B),
+        lv_color_hex(0x737373)
+    );
+    lv_obj_add_event_cb(edit_button, oil_popup_edit_button_event_cb, LV_EVENT_CLICKED, popup);
+}
+
+static void show_oil_popup_edit_content(lv_obj_t * popup)
+{
+    if (!popup) return;
+    reset_oil_popup_content_refs();
+    lv_obj_clean(popup);
+
+    uint32_t cycleKm = OIL_CYCLE_DEFAULT_KM;
+    ui_get_service_oil_cycle_km(&cycleKm);
+    snprintf(oil_cycle_input_text, sizeof(oil_cycle_input_text), "%lu", (unsigned long)cycleKm);
+    oil_cycle_input_replace_on_next_digit = true;
+
+    lv_obj_t * due_img = lv_img_create(popup);
+    lv_img_set_src(due_img, &oil_popup_due);
+    lv_obj_align(due_img, LV_ALIGN_TOP_MID, OIL_POPUP_EDIT_DUE_X_OFFSET, OIL_POPUP_EDIT_DUE_Y);
+
+    lv_obj_t * close_button = create_oil_popup_text_button(
+        popup,
+        "X",
+        OIL_POPUP_EDIT_CLOSE_WIDTH,
+        OIL_POPUP_EDIT_CLOSE_HEIGHT,
+        lv_color_hex(0x2B2B2B),
+        lv_color_hex(0x737373),
+        &lv_font_montserrat_28
+    );
+    lv_obj_align(close_button, LV_ALIGN_TOP_MID, OIL_POPUP_EDIT_CLOSE_X_OFFSET, OIL_POPUP_EDIT_CLOSE_Y);
+    lv_obj_add_event_cb(close_button, oil_popup_no_button_event_cb, LV_EVENT_CLICKED, oil_popup_overlay);
+
+    lv_obj_t * input_row = lv_obj_create(popup);
+    lv_obj_set_size(input_row, OIL_POPUP_EDIT_INPUT_ROW_WIDTH, OIL_POPUP_EDIT_INPUT_ROW_HEIGHT);
+    lv_obj_align(input_row, LV_ALIGN_TOP_MID, 0, OIL_POPUP_EDIT_INPUT_ROW_Y);
+    lv_obj_set_style_bg_opa(input_row, 0, 0);
+    lv_obj_set_style_border_width(input_row, 0, 0);
+    lv_obj_set_style_pad_all(input_row, 0, 0);
+    lv_obj_set_style_pad_column(input_row, OIL_POPUP_EDIT_INPUT_GAP, 0);
+    lv_obj_set_flex_flow(input_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(input_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(input_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t * input_box = lv_obj_create(input_row);
+    lv_obj_remove_style_all(input_box);
+    lv_obj_set_size(input_box, OIL_POPUP_EDIT_INPUT_WIDTH, OIL_POPUP_EDIT_INPUT_ROW_HEIGHT);
+    lv_obj_set_style_bg_color(input_box, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(input_box, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(input_box, 1, 0);
+    lv_obj_set_style_border_color(input_box, lv_color_hex(0x737373), 0);
+    lv_obj_set_style_radius(input_box, 8, 0);
+    lv_obj_set_style_pad_all(input_box, 0, 0);
+    lv_obj_clear_flag(input_box, LV_OBJ_FLAG_SCROLLABLE);
+
+    oil_cycle_input_label = lv_label_create(input_box);
+    lv_label_set_text(oil_cycle_input_label, oil_cycle_input_text);
+    lv_obj_set_style_text_color(oil_cycle_input_label, lv_color_white(), 0);
+    lv_obj_set_style_text_font(oil_cycle_input_label, &lv_font_montserrat_28, 0);
+    lv_obj_center(oil_cycle_input_label);
+
+    lv_obj_t * ok_button = create_oil_popup_text_button(
+        input_row,
+        "OK",
+        OIL_POPUP_EDIT_OK_WIDTH,
+        OIL_POPUP_EDIT_INPUT_ROW_HEIGHT,
+        lv_color_hex(0x1C84C6),
+        lv_color_hex(0x64C9FF),
+        &lv_font_montserrat_28
+    );
+    lv_obj_add_event_cb(ok_button, oil_popup_ok_button_event_cb, LV_EVENT_CLICKED, oil_popup_overlay);
+
+    lv_obj_t * clear_button = create_oil_popup_text_button(
+        input_row,
+        "Clear",
+        OIL_POPUP_EDIT_CLEAR_WIDTH,
+        OIL_POPUP_EDIT_INPUT_ROW_HEIGHT,
+        lv_color_hex(0x2B2B2B),
+        lv_color_hex(0x737373),
+        &lv_font_montserrat_24
+    );
+    lv_obj_add_event_cb(clear_button, oil_popup_clear_button_event_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t * keypad = lv_obj_create(popup);
+    lv_obj_set_size(keypad, OIL_POPUP_KEYPAD_WIDTH, OIL_POPUP_KEYPAD_HEIGHT);
+    lv_obj_align(keypad, LV_ALIGN_BOTTOM_MID, 0, OIL_POPUP_KEYPAD_BOTTOM_OFFSET);
+    lv_obj_set_style_bg_opa(keypad, 0, 0);
+    lv_obj_set_style_border_width(keypad, 0, 0);
+    lv_obj_set_style_pad_all(keypad, 0, 0);
+    lv_obj_set_style_pad_row(keypad, OIL_POPUP_KEY_GAP, 0);
+    lv_obj_set_style_pad_column(keypad, OIL_POPUP_KEY_GAP, 0);
+    lv_obj_set_flex_flow(keypad, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(keypad, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(keypad, LV_OBJ_FLAG_SCROLLABLE);
+
+    static const char * digits[] = { "0", "1", "2", "3", "4", "5", "6", "7", "8", "9" };
+    for (size_t i = 0; i < sizeof(digits) / sizeof(digits[0]); ++i) {
+        lv_obj_t * key = create_oil_popup_text_button(
+            keypad,
+            digits[i],
+            OIL_POPUP_KEY_WIDTH,
+            OIL_POPUP_KEY_HEIGHT,
+            lv_color_hex(0x2B2B2B),
+            lv_color_hex(0x737373),
+            &lv_font_montserrat_28
+        );
+        lv_obj_add_event_cb(key, oil_popup_digit_button_event_cb, LV_EVENT_CLICKED, (void *)digits[i]);
+    }
+}
+
+static void show_oil_popup(void)
+{
+    if (oil_popup_overlay) return;
+
+    oil_popup_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(oil_popup_overlay, SCREEN_WIDTH, SCREEN_HEIGHT);
+    lv_obj_set_style_bg_color(oil_popup_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(oil_popup_overlay, LV_OPA_60, 0);
+    lv_obj_set_style_border_width(oil_popup_overlay, 0, 0);
+    lv_obj_set_style_radius(oil_popup_overlay, 0, 0);
+    lv_obj_set_style_pad_all(oil_popup_overlay, 0, 0);
+    lv_obj_add_flag(oil_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(oil_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_move_foreground(oil_popup_overlay);
+
+    lv_obj_t * popup = lv_obj_create(oil_popup_overlay);
+    lv_obj_set_size(popup, OIL_POPUP_WIDTH, OIL_POPUP_HEIGHT);
+    lv_obj_center(popup);
+    lv_obj_set_style_bg_color(popup, lv_color_hex(0x161616), 0);
+    lv_obj_set_style_bg_opa(popup, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(popup, 1, 0);
+    lv_obj_set_style_border_color(popup, lv_color_hex(0x4A4A4A), 0);
+    lv_obj_set_style_radius(popup, 8, 0);
+    lv_obj_set_style_shadow_width(popup, 27, 0);
+    lv_obj_set_style_shadow_opa(popup, LV_OPA_40, 0);
+    lv_obj_set_style_shadow_color(popup, lv_color_black(), 0);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    show_oil_popup_confirm_content(popup);
+}
+
+static void oil_touch_area_event_cb(lv_event_t * e)
+{
+    LV_UNUSED(e);
+    show_oil_popup();
+}
+
 static void create_center_status_bar(lv_obj_t* parent)
 {
     oil_percent_label = lv_label_create(parent);
@@ -1227,7 +1582,48 @@ static void create_center_status_bar(lv_obj_t* parent)
     lv_obj_clear_flag(oil_life_bar, LV_OBJ_FLAG_SCROLLABLE);
     set_oil_percent_display(oil_percent_requested_value, LV_ANIM_OFF);
 
-    create_icon(parent, &oil, OIL_ICON_X, OIL_ICON_Y, OIL_ICON_SCALE);
+    lv_obj_t * oil_icon = create_icon(parent, &oil, OIL_ICON_X, OIL_ICON_Y, OIL_ICON_SCALE);
+
+    lv_obj_update_layout(parent);
+
+    int32_t x1 = lv_obj_get_x(oil_percent_label);
+    int32_t y1 = lv_obj_get_y(oil_percent_label);
+    int32_t x2 = x1 + lv_obj_get_width(oil_percent_label);
+    int32_t y2 = y1 + lv_obj_get_height(oil_percent_label);
+
+    int32_t obj_x1 = lv_obj_get_x(oil_life_bar);
+    int32_t obj_y1 = lv_obj_get_y(oil_life_bar);
+    int32_t obj_x2 = obj_x1 + lv_obj_get_width(oil_life_bar);
+    int32_t obj_y2 = obj_y1 + lv_obj_get_height(oil_life_bar);
+    if (obj_x1 < x1) x1 = obj_x1;
+    if (obj_y1 < y1) y1 = obj_y1;
+    if (obj_x2 > x2) x2 = obj_x2;
+    if (obj_y2 > y2) y2 = obj_y2;
+
+    obj_x1 = lv_obj_get_x(oil_icon);
+    obj_y1 = lv_obj_get_y(oil_icon);
+    obj_x2 = obj_x1 + lv_obj_get_width(oil_icon);
+    obj_y2 = obj_y1 + lv_obj_get_height(oil_icon);
+    if (obj_x1 < x1) x1 = obj_x1;
+    if (obj_y1 < y1) y1 = obj_y1;
+    if (obj_x2 > x2) x2 = obj_x2;
+    if (obj_y2 > y2) y2 = obj_y2;
+
+    lv_obj_t * touch_area = lv_obj_create(parent);
+    lv_obj_set_pos(touch_area, x1 - CENTER_STATUS_TOUCH_PADDING, y1 - CENTER_STATUS_TOUCH_PADDING);
+    lv_obj_set_size(
+        touch_area,
+        (x2 - x1) + (CENTER_STATUS_TOUCH_PADDING * 2),
+        (y2 - y1) + (CENTER_STATUS_TOUCH_PADDING * 2)
+    );
+    lv_obj_set_style_bg_opa(touch_area, 0, 0);
+    lv_obj_set_style_border_width(touch_area, 0, 0);
+    lv_obj_set_style_shadow_width(touch_area, 0, 0);
+    lv_obj_set_style_radius(touch_area, 0, 0);
+    lv_obj_set_style_pad_all(touch_area, 0, 0);
+    lv_obj_add_flag(touch_area, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(touch_area, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(touch_area, oil_touch_area_event_cb, LV_EVENT_PRESSED, NULL);
 }
 
 void create_monitor_item(lv_obj_t * parent, monitor_item_t * item, const char * name, lv_color_t color, int32_t ignored)
@@ -1455,10 +1851,6 @@ void UiResetRuntimeState(void)
         lv_timer_del(needle_ceremony_timer);
         needle_ceremony_timer = NULL;
     }
-    if (needle_ceremony_delay_timer) {
-        lv_timer_del(needle_ceremony_delay_timer);
-        needle_ceremony_delay_timer = NULL;
-    }
     if (startup_warning_icon_timer) {
         lv_timer_del(startup_warning_icon_timer);
         startup_warning_icon_timer = NULL;
@@ -1515,6 +1907,7 @@ void UiResetRuntimeState(void)
     outside_temp_label = NULL;
     oil_percent_label = NULL;
     oil_life_bar = NULL;
+    oil_popup_overlay = NULL;
     outside_temp_rendered_valid = false;
     outside_temp_rendered_value = 1000;
     frost_icon_rendered_visible = false;
@@ -1802,13 +2195,7 @@ void GaugeInit()
     pending_core1_percent = 0;
     pending_core2_percent = 0;
     start_monitor_ceremony();
-    needle_ceremony_delay_timer = lv_timer_create(needle_ceremony_delay_timer_cb, 3000, NULL);
-    if (needle_ceremony_delay_timer) {
-        lv_timer_set_repeat_count(needle_ceremony_delay_timer, 1);
-    } else {
-        needle_ceremony_pending = false;
-        start_needle_ceremony();
-    }
+    start_needle_ceremony();
 
     lv_obj_clear_flag(lv_scr_act(), LV_OBJ_FLAG_SCROLLABLE);
 }

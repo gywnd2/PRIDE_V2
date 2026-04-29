@@ -107,6 +107,7 @@ typedef struct {
 
     bool serviceDue;
     uint32_t serviceOdoKm;
+    uint32_t serviceOilCycleKm;
     uint8_t oilPercent;
 } UiSharedState;
 
@@ -234,6 +235,10 @@ public:
     void FinishDisplayLogSession();
     bool RefreshServiceDueFromStorage();
     bool AddServiceOdoDistance(uint32_t deltaKm, uint32_t* totalOut = nullptr);
+    bool ResetServiceOdo();
+    bool GetServiceOilCycleKm(uint32_t* outKm);
+    bool SetServiceOilCycleKm(uint32_t cycleKm);
+    bool ResetServiceOilCycleKm();
     bool GetUiSharedSnapshot(UiSharedState* out, TickType_t waitTime = 0);
     bool GetUiWifiState(bool* connected, int32_t* rssi = nullptr, TickType_t waitTime = 0);
     bool GetUiClockText(char* out, size_t outLen, TickType_t waitTime = 0);

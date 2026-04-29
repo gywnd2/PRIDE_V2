@@ -210,6 +210,9 @@ DisplayMgr::~DisplayMgr()
 #ifndef TOUCH_EXTRA_MIRROR_Y
 #define TOUCH_EXTRA_MIRROR_Y true
 #endif
+#ifndef TOUCH_EXTRA_MIRROR_X
+#define TOUCH_EXTRA_MIRROR_X true
+#endif
 
 static constexpr int32_t TOUCH_I2C_SDA_PIN = GT911_I2C_CONFIG_SDA_IO_NUM;
 static constexpr int32_t TOUCH_I2C_SCL_PIN = GT911_I2C_CONFIG_SCL_IO_NUM;
@@ -259,6 +262,10 @@ static void transform_touch_point(int16_t* x, int16_t* y)
 
 #if TOUCH_EXTRA_MIRROR_Y
     ty = (SCREEN_HEIGHT - 1) - ty;
+#endif
+
+#if TOUCH_EXTRA_MIRROR_X
+    tx = (SCREEN_WIDTH - 1) - tx;
 #endif
 
     *x = clamp_touch_coord(tx, SCREEN_WIDTH - 1);
@@ -557,15 +564,33 @@ static void register_idle_hooks_once()
 
 static void reset_cpu_usage_sampler()
 {
+    uint8_t lastFiltered0 = s_cpuFilteredUsage0;
+    uint8_t lastFiltered1 = s_cpuFilteredUsage1;
+    bool hadValidUsage = s_cpuUsageValid;
+
     s_cpuPrevIdle0 = 0;
     s_cpuPrevIdle1 = 0;
     s_cpuPeakIdle0 = 1;
     s_cpuPeakIdle1 = 1;
     s_cpuPrevSampleTick = 0;
-    s_cpuFilteredUsage0 = 0;
-    s_cpuFilteredUsage1 = 0;
-    s_cpuUsageValid = false;
-    s_cpuWarmupSamples = 3;
+    s_cpuFilteredUsage0 = hadValidUsage ? lastFiltered0 : 0;
+    s_cpuFilteredUsage1 = hadValidUsage ? lastFiltered1 : 0;
+    s_cpuUsageValid = hadValidUsage;
+    s_cpuWarmupSamples = hadValidUsage ? 0 : 3;
+}
+
+static int32_t sample_internal_ram_usage_percent()
+{
+    size_t total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (total == 0) {
+        total = heap_caps_get_total_size(MALLOC_CAP_8BIT);
+        free = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    }
+    if (total == 0) return 0;
+
+    if (free > total) free = total;
+    return (int32_t)(((total - free) * 100U) / total);
 }
 
 static bool sample_cpu_usage(uint8_t* core0_usage, uint8_t* core1_usage)
@@ -2178,9 +2203,7 @@ void DisplayMgr::HandleLvglTask(void *pvParameters)
             if (!s_splashActive && !debugBusy &&
                 (now - lastMonTick) >= MONITOR_UPDATE_PERIOD_TICKS &&
                 (s_monitorResumeTick == 0 || now >= s_monitorResumeTick)) {
-                size_t total = heap_caps_get_total_size(MALLOC_CAP_8BIT);
-                size_t free = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-                int32_t ram = (total > 0) ? (int32_t)(((total - free) * 100U) / total) : 0;
+                int32_t ram = sample_internal_ram_usage_percent();
 
                 uint8_t core0 = 0;
                 uint8_t core1 = 0;

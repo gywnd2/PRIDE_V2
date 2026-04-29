@@ -130,6 +130,7 @@ public:
     void SetMafRate(float val);
     void SetOBDStatus(int status);
     int GetOBDStatus(void);
+    void ResetServiceOdoSessionBase(void);
     bool QueryOutsideTemp(float& outsideTempC);
     bool QueryPidRaw(const String& pidCommand, String& payloadOut, int8_t& stateOut);
 };

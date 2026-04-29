@@ -126,11 +126,14 @@ void StorageMgr::Init()
         SystemAPI* system = SystemAPI::getInstance();
         TEST_LOG("SystemAPI ptr=%p", system);
         uint32_t serviceOdoKm = 0;
+        uint32_t oilCycleKm = SERVICE_OIL_CYCLE_DEFAULT_KM;
+        this->ReadServiceOilCycleKm(&oilCycleKm);
         if (this->ReadServiceOdoKm(&serviceOdoKm)) {
             system->PublishServiceOdoKm(serviceOdoKm);
-            TEST_LOG("service odo=%u km due=%d",
+            TEST_LOG("service odo=%u km cycle=%u due=%d",
                      (unsigned int)serviceOdoKm,
-                     serviceOdoKm >= SERVICE_ODO_THRESHOLD_KM ? 1 : 0);
+                     (unsigned int)oilCycleKm,
+                     serviceOdoKm >= oilCycleKm ? 1 : 0);
         }
         if (system->LockGif(pdMS_TO_TICKS(500))) {
             TEST_LOG("LockGif acquired");
@@ -460,6 +463,107 @@ bool StorageMgr::AddServiceOdoKm(uint32_t deltaKm, uint32_t* totalOut)
 
     xSemaphoreGive(_logMutex);
     return ok;
+}
+
+bool StorageMgr::ResetServiceOdoKm(uint32_t* totalOut)
+{
+    if (totalOut) *totalOut = 0;
+    if (_logMutex == nullptr) return false;
+    if (xSemaphoreTake(_logMutex, pdMS_TO_TICKS(180)) != pdTRUE) return false;
+
+    bool ok = false;
+    do {
+        if (!EnsureDbDir()) break;
+
+        if (SD.exists(SERVICE_ODO_FILE_PATH) && !SD.remove(SERVICE_ODO_FILE_PATH)) {
+            break;
+        }
+
+        File writeFile = SD.open(SERVICE_ODO_FILE_PATH, FILE_WRITE);
+        if (!writeFile) break;
+        writeFile.print(0);
+        writeFile.close();
+
+        if (totalOut) *totalOut = 0;
+        TEST_LOG("service odo reset");
+        ok = true;
+    } while (false);
+
+    xSemaphoreGive(_logMutex);
+    return ok;
+}
+
+bool StorageMgr::ReadServiceOilCycleKm(uint32_t* outKm)
+{
+    if (!outKm) return false;
+    *outKm = SERVICE_OIL_CYCLE_DEFAULT_KM;
+    if (_logMutex == nullptr) return false;
+    if (xSemaphoreTake(_logMutex, pdMS_TO_TICKS(120)) != pdTRUE) return false;
+
+    bool ok = false;
+    do {
+        if (!EnsureDbDir()) break;
+        if (!SD.exists(SERVICE_OIL_CYCLE_FILE_PATH)) {
+            ok = true;
+            break;
+        }
+
+        File f = SD.open(SERVICE_OIL_CYCLE_FILE_PATH, FILE_READ);
+        if (!f) break;
+        if (f.isDirectory()) {
+            f.close();
+            break;
+        }
+
+        char buf[32] = {0};
+        size_t len = f.readBytes(buf, sizeof(buf) - 1);
+        f.close();
+        buf[len] = '\0';
+
+        char* end = nullptr;
+        unsigned long value = strtoul(buf, &end, 10);
+        if (end == buf) break;
+
+        *outKm = (value == 0UL) ? SERVICE_OIL_CYCLE_DEFAULT_KM : (uint32_t)value;
+        ok = true;
+    } while (false);
+
+    xSemaphoreGive(_logMutex);
+    return ok;
+}
+
+bool StorageMgr::WriteServiceOilCycleKm(uint32_t cycleKm, uint32_t* writtenOut)
+{
+    if (writtenOut) *writtenOut = 0;
+    if (cycleKm == 0U) cycleKm = SERVICE_OIL_CYCLE_DEFAULT_KM;
+    if (_logMutex == nullptr) return false;
+    if (xSemaphoreTake(_logMutex, pdMS_TO_TICKS(180)) != pdTRUE) return false;
+
+    bool ok = false;
+    do {
+        if (!EnsureDbDir()) break;
+
+        if (SD.exists(SERVICE_OIL_CYCLE_FILE_PATH) && !SD.remove(SERVICE_OIL_CYCLE_FILE_PATH)) {
+            break;
+        }
+
+        File writeFile = SD.open(SERVICE_OIL_CYCLE_FILE_PATH, FILE_WRITE);
+        if (!writeFile) break;
+        writeFile.print(cycleKm);
+        writeFile.close();
+
+        if (writtenOut) *writtenOut = cycleKm;
+        TEST_LOG("service oil cycle updated value=%u", (unsigned int)cycleKm);
+        ok = true;
+    } while (false);
+
+    xSemaphoreGive(_logMutex);
+    return ok;
+}
+
+bool StorageMgr::ResetServiceOilCycleKm(uint32_t* writtenOut)
+{
+    return WriteServiceOilCycleKm(SERVICE_OIL_CYCLE_DEFAULT_KM, writtenOut);
 }
 
 bool StorageMgr::PrepareNextRuntimeLogFileLocked()
