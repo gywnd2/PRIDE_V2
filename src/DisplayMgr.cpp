@@ -26,6 +26,10 @@ extern "C" int Cache_WriteBack_Addr(uint32_t addr, uint32_t size);
 #endif
 #include <AnimatedGIF.h>
 
+#ifndef DISPLAY_RUNTIME_LOG_ENABLED
+#define DISPLAY_RUNTIME_LOG_ENABLED 0
+#endif
+
 static void display_logf(const char* fmt, ...);
 static void display_serial_printf(const char* fmt, ...);
 static void display_serial_println(const char* line);
@@ -49,6 +53,36 @@ static volatile uint32_t s_singleFlushFrameCount = 0;
 static volatile uint32_t s_singleFlushPixelCount = 0;
 static volatile uint64_t s_singleFlushCopyTimeUs = 0;
 static volatile uint32_t s_singleFlushMaxCopyUs = 0;
+static uint32_t s_flushFrameDirtyPixels = 0;
+static uint32_t s_perfFrameCount = 0;
+static uint64_t s_perfDirtyPixelTotal = 0;
+static uint32_t s_perfDirtyPixelMax = 0;
+static uint32_t s_perfFullSyncCount = 0;
+static uint32_t s_perfFullSyncFullFrameCount = 0;
+static uint32_t s_perfFullSyncSceneResetCount = 0;
+static uint32_t s_perfFullSyncPeriodicCount = 0;
+static uint32_t s_perfFullSyncThresholdCount = 0;
+static uint32_t s_perfReplayCount = 0;
+static uint32_t s_perfCopyCount = 0;
+static uint64_t s_perfCopyTotalUs = 0;
+static uint32_t s_perfCopyMaxUs = 0;
+static volatile uint32_t s_vsyncLastUs = 0;
+static volatile uint32_t s_perfVsyncDeltaCount = 0;
+static volatile uint64_t s_perfVsyncDeltaTotalUs = 0;
+static volatile uint32_t s_perfVsyncDeltaMinUs = 0xFFFFFFFFU;
+static volatile uint32_t s_perfVsyncDeltaMaxUs = 0;
+static volatile uint32_t s_perfVsyncJitterMaxUs = 0;
+static uint32_t s_perfLvglLoopGapCount = 0;
+static uint32_t s_perfLvglLoopGapMaxMs = 0;
+static uint32_t s_perfLvglHandlerSlowCount = 0;
+static uint32_t s_perfLvglHandlerMaxUs = 0;
+static uint32_t s_perfLvglLockFailCount = 0;
+static uint32_t s_perfLvglLockFailMaxStreak = 0;
+static uint32_t s_lvglLockFailStreak = 0;
+static uint32_t s_jitterLastLogMs = 0;
+static bool s_lastUiWifiConnected = false;
+static bool s_lastUiBtConnected = false;
+static int s_lastUiObdStatus = 0;
 static bool s_flushFrameStarted = false;
 static bool s_usePseudoDoubleBuffer = false;
 static bool s_backBufferSynced = true;
@@ -82,9 +116,14 @@ static uint32_t s_successfulPseudoSwapFrameCount = 0;
 
 static constexpr TickType_t MONITOR_UPDATE_PERIOD_TICKS = pdMS_TO_TICKS(1000);
 static constexpr TickType_t UI_SHARED_UPDATE_PERIOD_TICKS = pdMS_TO_TICKS(100);
+static constexpr TickType_t DISPLAY_PERF_STATS_PERIOD_TICKS = pdMS_TO_TICKS(30000);
 static constexpr uint32_t LVGL_TASK_MIN_SLEEP_MS = 1U;
 static constexpr uint32_t LVGL_TASK_MAX_SLEEP_MS = 4U;
 static constexpr uint32_t LVGL_TASK_LOCK_FAIL_SLEEP_MS = 2U;
+static constexpr uint32_t LVGL_LOOP_GAP_WARN_MS = 35U;
+static constexpr uint32_t LVGL_LOOP_GAP_LOG_MS = 55U;
+static constexpr uint32_t LVGL_HANDLER_SLOW_US = 55000U;
+static constexpr uint32_t LVGL_JITTER_LOG_THROTTLE_MS = 500U;
 #ifndef DISPLAY_PERIODIC_FULL_SYNC_INTERVAL
 #define DISPLAY_PERIODIC_FULL_SYNC_INTERVAL 120U
 #endif
@@ -110,9 +149,21 @@ static constexpr uint32_t DISPLAY_FRAME_PERIOD_MS =
     (uint32_t)((((uint64_t)DISPLAY_TOTAL_H_PIXELS * (uint64_t)DISPLAY_TOTAL_V_LINES * 1000ULL) +
                 (uint64_t)DISPLAY_TARGET_PCLK_HZ - 1ULL) /
                (uint64_t)DISPLAY_TARGET_PCLK_HZ);
+static constexpr uint32_t DISPLAY_FRAME_PERIOD_US =
+    (uint32_t)((((uint64_t)DISPLAY_TOTAL_H_PIXELS * (uint64_t)DISPLAY_TOTAL_V_LINES * 1000000ULL) +
+                (uint64_t)DISPLAY_TARGET_PCLK_HZ - 1ULL) /
+               (uint64_t)DISPLAY_TARGET_PCLK_HZ);
 static constexpr uint32_t DISPLAY_VSYNC_WAIT_BUDGET_MS =
     ((DISPLAY_FRAME_PERIOD_MS + 12U) < 40U) ? 40U : (DISPLAY_FRAME_PERIOD_MS + 12U);
 static constexpr bool DISPLAY_ROTATE_180 = true;
+
+enum DisplayPerfFullSyncKind
+{
+    DISPLAY_PERF_FULL_SYNC_FULLFRAME = 0,
+    DISPLAY_PERF_FULL_SYNC_SCENE_RESET,
+    DISPLAY_PERF_FULL_SYNC_PERIODIC,
+    DISPLAY_PERF_FULL_SYNC_THRESHOLD
+};
 
 static void trim_display_log_line(char* line)
 {
@@ -128,10 +179,14 @@ static void trim_display_log_line(char* line)
 
 static void append_display_log_line(const char* line)
 {
+#if DISPLAY_RUNTIME_LOG_ENABLED
     if (!line || line[0] == '\0') return;
     SystemAPI* system = SystemAPI::getInstance();
     if (!system) return;
     system->AppendDisplayLog(line);
+#else
+    (void)line;
+#endif
 }
 
 static void display_logf(const char* fmt, ...)
@@ -426,6 +481,10 @@ static inline bool area_can_merge(const lv_area_t* a, const lv_area_t* b)
 
 static inline void request_full_invalidate();
 static void display_diag_log(const char* tag);
+static void display_perf_stats_log();
+static inline void perf_note_copy_time(uint32_t copyUs);
+static inline void perf_note_frame_dirty(uint32_t dirtyPixels);
+static inline void perf_note_full_sync(DisplayPerfFullSyncKind kind);
 static bool wait_for_vsync_edge(TickType_t timeoutTicks);
 static void request_rgb_panel_restart(esp_lcd_panel_handle_t panel, const char* tag);
 
@@ -506,6 +565,162 @@ static void display_diag_log(const char* tag)
         s_frameHasFullRefreshArea ? 1 : 0,
         s_sceneResetPending ? 1 : 0,
         (unsigned int)s_vsyncCount
+    );
+}
+
+static void display_jitter_log(const char* tag, uint32_t loopGapMs, uint32_t handlerUs, uint32_t lockFailStreak)
+{
+    uint32_t nowMs = (uint32_t)(esp_timer_get_time() / 1000ULL);
+    if ((nowMs - s_jitterLastLogMs) < LVGL_JITTER_LOG_THROTTLE_MS) return;
+    s_jitterLastLogMs = nowMs;
+
+    display_serial_printf(
+        "[DisplayMgr][JITTER] %s loop_gap_ms=%u handler_us=%u lock_fail_streak=%u req=%u done=%u skip=%u restart=%u copy_max_us=%u wifi=%d bt=%d obd=%d cpu0=%u cpu1=%u\n",
+        tag ? tag : "(null)",
+        (unsigned int)loopGapMs,
+        (unsigned int)handlerUs,
+        (unsigned int)lockFailStreak,
+        (unsigned int)s_swapReqCount,
+        (unsigned int)s_swapDoneCount,
+        (unsigned int)s_swapSkipTimeoutCount,
+        (unsigned int)s_panelRestartCount,
+        (unsigned int)s_perfCopyMaxUs,
+        s_lastUiWifiConnected ? 1 : 0,
+        s_lastUiBtConnected ? 1 : 0,
+        (int)s_lastUiObdStatus,
+        (unsigned int)s_cpuFilteredUsage0,
+        (unsigned int)s_cpuFilteredUsage1
+    );
+}
+
+static inline void perf_note_copy_time(uint32_t copyUs)
+{
+    s_perfCopyCount++;
+    s_perfCopyTotalUs += copyUs;
+    if (copyUs > s_perfCopyMaxUs) {
+        s_perfCopyMaxUs = copyUs;
+    }
+}
+
+static inline void perf_note_frame_dirty(uint32_t dirtyPixels)
+{
+    s_perfFrameCount++;
+    s_perfDirtyPixelTotal += dirtyPixels;
+    if (dirtyPixels > s_perfDirtyPixelMax) {
+        s_perfDirtyPixelMax = dirtyPixels;
+    }
+}
+
+static inline void perf_note_full_sync(DisplayPerfFullSyncKind kind)
+{
+    s_perfFullSyncCount++;
+    switch (kind) {
+        case DISPLAY_PERF_FULL_SYNC_FULLFRAME:
+            s_perfFullSyncFullFrameCount++;
+            break;
+        case DISPLAY_PERF_FULL_SYNC_SCENE_RESET:
+            s_perfFullSyncSceneResetCount++;
+            break;
+        case DISPLAY_PERF_FULL_SYNC_PERIODIC:
+            s_perfFullSyncPeriodicCount++;
+            break;
+        case DISPLAY_PERF_FULL_SYNC_THRESHOLD:
+        default:
+            s_perfFullSyncThresholdCount++;
+            break;
+    }
+}
+
+static void display_perf_stats_log()
+{
+    uint32_t frameCount = s_perfFrameCount;
+    uint64_t dirtyTotal = s_perfDirtyPixelTotal;
+    uint32_t dirtyMax = s_perfDirtyPixelMax;
+    uint32_t fullSyncCount = s_perfFullSyncCount;
+    uint32_t fullFrameCount = s_perfFullSyncFullFrameCount;
+    uint32_t sceneResetCount = s_perfFullSyncSceneResetCount;
+    uint32_t periodicCount = s_perfFullSyncPeriodicCount;
+    uint32_t thresholdCount = s_perfFullSyncThresholdCount;
+    uint32_t replayCount = s_perfReplayCount;
+    uint32_t copyCount = s_perfCopyCount;
+    uint64_t copyTotalUs = s_perfCopyTotalUs;
+    uint32_t copyMaxUs = s_perfCopyMaxUs;
+
+    uint32_t vsyncDeltaCount = s_perfVsyncDeltaCount;
+    uint64_t vsyncDeltaTotalUs = s_perfVsyncDeltaTotalUs;
+    uint32_t vsyncDeltaMinUs = s_perfVsyncDeltaMinUs;
+    uint32_t vsyncDeltaMaxUs = s_perfVsyncDeltaMaxUs;
+    uint32_t vsyncJitterMaxUs = s_perfVsyncJitterMaxUs;
+    uint32_t lvglLoopGapCount = s_perfLvglLoopGapCount;
+    uint32_t lvglLoopGapMaxMs = s_perfLvglLoopGapMaxMs;
+    uint32_t lvglHandlerSlowCount = s_perfLvglHandlerSlowCount;
+    uint32_t lvglHandlerMaxUs = s_perfLvglHandlerMaxUs;
+    uint32_t lvglLockFailCount = s_perfLvglLockFailCount;
+    uint32_t lvglLockFailMaxStreak = s_perfLvglLockFailMaxStreak;
+
+    s_perfFrameCount = 0;
+    s_perfDirtyPixelTotal = 0;
+    s_perfDirtyPixelMax = 0;
+    s_perfFullSyncCount = 0;
+    s_perfFullSyncFullFrameCount = 0;
+    s_perfFullSyncSceneResetCount = 0;
+    s_perfFullSyncPeriodicCount = 0;
+    s_perfFullSyncThresholdCount = 0;
+    s_perfReplayCount = 0;
+    s_perfCopyCount = 0;
+    s_perfCopyTotalUs = 0;
+    s_perfCopyMaxUs = 0;
+    s_perfVsyncDeltaCount = 0;
+    s_perfVsyncDeltaTotalUs = 0;
+    s_perfVsyncDeltaMinUs = 0xFFFFFFFFU;
+    s_perfVsyncDeltaMaxUs = 0;
+    s_perfVsyncJitterMaxUs = 0;
+    s_perfLvglLoopGapCount = 0;
+    s_perfLvglLoopGapMaxMs = 0;
+    s_perfLvglHandlerSlowCount = 0;
+    s_perfLvglHandlerMaxUs = 0;
+    s_perfLvglLockFailCount = 0;
+    s_perfLvglLockFailMaxStreak = 0;
+
+    uint32_t dirtyAvg = frameCount ? (uint32_t)(dirtyTotal / frameCount) : 0U;
+    uint32_t copyAvgUs = copyCount ? (uint32_t)(copyTotalUs / copyCount) : 0U;
+    uint32_t vsyncAvgUs = vsyncDeltaCount ? (uint32_t)(vsyncDeltaTotalUs / vsyncDeltaCount) : 0U;
+    uint32_t vsyncMinUs = (vsyncDeltaCount && vsyncDeltaMinUs != 0xFFFFFFFFU) ? vsyncDeltaMinUs : 0U;
+
+    display_serial_printf(
+        "[DisplayMgr][STATS] window_ms=30000 frames=%u dirty_px_avg=%u dirty_px_max=%u full_sync=%u fullframe=%u scene=%u periodic=%u threshold=%u replay=%u copy_avg_us=%u copy_max_us=%u vsync_delta_avg_us=%u vsync_delta_min_us=%u vsync_delta_max_us=%u vsync_jitter_max_us=%u lv_gap=%u lv_gap_max_ms=%u lv_slow=%u lv_handler_max_us=%u lv_lock_fail=%u lv_lock_fail_max=%u req=%u done=%u skip=%u restart=%u bypass=%u vsync=%u wifi=%d bt=%d obd=%d cpu0=%u cpu1=%u\n",
+        (unsigned int)frameCount,
+        (unsigned int)dirtyAvg,
+        (unsigned int)dirtyMax,
+        (unsigned int)fullSyncCount,
+        (unsigned int)fullFrameCount,
+        (unsigned int)sceneResetCount,
+        (unsigned int)periodicCount,
+        (unsigned int)thresholdCount,
+        (unsigned int)replayCount,
+        (unsigned int)copyAvgUs,
+        (unsigned int)copyMaxUs,
+        (unsigned int)vsyncAvgUs,
+        (unsigned int)vsyncMinUs,
+        (unsigned int)vsyncDeltaMaxUs,
+        (unsigned int)vsyncJitterMaxUs,
+        (unsigned int)lvglLoopGapCount,
+        (unsigned int)lvglLoopGapMaxMs,
+        (unsigned int)lvglHandlerSlowCount,
+        (unsigned int)lvglHandlerMaxUs,
+        (unsigned int)lvglLockFailCount,
+        (unsigned int)lvglLockFailMaxStreak,
+        (unsigned int)s_swapReqCount,
+        (unsigned int)s_swapDoneCount,
+        (unsigned int)s_swapSkipTimeoutCount,
+        (unsigned int)s_panelRestartCount,
+        (unsigned int)s_replayBypassCount,
+        (unsigned int)s_vsyncCount,
+        s_lastUiWifiConnected ? 1 : 0,
+        s_lastUiBtConnected ? 1 : 0,
+        (int)s_lastUiObdStatus,
+        (unsigned int)s_cpuFilteredUsage0,
+        (unsigned int)s_cpuFilteredUsage1
     );
 }
 
@@ -670,6 +885,10 @@ static bool sample_cpu_usage(uint8_t* core0_usage, uint8_t* core1_usage)
 
 static void apply_shared_ui_state(const UiSharedState& s)
 {
+    s_lastUiWifiConnected = s.wifiConnected;
+    s_lastUiBtConnected = s.btConnected;
+    s_lastUiObdStatus = s.obdStatus;
+
     if (s.wifiConnected) update_wifi_icon_connected(s.wifiRssi);
     else update_wifi_icon_disconnected();
 
@@ -1011,6 +1230,26 @@ static bool IRAM_ATTR on_vsync_callback_common(
     LV_UNUSED(panel);
     SemaphoreHandle_t sem = (SemaphoreHandle_t)user_ctx;
     if (!sem) return false;
+    uint32_t nowUs = (uint32_t)esp_timer_get_time();
+    uint32_t lastUs = s_vsyncLastUs;
+    if (lastUs != 0U) {
+        uint32_t deltaUs = nowUs - lastUs;
+        s_perfVsyncDeltaCount = s_perfVsyncDeltaCount + 1U;
+        s_perfVsyncDeltaTotalUs += deltaUs;
+        if (deltaUs < s_perfVsyncDeltaMinUs) {
+            s_perfVsyncDeltaMinUs = deltaUs;
+        }
+        if (deltaUs > s_perfVsyncDeltaMaxUs) {
+            s_perfVsyncDeltaMaxUs = deltaUs;
+        }
+        uint32_t jitterUs = (deltaUs > DISPLAY_FRAME_PERIOD_US) ?
+                            (deltaUs - DISPLAY_FRAME_PERIOD_US) :
+                            (DISPLAY_FRAME_PERIOD_US - deltaUs);
+        if (jitterUs > s_perfVsyncJitterMaxUs) {
+            s_perfVsyncJitterMaxUs = jitterUs;
+        }
+    }
+    s_vsyncLastUs = nowUs;
     s_vsyncCount++;
     BaseType_t high_task_wakeup = pdFALSE;
     xSemaphoreGiveFromISR(sem, &high_task_wakeup);
@@ -1395,21 +1634,25 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
     if (self && self->gfx) {
         if (!s_usePseudoDoubleBuffer) {
             // Single-FB path: align write burst to frame boundary.
-            if (!s_flushFrameStarted && s_vsyncSem) {
-                uint32_t before = s_vsyncCount;
-                xSemaphoreTake(s_vsyncSem, 0);
-                TickType_t t0 = xTaskGetTickCount();
-                while (s_vsyncCount == before &&
-                       (xTaskGetTickCount() - t0) < pdMS_TO_TICKS(DISPLAY_VSYNC_WAIT_BUDGET_MS)) {
-                    xSemaphoreTake(s_vsyncSem, pdMS_TO_TICKS(2));
-                }
+            if (!s_flushFrameStarted) {
                 s_flushFrameStarted = true;
+                s_flushFrameDirtyPixels = 0;
+                if (s_vsyncSem) {
+                    uint32_t before = s_vsyncCount;
+                    xSemaphoreTake(s_vsyncSem, 0);
+                    TickType_t t0 = xTaskGetTickCount();
+                    while (s_vsyncCount == before &&
+                           (xTaskGetTickCount() - t0) < pdMS_TO_TICKS(DISPLAY_VSYNC_WAIT_BUDGET_MS)) {
+                        xSemaphoreTake(s_vsyncSem, pdMS_TO_TICKS(2));
+                    }
+                }
             }
 
             uint16_t* fb = self->_fb_buf[0];
             if (fb) {
                 uint32_t w = lv_area_get_width(area);
                 uint32_t h = lv_area_get_height(area);
+                s_flushFrameDirtyPixels += (w * h);
                 uint16_t* src = (uint16_t*)color_p;
                 size_t rowBytes = w * sizeof(uint16_t);
                 uint32_t copyStartUs = (uint32_t)esp_timer_get_time();
@@ -1454,6 +1697,7 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
                 if (copyUs > s_singleFlushMaxCopyUs) {
                     s_singleFlushMaxCopyUs = copyUs;
                 }
+                perf_note_copy_time(copyUs);
             } else if (!s_loggedNullFrontFb) {
                 s_loggedNullFrontFb = true;
                 display_serial_println("[DisplayMgr] Warning: front FB is null in flush");
@@ -1463,6 +1707,7 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
                 s_swapReqCount++;
                 s_swapDoneCount++;
                 s_singleFlushFrameCount++;
+                perf_note_frame_dirty(s_flushFrameDirtyPixels);
                 s_flushFrameStarted = false;
             }
 
@@ -1475,6 +1720,7 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
             s_frameHasFullRefreshArea = false;
             s_frameStartedFromSceneReset = s_sceneResetPending;
             s_dirtyAreaCount = 0;
+            s_flushFrameDirtyPixels = 0;
         }
 
         bool isFullFrame =
@@ -1497,6 +1743,7 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
                     uint16_t* front = self->_fb_buf[self->_frontFbIndex];
                     uint16_t* back = self->_fb_buf[self->_backFbIndex];
                     if (front && back) {
+                        uint32_t resyncStartUs = (uint32_t)esp_timer_get_time();
                         if (s_sceneResetPending) {
                             // Scene transition (e.g., splash->gauge): don't reuse old frame.
                             memset(back, 0, self->_fb_pixels * sizeof(uint16_t));
@@ -1506,6 +1753,8 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
                             display_diag_log("resync-front-to-back");
                         }
                         cache_writeback_span(back, self->_fb_pixels * sizeof(uint16_t));
+                        uint32_t copyUs = (uint32_t)((uint64_t)esp_timer_get_time() - (uint64_t)resyncStartUs);
+                        perf_note_copy_time(copyUs);
                     }
                     s_backBufferSynced = true;
                     s_sceneResetPending = false;
@@ -1516,11 +1765,14 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
             add_dirty_area_merged(&writeArea);
         }
 
+        uint32_t w = lv_area_get_width(area);
+        uint32_t h = lv_area_get_height(area);
+        s_flushFrameDirtyPixels += (w * h);
+
         uint16_t* fb = self->_fb_buf[self->_backFbIndex];
         if (fb) {
-            uint32_t w = lv_area_get_width(area);
-            uint32_t h = lv_area_get_height(area);
             uint16_t* src = (uint16_t*)color_p;
+            uint32_t copyStartUs = (uint32_t)esp_timer_get_time();
             if (!DISPLAY_ROTATE_180) {
                 for (uint32_t y = 0; y < h; ++y) {
                     size_t dstOff = (size_t)(area->y1 + y) * SCREEN_WIDTH + (size_t)area->x1;
@@ -1538,6 +1790,8 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
                 }
             }
             cache_writeback_area(fb, &writeArea);
+            uint32_t copyUs = (uint32_t)((uint64_t)esp_timer_get_time() - (uint64_t)copyStartUs);
+            perf_note_copy_time(copyUs);
         } else if (!s_loggedNullBackFb) {
             s_loggedNullBackFb = true;
             display_serial_println("[DisplayMgr] Warning: back FB is null in flush");
@@ -1574,8 +1828,11 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
                 uint16_t* front = self->_fb_buf[self->_frontFbIndex];
                 uint16_t* back = self->_fb_buf[self->_backFbIndex];
                 if (front && back) {
+                    uint32_t resyncStartUs = (uint32_t)esp_timer_get_time();
                     memcpy(back, front, self->_fb_pixels * sizeof(uint16_t));
                     cache_writeback_span(back, self->_fb_pixels * sizeof(uint16_t));
+                    uint32_t copyUs = (uint32_t)((uint64_t)esp_timer_get_time() - (uint64_t)resyncStartUs);
+                    perf_note_copy_time(copyUs);
                 }
                 s_backBufferSynced = true;
                 s_dirtyAreaCount = 0;
@@ -1608,6 +1865,13 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
             for (uint8_t i = 0; i < s_dirtyAreaCount; ++i) {
                 dirtyPixels += area_pixels(&s_dirtyAreas[i]);
             }
+            uint32_t frameDirtyPixels = s_flushFrameDirtyPixels;
+            if ((s_frameHasFullRefreshArea || s_frameStartedFromSceneReset) &&
+                frameDirtyPixels < self->_fb_pixels) {
+                frameDirtyPixels = self->_fb_pixels;
+            }
+            perf_note_frame_dirty(frameDirtyPixels);
+
             if (s_splashActive) {
                 // During splash GIF playback we prefer decoder cadence over keeping
                 // both full-screen framebuffers identical on every frame. Scene reset
@@ -1622,11 +1886,11 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
             }
             const uint32_t replayThresholdPixels = (SCREEN_WIDTH * SCREEN_HEIGHT * 35U) / 100U;
             bool doPeriodicFullSync = false;
-            if (PERIODIC_FULL_SYNC_INTERVAL_FRAMES > 0U) {
-                s_successfulPseudoSwapFrameCount++;
-                doPeriodicFullSync =
-                    (s_successfulPseudoSwapFrameCount % PERIODIC_FULL_SYNC_INTERVAL_FRAMES) == 0U;
-            }
+#if DISPLAY_PERIODIC_FULL_SYNC_INTERVAL > 0U
+            s_successfulPseudoSwapFrameCount++;
+            doPeriodicFullSync =
+                (s_successfulPseudoSwapFrameCount % PERIODIC_FULL_SYNC_INTERVAL_FRAMES) == 0U;
+#endif
             bool doFullSync =
                 s_frameHasFullRefreshArea ||
                 s_frameStartedFromSceneReset ||
@@ -1637,30 +1901,43 @@ void DisplayMgr::lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_col
             uint16_t* back = self->_fb_buf[self->_backFbIndex];
             if (front && back) {
                 if (doFullSync) {
+                    uint32_t syncStartUs = (uint32_t)esp_timer_get_time();
                     memcpy(back, front, self->_fb_pixels * sizeof(uint16_t));
                     cache_writeback_span(back, self->_fb_pixels * sizeof(uint16_t));
+                    uint32_t copyUs = (uint32_t)((uint64_t)esp_timer_get_time() - (uint64_t)syncStartUs);
+                    perf_note_copy_time(copyUs);
 
                     if (s_frameHasFullRefreshArea) {
+                        perf_note_full_sync(DISPLAY_PERF_FULL_SYNC_FULLFRAME);
                         display_diag_log("fullframe-full-sync");
                     } else if (s_frameStartedFromSceneReset) {
+                        perf_note_full_sync(DISPLAY_PERF_FULL_SYNC_SCENE_RESET);
                         display_diag_log("scene-reset-full-sync");
                     } else if (doPeriodicFullSync) {
+                        perf_note_full_sync(DISPLAY_PERF_FULL_SYNC_PERIODIC);
                         display_diag_log("periodic-full-sync");
                     } else {
+                        perf_note_full_sync(DISPLAY_PERF_FULL_SYNC_THRESHOLD);
                         display_diag_log("threshold-full-sync");
                     }
                 } else {
                     // Replay this frame's dirty regions into the new back buffer so
                     // the next partial frame always starts from identical content.
-                    for (uint8_t i = 0; i < s_dirtyAreaCount; ++i) {
-                        const lv_area_t* a = &s_dirtyAreas[i];
-                        uint32_t w = lv_area_get_width(a);
-                        uint32_t h = lv_area_get_height(a);
-                        for (uint32_t y = 0; y < h; ++y) {
-                            size_t off = (size_t)(a->y1 + y) * SCREEN_WIDTH + (size_t)a->x1;
-                            memcpy(&back[off], &front[off], w * sizeof(uint16_t));
+                    if (s_dirtyAreaCount > 0) {
+                        uint32_t replayStartUs = (uint32_t)esp_timer_get_time();
+                        for (uint8_t i = 0; i < s_dirtyAreaCount; ++i) {
+                            const lv_area_t* a = &s_dirtyAreas[i];
+                            uint32_t w = lv_area_get_width(a);
+                            uint32_t h = lv_area_get_height(a);
+                            for (uint32_t y = 0; y < h; ++y) {
+                                size_t off = (size_t)(a->y1 + y) * SCREEN_WIDTH + (size_t)a->x1;
+                                memcpy(&back[off], &front[off], w * sizeof(uint16_t));
+                            }
+                            cache_writeback_area(back, a);
                         }
-                        cache_writeback_area(back, a);
+                        uint32_t copyUs = (uint32_t)((uint64_t)esp_timer_get_time() - (uint64_t)replayStartUs);
+                        perf_note_copy_time(copyUs);
+                        s_perfReplayCount++;
                     }
                 }
                 s_backBufferSynced = true;
@@ -2160,17 +2437,43 @@ void DisplayMgr::HandleLvglTask(void *pvParameters)
     TickType_t lastMonTick = now;
     TickType_t lastUiTick = now;
     TickType_t lastSyncLogTick = now;
+    TickType_t lastPerfStatsTick = now;
+    uint32_t lastLoopMs = (uint32_t)(esp_timer_get_time() / 1000ULL);
     bool prevDebugBusy = false;
     display_serial_println("[DisplayMgr] LvglTask started");
 
     while (true) {
+        uint32_t loopNowMs = (uint32_t)(esp_timer_get_time() / 1000ULL);
+        uint32_t loopGapMs = loopNowMs - lastLoopMs;
+        lastLoopMs = loopNowMs;
+        if (loopGapMs >= LVGL_LOOP_GAP_WARN_MS) {
+            s_perfLvglLoopGapCount++;
+            if (loopGapMs > s_perfLvglLoopGapMaxMs) {
+                s_perfLvglLoopGapMaxMs = loopGapMs;
+            }
+            if (loopGapMs >= LVGL_LOOP_GAP_LOG_MS) {
+                display_jitter_log("loop-gap", loopGapMs, 0, s_lvglLockFailStreak);
+            }
+        }
+
         TickType_t sleepTicks = pdMS_TO_TICKS(LVGL_TASK_LOCK_FAIL_SLEEP_MS);
         if (sleepTicks == 0) {
             sleepTicks = 1;
         }
 
         if (system->LockLvgl(pdMS_TO_TICKS(5))) {
+            s_lvglLockFailStreak = 0;
+            uint32_t handlerStartUs = (uint32_t)esp_timer_get_time();
             uint32_t nextDelayMs = lv_timer_handler();
+            uint32_t handlerUs = (uint32_t)((uint64_t)esp_timer_get_time() - (uint64_t)handlerStartUs);
+            if (handlerUs > s_perfLvglHandlerMaxUs) {
+                s_perfLvglHandlerMaxUs = handlerUs;
+            }
+            if (handlerUs >= LVGL_HANDLER_SLOW_US) {
+                s_perfLvglHandlerSlowCount++;
+                display_jitter_log("handler-slow", loopGapMs, handlerUs, 0);
+            }
+
             if (s_forceFullInvalidatePending && !s_splashActive) {
                 lv_obj_t* screen = lv_scr_act();
                 if (screen) {
@@ -2221,6 +2524,10 @@ void DisplayMgr::HandleLvglTask(void *pvParameters)
                 s_singleFlushMaxCopyUs = 0;
                 lastSyncLogTick = now;
             }
+            if ((now - lastPerfStatsTick) >= DISPLAY_PERF_STATS_PERIOD_TICKS) {
+                display_perf_stats_log();
+                lastPerfStatsTick = now;
+            }
             prevDebugBusy = debugBusy;
 
             system->UnlockLvgl();
@@ -2235,6 +2542,15 @@ void DisplayMgr::HandleLvglTask(void *pvParameters)
             }
             if (sleepTicks == 0) {
                 sleepTicks = 1;
+            }
+        } else {
+            s_perfLvglLockFailCount++;
+            s_lvglLockFailStreak++;
+            if (s_lvglLockFailStreak > s_perfLvglLockFailMaxStreak) {
+                s_perfLvglLockFailMaxStreak = s_lvglLockFailStreak;
+            }
+            if ((s_lvglLockFailStreak % 8U) == 0U) {
+                display_jitter_log("lvgl-lock-fail", loopGapMs, 0, s_lvglLockFailStreak);
             }
         }
 

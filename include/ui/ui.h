@@ -34,6 +34,7 @@ extern "C" {
 #define OIL_POPUP_BUTTON_HEIGHT 72
 #define OIL_POPUP_BUTTON_GAP 10
 #define OIL_POPUP_PRESS_ZOOM 276
+#define OIL_POPUP_PROMPT_MAX_WIDTH (OIL_POPUP_WIDTH - 60)
 
 #define OIL_POPUP_KEYPAD_WIDTH 540
 #define OIL_POPUP_EDIT_DUE_WIDTH 190
@@ -55,6 +56,9 @@ extern "C" {
 #define OIL_POPUP_KEY_WIDTH 100
 #define OIL_POPUP_KEY_HEIGHT 75
 #define OIL_POPUP_KEY_GAP 10
+#define OIL_REPLACE_TITLE_SCALE 128
+#define OIL_REPLACE_TITLE_X 32
+#define OIL_REPLACE_TITLE_Y 32
 #define OIL_CYCLE_DEFAULT_KM 7000U
 #define OIL_CYCLE_INPUT_MAX 10
 
@@ -104,7 +108,7 @@ extern "C" {
 #define OVERHEAT_SCALE 155
 
 #define COOLANT_COLD_THRESHOLD_C 50
-#define COOLANT_OVERHEAT_THRESHOLD_C 80
+#define COOLANT_OVERHEAT_THRESHOLD_C 110
 
 LV_IMG_DECLARE(needle);
 LV_IMG_DECLARE(coolantGauge);
@@ -130,6 +134,8 @@ LV_IMG_DECLARE(oil_popup_yes);
 LV_IMG_DECLARE(oil_popup_no);
 LV_IMG_DECLARE(oil_popup_edit);
 LV_IMG_DECLARE(oil_popup_due);
+LV_IMG_DECLARE(oil_edit);
+LV_IMG_DECLARE(oil_replace);
 
 typedef struct {
     lv_obj_t * bar;
@@ -168,6 +174,10 @@ void update_bt_icon_disconnected(void);
 void update_obd_icon_connected(void);
 void update_obd_icon_disconnected(void);
 bool ui_reset_service_odo(void);
+bool ui_get_service_odo_km(uint32_t* outKm);
+bool ui_set_service_odo_km(uint32_t serviceKm);
+bool ui_get_service_odo_base_km(uint32_t* outKm, bool* valid);
+bool ui_set_service_odo_base_km(uint32_t baseOdoKm);
 bool ui_get_service_oil_cycle_km(uint32_t* outKm);
 bool ui_set_service_oil_cycle_km(uint32_t cycleKm);
 bool ui_reset_service_oil_cycle_km(void);

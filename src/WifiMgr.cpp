@@ -572,6 +572,11 @@ void WifiMgr::ConnectTask(void* pvParameters)
                      (unsigned int)attemptCount,
                      (unsigned int)slot,
                      ssid);
+            Serial.printf("[WifiMgr][CONNECT] attempt=%u slot=%u ssid=\"%s\" begin status=%d\n",
+                          (unsigned int)attemptCount,
+                          (unsigned int)slot,
+                          ssid,
+                          (int)WiFi.status());
 
             // Ensure previous connecting state is cleared before changing STA config.
             WiFi.disconnect(false, false);
@@ -590,6 +595,12 @@ void WifiMgr::ConnectTask(void* pvParameters)
             }
 
             wl_status_t finalStatus = WiFi.status();
+            Serial.printf("[WifiMgr][CONNECT] attempt=%u slot=%u result_status=%d elapsed_ms=%u rssi=%d\n",
+                          (unsigned int)attemptCount,
+                          (unsigned int)slot,
+                          (int)finalStatus,
+                          (unsigned int)(millis() - beginMs),
+                          (int)WiFi.RSSI());
             if (finalStatus != WL_CONNECTED) {
                 if (finalStatus == WL_NO_SSID_AVAIL) {
                     TEST_LOG("Connect failed (#%u, SSID=\"%s\"): SSID not found",

@@ -173,6 +173,7 @@ private:
     SemaphoreHandle_t _gifMutex = nullptr;
     SemaphoreHandle_t _lvglMutex = nullptr;
     SemaphoreHandle_t _uiStateMutex = nullptr;
+    SemaphoreHandle_t _serviceOdoMutex = nullptr;
 
     DisplayMgr* displayMgr = nullptr;
     StorageMgr* storageMgr = nullptr;
@@ -182,6 +183,12 @@ private:
     WifiMgr* wifiMgr = nullptr;
     GIFMemory gifObj;
     UiSharedState uiState;
+    ServiceOdoState serviceOdoState;
+    bool serviceOdoStateLoaded = false;
+
+    bool LoadServiceOdoState(ServiceOdoState* outState);
+    bool StoreServiceOdoState(const ServiceOdoState& state);
+    bool GetCurrentOrLastOdoKm(uint32_t* outOdoKm);
 
 public:
     static SystemAPI* getInstance()
@@ -234,8 +241,13 @@ public:
     void AppendDisplayLog(const char* line);
     void FinishDisplayLogSession();
     bool RefreshServiceDueFromStorage();
-    bool AddServiceOdoDistance(uint32_t deltaKm, uint32_t* totalOut = nullptr);
+    bool UpdateServiceOdoFromCurrentOdo(uint32_t currentOdoKm, uint32_t* serviceOut = nullptr, bool persistSnapshot = false);
+    bool PersistServiceOdoSnapshot(uint32_t currentOdoKm, uint32_t* serviceOut = nullptr);
     bool ResetServiceOdo();
+    bool GetServiceOdoKm(uint32_t* outKm);
+    bool SetServiceOdoKm(uint32_t serviceKm);
+    bool GetServiceOdoBaseKm(uint32_t* outKm, bool* valid = nullptr);
+    bool SetServiceOdoBaseKm(uint32_t baseOdoKm);
     bool GetServiceOilCycleKm(uint32_t* outKm);
     bool SetServiceOilCycleKm(uint32_t cycleKm);
     bool ResetServiceOilCycleKm();

@@ -10,6 +10,277 @@
 
 static constexpr const char* STORAGE_LOG_DIR = "/log";
 
+enum ServiceOdoCopyState
+{
+    SERVICE_ODO_COPY_MISSING = 0,
+    SERVICE_ODO_COPY_VALID,
+    SERVICE_ODO_COPY_CORRUPT,
+    SERVICE_ODO_COPY_IO_ERROR
+};
+
+static const char* service_odo_copy_state_name(ServiceOdoCopyState state)
+{
+    switch (state) {
+        case SERVICE_ODO_COPY_MISSING: return "missing";
+        case SERVICE_ODO_COPY_VALID: return "valid";
+        case SERVICE_ODO_COPY_CORRUPT: return "corrupt";
+        case SERVICE_ODO_COPY_IO_ERROR: return "io_error";
+        default: return "unknown";
+    }
+}
+
+static ServiceOdoState make_default_service_odo_state()
+{
+    ServiceOdoState state = {};
+    return state;
+}
+
+static bool parse_uint32_text(const char* text, uint32_t* outValue)
+{
+    if (!text || !outValue) return false;
+
+    const unsigned char* p = (const unsigned char*)text;
+    while (*p != '\0' && isspace(*p)) p++;
+    if (!isdigit(*p)) return false;
+
+    uint32_t value = 0;
+    while (isdigit(*p)) {
+        uint32_t digit = (uint32_t)(*p - '0');
+        if (value > (UINT32_MAX - digit) / 10U) return false;
+        value = (value * 10U) + digit;
+        p++;
+    }
+
+    while (*p != '\0') {
+        if (!isspace(*p)) return false;
+        p++;
+    }
+
+    *outValue = value;
+    return true;
+}
+
+static char* trim_in_place(char* text)
+{
+    if (!text) return text;
+
+    while (*text != '\0' && isspace((unsigned char)*text)) text++;
+
+    char* end = text + strlen(text);
+    while (end > text && isspace((unsigned char)*(end - 1))) {
+        end--;
+    }
+    *end = '\0';
+    return text;
+}
+
+static bool parse_service_odo_state_text(char* text, ServiceOdoState* outState)
+{
+    if (!text || !outState) return false;
+
+    ServiceOdoState state = make_default_service_odo_state();
+
+    if (strchr(text, '=') == nullptr) {
+        uint32_t legacyServiceKm = 0;
+        if (!parse_uint32_text(text, &legacyServiceKm)) return false;
+        state.last_service_km = legacyServiceKm;
+        *outState = state;
+        return true;
+    }
+
+    bool versionFound = false;
+    bool baseValidFound = false;
+    bool baseOdoFound = false;
+
+    char* cursor = text;
+    while (cursor && *cursor != '\0') {
+        char* line = cursor;
+        char* next = strpbrk(cursor, "\r\n");
+        if (next) {
+            *next = '\0';
+            cursor = next + 1;
+            while (*cursor == '\r' || *cursor == '\n') cursor++;
+        } else {
+            cursor = nullptr;
+        }
+
+        line = trim_in_place(line);
+        if (line[0] == '\0' || line[0] == '#') continue;
+
+        char* eq = strchr(line, '=');
+        if (!eq) return false;
+        *eq = '\0';
+
+        char* key = trim_in_place(line);
+        char* valueText = trim_in_place(eq + 1);
+        uint32_t value = 0;
+        if (!parse_uint32_text(valueText, &value)) return false;
+
+        if (strcmp(key, "version") == 0) {
+            if (value != 2U) return false;
+            versionFound = true;
+        } else if (strcmp(key, "revision") == 0) {
+            state.revision = value;
+        } else if (strcmp(key, "base_odo_valid") == 0) {
+            if (value > 1U) return false;
+            state.base_odo_valid = (value != 0U);
+            baseValidFound = true;
+        } else if (strcmp(key, "base_odo_km") == 0) {
+            state.base_odo_km = value;
+            baseOdoFound = true;
+        } else if (strcmp(key, "last_seen_odo_km") == 0) {
+            state.last_seen_odo_km = value;
+        } else if (strcmp(key, "last_service_km") == 0) {
+            state.last_service_km = value;
+        }
+    }
+
+    if (!versionFound || !baseValidFound) return false;
+    if (state.base_odo_valid && !baseOdoFound) return false;
+
+    *outState = state;
+    return true;
+}
+
+static bool service_odo_states_equal(const ServiceOdoState& a, const ServiceOdoState& b)
+{
+    return a.revision == b.revision &&
+           a.base_odo_valid == b.base_odo_valid &&
+           a.base_odo_km == b.base_odo_km &&
+           a.last_seen_odo_km == b.last_seen_odo_km &&
+           a.last_service_km == b.last_service_km;
+}
+
+static size_t format_service_odo_state_text(const ServiceOdoState& state, char* out, size_t outLen)
+{
+    if (!out || outLen == 0) return 0;
+
+    int written = snprintf(
+        out,
+        outLen,
+        "version=2\n"
+        "revision=%lu\n"
+        "base_odo_valid=%u\n"
+        "base_odo_km=%lu\n"
+        "last_seen_odo_km=%lu\n"
+        "last_service_km=%lu\n",
+        (unsigned long)state.revision,
+        state.base_odo_valid ? 1U : 0U,
+        (unsigned long)state.base_odo_km,
+        (unsigned long)state.last_seen_odo_km,
+        (unsigned long)state.last_service_km
+    );
+    if (written <= 0 || (size_t)written >= outLen) return 0;
+    return (size_t)written;
+}
+
+static ServiceOdoCopyState read_service_odo_copy(const char* path, ServiceOdoState* outState)
+{
+    if (outState) *outState = make_default_service_odo_state();
+    if (!path || !outState) return SERVICE_ODO_COPY_IO_ERROR;
+    if (!SD.exists(path)) return SERVICE_ODO_COPY_MISSING;
+
+    File f = SD.open(path, FILE_READ);
+    if (!f) return SERVICE_ODO_COPY_IO_ERROR;
+    if (f.isDirectory()) {
+        f.close();
+        return SERVICE_ODO_COPY_IO_ERROR;
+    }
+
+    char buf[192] = {0};
+    size_t len = f.readBytes(buf, sizeof(buf) - 1);
+    bool truncated = f.available() > 0;
+    f.close();
+    buf[len] = '\0';
+
+    if (truncated) return SERVICE_ODO_COPY_CORRUPT;
+    return parse_service_odo_state_text(buf, outState) ? SERVICE_ODO_COPY_VALID : SERVICE_ODO_COPY_CORRUPT;
+}
+
+static bool write_service_odo_copy(const char* path, const ServiceOdoState& state)
+{
+    if (!path) return false;
+    if (SD.exists(path) && !SD.remove(path)) return false;
+
+    char text[192] = {0};
+    size_t len = format_service_odo_state_text(state, text, sizeof(text));
+    if (len == 0) return false;
+
+    File writeFile = SD.open(path, FILE_WRITE);
+    if (!writeFile) return false;
+    size_t written = writeFile.print(text);
+    writeFile.flush();
+    writeFile.close();
+    return written == len;
+}
+
+static bool write_service_odo_mirror_locked(const ServiceOdoState& state)
+{
+    if (!write_service_odo_copy(SERVICE_ODO_BACKUP_FILE_PATH, state)) return false;
+    if (!write_service_odo_copy(SERVICE_ODO_FILE_PATH, state)) return false;
+    return true;
+}
+
+static bool read_service_odo_mirror_locked(ServiceOdoState* outState, bool* repairNeeded)
+{
+    if (!outState) return false;
+    *outState = make_default_service_odo_state();
+    if (repairNeeded) *repairNeeded = false;
+
+    ServiceOdoState primary = make_default_service_odo_state();
+    ServiceOdoState backup = make_default_service_odo_state();
+    ServiceOdoCopyState primaryState = read_service_odo_copy(SERVICE_ODO_FILE_PATH, &primary);
+    ServiceOdoCopyState backupState = read_service_odo_copy(SERVICE_ODO_BACKUP_FILE_PATH, &backup);
+
+    if (primaryState == SERVICE_ODO_COPY_VALID && backupState == SERVICE_ODO_COPY_VALID) {
+        *outState = (backup.revision > primary.revision) ? backup : primary;
+        if (repairNeeded) *repairNeeded = !service_odo_states_equal(primary, backup);
+        if (!service_odo_states_equal(primary, backup)) {
+            TEST_LOG("service odo mirror mismatch primary_rev=%u backup_rev=%u chosen_rev=%u",
+                     (unsigned int)primary.revision,
+                     (unsigned int)backup.revision,
+                     (unsigned int)outState->revision);
+        }
+        return true;
+    }
+
+    if (primaryState == SERVICE_ODO_COPY_VALID) {
+        *outState = primary;
+        if (repairNeeded) *repairNeeded = true;
+        TEST_LOG("service odo primary recovered rev=%u backup_state=%s",
+                 (unsigned int)primary.revision,
+                 service_odo_copy_state_name(backupState));
+        return true;
+    }
+
+    if (backupState == SERVICE_ODO_COPY_VALID) {
+        *outState = backup;
+        if (repairNeeded) *repairNeeded = true;
+        TEST_LOG("service odo backup recovered rev=%u primary_state=%s",
+                 (unsigned int)backup.revision,
+                 service_odo_copy_state_name(primaryState));
+        return true;
+    }
+
+    if (primaryState == SERVICE_ODO_COPY_MISSING && backupState == SERVICE_ODO_COPY_MISSING) {
+        if (repairNeeded) *repairNeeded = true;
+        return true;
+    }
+
+    if (primaryState == SERVICE_ODO_COPY_IO_ERROR || backupState == SERVICE_ODO_COPY_IO_ERROR) {
+        TEST_LOG("service odo mirror read failed primary_state=%s backup_state=%s",
+                 service_odo_copy_state_name(primaryState),
+                 service_odo_copy_state_name(backupState));
+        return false;
+    }
+
+    if (repairNeeded) *repairNeeded = true;
+    TEST_LOG("service odo mirror corrupt primary_state=%s backup_state=%s",
+             service_odo_copy_state_name(primaryState),
+             service_odo_copy_state_name(backupState));
+    return false;
+}
+
 #ifndef FILE_APPEND
 #define FILE_APPEND "a"
 #endif
@@ -373,91 +644,26 @@ bool StorageMgr::EnsureDbDir()
     return ok;
 }
 
-bool StorageMgr::ReadServiceOdoKm(uint32_t* outKm)
+bool StorageMgr::ReadServiceOdoState(ServiceOdoState* outState)
 {
-    if (!outKm) return false;
-    *outKm = 0;
+    if (!outState) return false;
+    *outState = make_default_service_odo_state();
     if (_logMutex == nullptr) return false;
     if (xSemaphoreTake(_logMutex, pdMS_TO_TICKS(120)) != pdTRUE) return false;
 
     bool ok = false;
     do {
         if (!EnsureDbDir()) break;
-        if (!SD.exists(SERVICE_ODO_FILE_PATH)) {
-            ok = true;
-            break;
-        }
 
-        File f = SD.open(SERVICE_ODO_FILE_PATH, FILE_READ);
-        if (!f) break;
-        if (f.isDirectory()) {
-            f.close();
-            break;
-        }
-
-        char buf[32] = {0};
-        size_t len = f.readBytes(buf, sizeof(buf) - 1);
-        f.close();
-        buf[len] = '\0';
-
-        char* end = nullptr;
-        unsigned long value = strtoul(buf, &end, 10);
-        if (end == buf) break;
-
-        *outKm = (uint32_t)value;
-        ok = true;
-    } while (false);
-
-    xSemaphoreGive(_logMutex);
-    return ok;
-}
-
-bool StorageMgr::AddServiceOdoKm(uint32_t deltaKm, uint32_t* totalOut)
-{
-    if (totalOut) *totalOut = 0;
-    if (_logMutex == nullptr) return false;
-    if (xSemaphoreTake(_logMutex, pdMS_TO_TICKS(180)) != pdTRUE) return false;
-
-    bool ok = false;
-    uint32_t total = 0;
-    do {
-        if (!EnsureDbDir()) break;
-
-        if (SD.exists(SERVICE_ODO_FILE_PATH)) {
-            File readFile = SD.open(SERVICE_ODO_FILE_PATH, FILE_READ);
-            if (!readFile) break;
-            if (readFile.isDirectory()) {
-                readFile.close();
-                break;
+        bool repairNeeded = false;
+        if (!read_service_odo_mirror_locked(outState, &repairNeeded)) break;
+        if (repairNeeded) {
+            if (write_service_odo_mirror_locked(*outState)) {
+                TEST_LOG("service odo mirror repaired rev=%u", (unsigned int)outState->revision);
+            } else {
+                TEST_LOG("service odo mirror repair failed rev=%u", (unsigned int)outState->revision);
             }
-
-            char buf[32] = {0};
-            size_t len = readFile.readBytes(buf, sizeof(buf) - 1);
-            readFile.close();
-            buf[len] = '\0';
-
-            char* end = nullptr;
-            unsigned long value = strtoul(buf, &end, 10);
-            if (end == buf) break;
-            total = (uint32_t)value;
         }
-
-        if (UINT32_MAX - total < deltaKm) total = UINT32_MAX;
-        else total += deltaKm;
-
-        if (SD.exists(SERVICE_ODO_FILE_PATH) && !SD.remove(SERVICE_ODO_FILE_PATH)) {
-            break;
-        }
-
-        File writeFile = SD.open(SERVICE_ODO_FILE_PATH, FILE_WRITE);
-        if (!writeFile) break;
-        writeFile.print(total);
-        writeFile.close();
-
-        if (totalOut) *totalOut = total;
-        TEST_LOG("service odo updated delta=%u total=%u",
-                 (unsigned int)deltaKm,
-                 (unsigned int)total);
         ok = true;
     } while (false);
 
@@ -465,32 +671,37 @@ bool StorageMgr::AddServiceOdoKm(uint32_t deltaKm, uint32_t* totalOut)
     return ok;
 }
 
-bool StorageMgr::ResetServiceOdoKm(uint32_t* totalOut)
+bool StorageMgr::WriteServiceOdoState(const ServiceOdoState& state)
 {
-    if (totalOut) *totalOut = 0;
     if (_logMutex == nullptr) return false;
     if (xSemaphoreTake(_logMutex, pdMS_TO_TICKS(180)) != pdTRUE) return false;
 
     bool ok = false;
     do {
         if (!EnsureDbDir()) break;
-
-        if (SD.exists(SERVICE_ODO_FILE_PATH) && !SD.remove(SERVICE_ODO_FILE_PATH)) {
-            break;
-        }
-
-        File writeFile = SD.open(SERVICE_ODO_FILE_PATH, FILE_WRITE);
-        if (!writeFile) break;
-        writeFile.print(0);
-        writeFile.close();
-
-        if (totalOut) *totalOut = 0;
-        TEST_LOG("service odo reset");
+        if (!write_service_odo_mirror_locked(state)) break;
+        TEST_LOG("service odo state updated rev=%u acc_valid=%d source_base=%u last_seen=%u service=%u",
+                 (unsigned int)state.revision,
+                 state.base_odo_valid ? 1 : 0,
+                 (unsigned int)state.base_odo_km,
+                 (unsigned int)state.last_seen_odo_km,
+                 (unsigned int)state.last_service_km);
         ok = true;
     } while (false);
 
     xSemaphoreGive(_logMutex);
     return ok;
+}
+
+bool StorageMgr::ReadServiceOdoKm(uint32_t* outKm)
+{
+    if (!outKm) return false;
+    *outKm = 0;
+
+    ServiceOdoState state = {};
+    if (!ReadServiceOdoState(&state)) return false;
+    *outKm = state.last_service_km;
+    return true;
 }
 
 bool StorageMgr::ReadServiceOilCycleKm(uint32_t* outKm)

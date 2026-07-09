@@ -11,9 +11,21 @@
 
 static constexpr const char* SERVICE_ODO_DIR = "/db";
 static constexpr const char* SERVICE_ODO_FILE_PATH = "/db/odo.txt";
+static constexpr const char* SERVICE_ODO_BACKUP_FILE_PATH = "/db/odo.bak";
 static constexpr const char* SERVICE_OIL_CYCLE_FILE_PATH = "/db/oil_cycle.txt";
 static constexpr uint32_t SERVICE_OIL_CYCLE_DEFAULT_KM = 7000U;
 static constexpr uint32_t SERVICE_ODO_THRESHOLD_KM = SERVICE_OIL_CYCLE_DEFAULT_KM;
+
+struct ServiceOdoState
+{
+    uint32_t revision = 0;
+    // Retained for v2 file compatibility; service life now uses last_service_km.
+    bool base_odo_valid = false;
+    uint32_t base_odo_km = 0;
+    // Last raw source counter and accumulated distance since oil replacement.
+    uint32_t last_seen_odo_km = 0;
+    uint32_t last_service_km = 0;
+};
 
 struct GIFMemory
 {
@@ -68,9 +80,9 @@ class StorageMgr
         File SDOpen(const char* path, const char* mode = "r");
         size_t SDReadAll(const char* path, uint8_t* buffer, size_t maxLen);
         bool SDRemove(const char* path);
+        bool ReadServiceOdoState(ServiceOdoState* outState);
+        bool WriteServiceOdoState(const ServiceOdoState& state);
         bool ReadServiceOdoKm(uint32_t* outKm);
-        bool AddServiceOdoKm(uint32_t deltaKm, uint32_t* totalOut = nullptr);
-        bool ResetServiceOdoKm(uint32_t* totalOut = nullptr);
         bool ReadServiceOilCycleKm(uint32_t* outKm);
         bool WriteServiceOilCycleKm(uint32_t cycleKm, uint32_t* writtenOut = nullptr);
         bool ResetServiceOilCycleKm(uint32_t* writtenOut = nullptr);

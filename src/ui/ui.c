@@ -4,6 +4,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 
+#ifndef UI_DEBUG_SCREEN_ENABLED
+#define UI_DEBUG_SCREEN_ENABLED 0
+#endif
+
 static lv_obj_t * target_needle = NULL;
 static lv_obj_t * target_batt_needle = NULL;
 static lv_obj_t * icon_bt = NULL;
@@ -36,8 +40,11 @@ static lv_timer_t * oil_life_ceremony_timer = NULL;
 static bool oil_life_ceremony_active = false;
 static uint32_t oil_life_ceremony_start_ms = 0;
 static int32_t oil_percent_requested_value = 100;
+static int32_t oil_percent_rendered_value = -1;
 static char oil_cycle_input_text[OIL_CYCLE_INPUT_MAX + 1] = "7000";
 static bool oil_cycle_input_replace_on_next_digit = false;
+static bool oil_popup_replace_mode = false;
+static bool oil_touch_long_pressed = false;
 
 static monitor_item_t cpu_core1, cpu_core2, ram_usage;
 static lv_timer_t * monitor_ceremony_timer = NULL;
@@ -130,9 +137,13 @@ static lv_obj_t * create_oil_popup_button_base(lv_obj_t * parent, int32_t width,
 static lv_obj_t * create_oil_popup_image_button(lv_obj_t * parent, const void * label_src, lv_color_t bg_color, lv_color_t border_color);
 static lv_obj_t * create_oil_popup_text_button(lv_obj_t * parent, const char * text, int32_t width, int32_t height, lv_color_t bg_color, lv_color_t border_color, const lv_font_t * font);
 static void show_oil_popup(void);
+static void show_oil_popup_with_mode(bool edit_mode, bool replace_mode);
+static void show_oil_replace_popup(bool edit_mode);
 static void show_oil_popup_confirm_content(lv_obj_t * popup);
 static void show_oil_popup_edit_content(lv_obj_t * popup);
+static void oil_touch_area_pressed_event_cb(lv_event_t * e);
 static void oil_touch_area_event_cb(lv_event_t * e);
+static void oil_touch_area_long_press_event_cb(lv_event_t * e);
 static void start_oil_life_ceremony(void);
 static void finish_oil_life_ceremony(void);
 static void oil_life_ceremony_timer_cb(lv_timer_t * t);
@@ -463,12 +474,20 @@ static QueueHandle_t get_debug_log_queue(void)
 
 bool ui_debug_log_capture_enabled(void)
 {
+#if UI_DEBUG_SCREEN_ENABLED
     return debug_screen_visible;
+#else
+    return false;
+#endif
 }
 
 bool ui_debug_overlay_animating(void)
 {
+#if UI_DEBUG_SCREEN_ENABLED
     return debug_animation_active;
+#else
+    return false;
+#endif
 }
 
 static void debug_log_queue_clear(void)
@@ -502,6 +521,10 @@ static void debug_log_queue_push_line(const char* line)
 
 void ui_debug_log_enqueue(const char* line)
 {
+#if !UI_DEBUG_SCREEN_ENABLED
+    LV_UNUSED(line);
+    return;
+#else
     if (!line || line[0] == '\0') return;
     if (!ui_debug_log_capture_enabled()) return;
     uint16_t dropped_report = 0;
@@ -513,6 +536,7 @@ void ui_debug_log_enqueue(const char* line)
     }
     if (!allow) return;
     debug_log_queue_push_line(line);
+#endif
 }
 
 static void debug_log_flush_timer_cb(lv_timer_t * t)
@@ -568,6 +592,19 @@ static int32_t needle_abs_delta(int32_t a, int32_t b)
 {
     int32_t delta = a - b;
     return (delta < 0) ? -delta : delta;
+}
+
+static bool label_text_matches(lv_obj_t * label, const char * text)
+{
+    if (!label || !text) return false;
+    const char * current = lv_label_get_text(label);
+    return current && strcmp(current, text) == 0;
+}
+
+static void format_percent_text(char * out, size_t out_len, int32_t value)
+{
+    if (!out || out_len == 0) return;
+    snprintf(out, out_len, "%d%%", (int)value);
 }
 
 static int32_t needle_shortest_angle_delta(int32_t start_angle, int32_t target_angle)
@@ -634,8 +671,19 @@ static void set_monitor_item_instant(monitor_item_t * item, int32_t usage)
     if (!item || !item->bar || !item->label_val) return;
     if (usage < 0) usage = 0;
     if (usage > 100) usage = 100;
-    lv_bar_set_value(item->bar, usage, LV_ANIM_OFF);
-    lv_label_set_text_fmt(item->label_val, "%d%%", usage);
+
+    char text[8];
+    format_percent_text(text, sizeof(text), usage);
+    bool barSame = (lv_bar_get_value(item->bar) == usage);
+    bool labelSame = label_text_matches(item->label_val, text);
+    if (barSame && labelSame) return;
+
+    if (!barSame) {
+        lv_bar_set_value(item->bar, usage, LV_ANIM_OFF);
+    }
+    if (!labelSame) {
+        lv_label_set_text(item->label_val, text);
+    }
 }
 
 static void monitor_ceremony_timer_cb(lv_timer_t * t)
@@ -845,22 +893,36 @@ static void set_coolant_gauge_instant(int32_t val)
 {
     if (!target_needle) return;
     val = clamp_coolant(val);
+    int16_t target_angle = (int16_t)(coolant_to_angle(val) % 3600);
+    if (coolant_rendered_value == val &&
+        !coolant_needle_animating &&
+        !coolant_pending_valid &&
+        lv_img_get_angle(target_needle) == (uint16_t)target_angle) {
+        return;
+    }
     coolant_needle_animating = false;
     coolant_pending_valid = false;
     coolant_rendered_value = val;
     lv_anim_del(target_needle, (lv_anim_exec_xcb_t)needle_anim_exec_cb);
-    lv_img_set_angle(target_needle, (int16_t)(coolant_to_angle(val) % 3600));
+    lv_img_set_angle(target_needle, target_angle);
 }
 
 static void set_battery_gauge_instant(int32_t val)
 {
     if (!target_batt_needle) return;
     val = clamp_battery(val);
+    int16_t target_angle = (int16_t)(battery_to_angle(val) % 3600);
+    if (battery_rendered_value == val &&
+        !battery_needle_animating &&
+        !battery_pending_valid &&
+        lv_img_get_angle(target_batt_needle) == (uint16_t)target_angle) {
+        return;
+    }
     battery_needle_animating = false;
     battery_pending_valid = false;
     battery_rendered_value = val;
     lv_anim_del(target_batt_needle, (lv_anim_exec_xcb_t)needle_anim_exec_cb);
-    lv_img_set_angle(target_batt_needle, (int16_t)(battery_to_angle(val) % 3600));
+    lv_img_set_angle(target_batt_needle, target_angle);
 }
 
 static void apply_coolant_gauge_value(int32_t val, bool force_anim)
@@ -1125,6 +1187,7 @@ static void close_oil_popup_overlay(lv_obj_t * overlay)
     if (!overlay) return;
     if (overlay == oil_popup_overlay) {
         oil_popup_overlay = NULL;
+        oil_popup_replace_mode = false;
         reset_oil_popup_content_refs();
     }
     lv_obj_del_async(overlay);
@@ -1139,6 +1202,12 @@ static void oil_popup_yes_button_event_cb(lv_event_t * e)
 {
     lv_obj_t * overlay = (lv_obj_t *)lv_event_get_user_data(e);
     if (!overlay) return;
+
+    if (oil_popup_replace_mode) {
+        lv_obj_t * popup = lv_obj_get_child(overlay, 0);
+        if (popup) show_oil_popup_edit_content(popup);
+        return;
+    }
 
     bool cycle_reset = ui_reset_service_oil_cycle_km();
     bool odo_reset = ui_reset_service_odo();
@@ -1231,6 +1300,51 @@ static lv_obj_t * create_oil_popup_text_button(lv_obj_t * parent, const char * t
     return button;
 }
 
+static int32_t oil_popup_img_scaled_w(const lv_img_dsc_t * src, int32_t zoom)
+{
+    return src ? ((int32_t)src->header.w * zoom) / 256 : 0;
+}
+
+static int32_t oil_popup_img_scaled_h(const lv_img_dsc_t * src, int32_t zoom)
+{
+    return src ? ((int32_t)src->header.h * zoom) / 256 : 0;
+}
+
+static void place_oil_popup_replace_prompt(lv_obj_t * prompt, const lv_img_dsc_t * src)
+{
+    if (!prompt || !src) return;
+
+    int32_t zoom = 256;
+    int32_t w = oil_popup_img_scaled_w(src, zoom);
+    if (w > OIL_POPUP_PROMPT_MAX_WIDTH) {
+        zoom = (OIL_POPUP_PROMPT_MAX_WIDTH * 256) / (int32_t)src->header.w;
+        if (zoom < 1) zoom = 1;
+    }
+
+    w = oil_popup_img_scaled_w(src, zoom);
+    int32_t h = oil_popup_img_scaled_h(src, zoom);
+    lv_img_set_pivot(prompt, 0, 0);
+    lv_img_set_zoom(prompt, (uint16_t)zoom);
+    lv_obj_set_pos(
+        prompt,
+        (OIL_POPUP_WIDTH - w) / 2,
+        ((OIL_POPUP_HEIGHT - h) / 2) - 42
+    );
+}
+
+static void place_oil_popup_edit_title(lv_obj_t * title, const lv_img_dsc_t * src)
+{
+    if (!title || !src) return;
+
+    if (oil_popup_replace_mode) {
+        lv_img_set_pivot(title, 0, 0);
+        lv_img_set_zoom(title, OIL_REPLACE_TITLE_SCALE);
+        lv_obj_set_pos(title, OIL_REPLACE_TITLE_X, OIL_REPLACE_TITLE_Y);
+    } else {
+        lv_obj_align(title, LV_ALIGN_TOP_MID, OIL_POPUP_EDIT_DUE_X_OFFSET, OIL_POPUP_EDIT_DUE_Y);
+    }
+}
+
 static void update_oil_cycle_input_label(void)
 {
     if (oil_cycle_input_label) {
@@ -1268,8 +1382,12 @@ static void oil_popup_clear_button_event_cb(lv_event_t * e)
 static void oil_popup_ok_button_event_cb(lv_event_t * e)
 {
     lv_obj_t * overlay = (lv_obj_t *)lv_event_get_user_data(e);
-    uint32_t cycleKm = (uint32_t)strtoul(oil_cycle_input_text, NULL, 10);
-    ui_set_service_oil_cycle_km(cycleKm);
+    uint32_t inputKm = (uint32_t)strtoul(oil_cycle_input_text, NULL, 10);
+    if (oil_popup_replace_mode) {
+        ui_set_service_odo_km(inputKm);
+    } else {
+        ui_set_service_oil_cycle_km(inputKm);
+    }
     close_oil_popup_overlay(overlay);
 }
 
@@ -1291,12 +1409,21 @@ static void set_oil_percent_display(int32_t percent, lv_anim_enable_t anim)
 {
     percent = clamp_percent(percent);
 
-    if (oil_percent_label) {
-        lv_label_set_text_fmt(oil_percent_label, "%d%%", (int)percent);
+    char text[8];
+    format_percent_text(text, sizeof(text), percent);
+    bool labelSame = (!oil_percent_label || label_text_matches(oil_percent_label, text));
+    bool barSame = (!oil_life_bar || lv_bar_get_value(oil_life_bar) == percent);
+    if (oil_percent_rendered_value == percent && labelSame && barSame) {
+        return;
     }
-    if (oil_life_bar) {
+
+    if (oil_percent_label && !labelSame) {
+        lv_label_set_text(oil_percent_label, text);
+    }
+    if (oil_life_bar && !barSame) {
         lv_bar_set_value(oil_life_bar, percent, anim);
     }
+    oil_percent_rendered_value = percent;
 }
 
 void update_oil_percent(int32_t percent)
@@ -1373,8 +1500,13 @@ static void show_oil_popup_confirm_content(lv_obj_t * popup)
     lv_obj_clean(popup);
 
     lv_obj_t * prompt = lv_img_create(popup);
-    lv_img_set_src(prompt, &oil_reset_prompt);
-    lv_obj_align(prompt, LV_ALIGN_CENTER, 0, -42);
+    const lv_img_dsc_t * prompt_src = oil_popup_replace_mode ? &oil_edit : &oil_reset_prompt;
+    lv_img_set_src(prompt, prompt_src);
+    if (oil_popup_replace_mode) {
+        place_oil_popup_replace_prompt(prompt, prompt_src);
+    } else {
+        lv_obj_align(prompt, LV_ALIGN_CENTER, 0, -42);
+    }
 
     lv_obj_t * button_row = lv_obj_create(popup);
     lv_obj_set_size(button_row, lv_pct(100), 90);
@@ -1418,14 +1550,21 @@ static void show_oil_popup_edit_content(lv_obj_t * popup)
     reset_oil_popup_content_refs();
     lv_obj_clean(popup);
 
-    uint32_t cycleKm = OIL_CYCLE_DEFAULT_KM;
-    ui_get_service_oil_cycle_km(&cycleKm);
-    snprintf(oil_cycle_input_text, sizeof(oil_cycle_input_text), "%lu", (unsigned long)cycleKm);
+    uint32_t inputKm = OIL_CYCLE_DEFAULT_KM;
+    if (oil_popup_replace_mode) {
+        if (!ui_get_service_odo_km(&inputKm)) {
+            inputKm = 0;
+        }
+    } else {
+        ui_get_service_oil_cycle_km(&inputKm);
+    }
+    snprintf(oil_cycle_input_text, sizeof(oil_cycle_input_text), "%lu", (unsigned long)inputKm);
     oil_cycle_input_replace_on_next_digit = true;
 
     lv_obj_t * due_img = lv_img_create(popup);
-    lv_img_set_src(due_img, &oil_popup_due);
-    lv_obj_align(due_img, LV_ALIGN_TOP_MID, OIL_POPUP_EDIT_DUE_X_OFFSET, OIL_POPUP_EDIT_DUE_Y);
+    const lv_img_dsc_t * title_src = oil_popup_replace_mode ? &oil_replace : &oil_popup_due;
+    lv_img_set_src(due_img, title_src);
+    place_oil_popup_edit_title(due_img, title_src);
 
     lv_obj_t * close_button = create_oil_popup_text_button(
         popup,
@@ -1516,9 +1655,10 @@ static void show_oil_popup_edit_content(lv_obj_t * popup)
     }
 }
 
-static void show_oil_popup(void)
+static void show_oil_popup_with_mode(bool edit_mode, bool replace_mode)
 {
     if (oil_popup_overlay) return;
+    oil_popup_replace_mode = replace_mode;
 
     oil_popup_overlay = lv_obj_create(lv_scr_act());
     lv_obj_set_size(oil_popup_overlay, SCREEN_WIDTH, SCREEN_HEIGHT);
@@ -1544,13 +1684,39 @@ static void show_oil_popup(void)
     lv_obj_set_style_shadow_color(popup, lv_color_black(), 0);
     lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
 
-    show_oil_popup_confirm_content(popup);
+    if (edit_mode) show_oil_popup_edit_content(popup);
+    else show_oil_popup_confirm_content(popup);
+}
+
+static void show_oil_popup(void)
+{
+    show_oil_popup_with_mode(false, false);
+}
+
+static void show_oil_replace_popup(bool edit_mode)
+{
+    show_oil_popup_with_mode(edit_mode, true);
+}
+
+static void oil_touch_area_pressed_event_cb(lv_event_t * e)
+{
+    LV_UNUSED(e);
+    oil_touch_long_pressed = false;
 }
 
 static void oil_touch_area_event_cb(lv_event_t * e)
 {
     LV_UNUSED(e);
-    show_oil_popup();
+    if (!oil_touch_long_pressed) {
+        show_oil_popup();
+    }
+}
+
+static void oil_touch_area_long_press_event_cb(lv_event_t * e)
+{
+    LV_UNUSED(e);
+    oil_touch_long_pressed = true;
+    show_oil_replace_popup(false);
 }
 
 static void create_center_status_bar(lv_obj_t* parent)
@@ -1623,7 +1789,9 @@ static void create_center_status_bar(lv_obj_t* parent)
     lv_obj_set_style_pad_all(touch_area, 0, 0);
     lv_obj_add_flag(touch_area, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(touch_area, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(touch_area, oil_touch_area_event_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(touch_area, oil_touch_area_pressed_event_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(touch_area, oil_touch_area_event_cb, LV_EVENT_SHORT_CLICKED, NULL);
+    lv_obj_add_event_cb(touch_area, oil_touch_area_long_press_event_cb, LV_EVENT_LONG_PRESSED, NULL);
 }
 
 void create_monitor_item(lv_obj_t * parent, monitor_item_t * item, const char * name, lv_color_t color, int32_t ignored)
@@ -1834,11 +2002,19 @@ void update_monitor_ui(monitor_item_t * item, int32_t usage)
     if (!item || !item->bar || !item->label_val) return;
     if (usage < 0) usage = 0;
     if (usage > 100) usage = 100;
-    int32_t current = lv_bar_get_value(item->bar);
-    if (current == usage) return;
 
-    lv_bar_set_value(item->bar, usage, LV_ANIM_ON);
-    lv_label_set_text_fmt(item->label_val, "%d%%", usage);
+    char text[8];
+    format_percent_text(text, sizeof(text), usage);
+    int32_t current = lv_bar_get_value(item->bar);
+    bool labelSame = label_text_matches(item->label_val, text);
+    if (current == usage && labelSame) return;
+
+    if (current != usage) {
+        lv_bar_set_value(item->bar, usage, LV_ANIM_ON);
+    }
+    if (!labelSame) {
+        lv_label_set_text(item->label_val, text);
+    }
 }
 
 void UiResetRuntimeState(void)
@@ -1916,6 +2092,7 @@ void UiResetRuntimeState(void)
     overheat_icon_rendered_visible = false;
     service_icon_requested_visible = false;
     oil_percent_requested_value = 100;
+    oil_percent_rendered_value = -1;
     main_test_panel = NULL;
     debug_container = NULL;
     debug_swipe_zone = NULL;
@@ -2098,6 +2275,15 @@ void create_goodbye_screen(const char* time_text, const char* distance_text)
 
 void create_debug_screen(void)
 {
+#if !UI_DEBUG_SCREEN_ENABLED
+    debug_container = NULL;
+    debug_swipe_zone = NULL;
+    debug_close_zone = NULL;
+    debug_log_ta = NULL;
+    debug_screen_visible = false;
+    debug_animation_active = false;
+    return;
+#else
     debug_container = lv_obj_create(lv_scr_act());
     lv_obj_set_size(debug_container, SCREEN_WIDTH, SCREEN_HEIGHT);
     lv_obj_clear_flag(debug_container, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
@@ -2171,6 +2357,7 @@ void create_debug_screen(void)
     debug_screen_visible = false;
     debug_animation_active = false;
     create_debug_swipe_zone();
+#endif
 }
 
 void GaugeInit()

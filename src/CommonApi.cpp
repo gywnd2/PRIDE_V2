@@ -36,6 +36,17 @@ static uint8_t service_odo_to_oil_percent(uint32_t totalKm, uint32_t cycleKm)
     return (uint8_t)(((remainingKm * 100U) + (cycleKm / 2U)) / cycleKm);
 }
 
+static uint32_t bump_service_odo_revision(uint32_t revision)
+{
+    return (revision == UINT32_MAX) ? UINT32_MAX : (revision + 1U);
+}
+
+static uint32_t saturating_add_u32(uint32_t value, uint32_t delta)
+{
+    if (UINT32_MAX - value < delta) return UINT32_MAX;
+    return value + delta;
+}
+
 #ifndef UART_LOG_MAX_PER_SEC
 #define UART_LOG_MAX_PER_SEC 48U
 #endif
@@ -118,6 +129,8 @@ void SystemAPI::Init()
     uiState.wifiRssi = -100;
     uiState.oilPercent = 100;
     uiState.serviceOilCycleKm = SERVICE_OIL_CYCLE_DEFAULT_KM;
+    serviceOdoState = {};
+    serviceOdoStateLoaded = false;
 
     if (_gifMutex == NULL) {
         _gifMutex = xSemaphoreCreateMutex();
@@ -133,6 +146,11 @@ void SystemAPI::Init()
         _uiStateMutex = xSemaphoreCreateMutex();
     }
     TEST_LOG("ui state mutex=%p", _uiStateMutex);
+
+    if (_serviceOdoMutex == NULL) {
+        _serviceOdoMutex = xSemaphoreCreateMutex();
+    }
+    TEST_LOG("service odo mutex=%p", _serviceOdoMutex);
 }
 
 // ----------------------------------------------------------------
@@ -298,43 +316,211 @@ void SystemAPI::FinishDisplayLogSession() {
     storageSubscriber.SetEvent(STORAGE_FINISH_DISPLAY_LOG_SESSION);
 }
 
+bool SystemAPI::LoadServiceOdoState(ServiceOdoState* outState) {
+    if (!outState || !storageMgr || !_serviceOdoMutex) return false;
+
+    if (xSemaphoreTake(_serviceOdoMutex, pdMS_TO_TICKS(120)) != pdTRUE) {
+        return false;
+    }
+
+    bool ok = true;
+    if (!serviceOdoStateLoaded) {
+        ServiceOdoState loaded = {};
+        ok = storageMgr->ReadServiceOdoState(&loaded);
+        if (ok) {
+            serviceOdoState = loaded;
+            serviceOdoStateLoaded = true;
+        }
+    }
+
+    if (ok) *outState = serviceOdoState;
+    xSemaphoreGive(_serviceOdoMutex);
+    return ok;
+}
+
+bool SystemAPI::StoreServiceOdoState(const ServiceOdoState& state) {
+    if (!storageMgr || !_serviceOdoMutex) return false;
+    if (!storageMgr->WriteServiceOdoState(state)) return false;
+
+    if (xSemaphoreTake(_serviceOdoMutex, pdMS_TO_TICKS(120)) != pdTRUE) {
+        return false;
+    }
+    serviceOdoState = state;
+    serviceOdoStateLoaded = true;
+    xSemaphoreGive(_serviceOdoMutex);
+    return true;
+}
+
+bool SystemAPI::GetCurrentOrLastOdoKm(uint32_t* outOdoKm) {
+    if (!outOdoKm) return false;
+    *outOdoKm = 0;
+
+    if (obdMgr) {
+        uint32_t currentOdoKm = obdMgr->GetOdometerKm();
+        if (currentOdoKm > 0 || obdMgr->GetOBDStatus() == OBD_CONNECTED) {
+            *outOdoKm = currentOdoKm;
+            return true;
+        }
+    }
+
+    ServiceOdoState state = {};
+    if (LoadServiceOdoState(&state) && state.last_seen_odo_km > 0) {
+        *outOdoKm = state.last_seen_odo_km;
+        return true;
+    }
+    return false;
+}
+
 bool SystemAPI::RefreshServiceDueFromStorage() {
     if (!storageMgr) {
         PublishServiceDue(false);
         return false;
     }
 
-    uint32_t totalKm = 0;
-    bool ok = storageMgr->ReadServiceOdoKm(&totalKm);
-    if (ok) PublishServiceOdoKm(totalKm);
+    uint32_t cycleKm = SERVICE_OIL_CYCLE_DEFAULT_KM;
+    bool cycleOk = storageMgr->ReadServiceOilCycleKm(&cycleKm);
+    cycleKm = normalize_service_oil_cycle(cycleKm);
+    if (LockUiState(pdMS_TO_TICKS(20))) {
+        uiState.serviceOilCycleKm = cycleKm;
+        UnlockUiState();
+    }
+
+    ServiceOdoState state = {};
+    bool ok = LoadServiceOdoState(&state);
+    if (ok) PublishServiceOdoKm(state.last_service_km);
     else PublishServiceOdoKm(0);
-    return ok;
+    return ok && cycleOk;
 }
 
-bool SystemAPI::AddServiceOdoDistance(uint32_t deltaKm, uint32_t* totalOut) {
+bool SystemAPI::UpdateServiceOdoFromCurrentOdo(uint32_t currentOdoKm, uint32_t* serviceOut, bool persistSnapshot) {
+    if (serviceOut) *serviceOut = 0;
     if (!storageMgr) return false;
 
-    uint32_t totalKm = 0;
-    bool ok = storageMgr->AddServiceOdoKm(deltaKm, &totalKm);
+    ServiceOdoState state = {};
+    if (!LoadServiceOdoState(&state)) return false;
+
+    bool shouldPersist = persistSnapshot;
+    uint32_t serviceKm = state.last_service_km;
+    uint32_t deltaKm = 0;
+
+    if (!state.base_odo_valid) {
+        state.base_odo_valid = true;
+        state.base_odo_km = 0;
+        state.last_seen_odo_km = currentOdoKm;
+        shouldPersist = true;
+        TEST_LOG("service odo accumulator initialized source=%u service=%u",
+                 (unsigned int)currentOdoKm,
+                 (unsigned int)serviceKm);
+    } else if (state.last_seen_odo_km == 0U) {
+        state.last_seen_odo_km = currentOdoKm;
+        shouldPersist = true;
+        TEST_LOG("service odo source baseline set source=%u service=%u",
+                 (unsigned int)currentOdoKm,
+                 (unsigned int)serviceKm);
+    } else if (currentOdoKm >= state.last_seen_odo_km) {
+        deltaKm = currentOdoKm - state.last_seen_odo_km;
+        if (deltaKm > 0U) {
+            serviceKm = saturating_add_u32(serviceKm, deltaKm);
+        }
+    } else {
+        TEST_LOG("service odo source reset last_seen=%u current=%u service=%u",
+                 (unsigned int)state.last_seen_odo_km,
+                 (unsigned int)currentOdoKm,
+                 (unsigned int)serviceKm);
+        if (persistSnapshot) {
+            shouldPersist = true;
+        }
+    }
+
+    state.last_seen_odo_km = currentOdoKm;
+    state.last_service_km = serviceKm;
+
+    bool ok = true;
+    if (shouldPersist) {
+        state.revision = bump_service_odo_revision(state.revision);
+        ok = StoreServiceOdoState(state);
+    } else if (_serviceOdoMutex && xSemaphoreTake(_serviceOdoMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        serviceOdoState = state;
+        serviceOdoStateLoaded = true;
+        xSemaphoreGive(_serviceOdoMutex);
+    }
+
     if (ok) {
-        PublishServiceOdoKm(totalKm);
-        if (totalOut) *totalOut = totalKm;
+        PublishServiceOdoKm(serviceKm);
+        if (serviceOut) *serviceOut = serviceKm;
     }
     return ok;
 }
 
-bool SystemAPI::ResetServiceOdo() {
-    if (!storageMgr) return false;
+bool SystemAPI::PersistServiceOdoSnapshot(uint32_t currentOdoKm, uint32_t* serviceOut) {
+    return UpdateServiceOdoFromCurrentOdo(currentOdoKm, serviceOut, true);
+}
 
-    uint32_t totalKm = 0;
-    bool ok = storageMgr->ResetServiceOdoKm(&totalKm);
+bool SystemAPI::ResetServiceOdo() {
+    uint32_t currentOdoKm = 0;
+    if (!GetCurrentOrLastOdoKm(&currentOdoKm)) return false;
+
+    ServiceOdoState state = {};
+    LoadServiceOdoState(&state);
+    state.revision = bump_service_odo_revision(state.revision);
+    state.base_odo_valid = true;
+    state.base_odo_km = 0;
+    state.last_seen_odo_km = currentOdoKm;
+    state.last_service_km = 0;
+
+    bool ok = StoreServiceOdoState(state);
     if (ok) {
         if (obdMgr) {
             obdMgr->ResetServiceOdoSessionBase();
         }
-        PublishServiceOdoKm(totalKm);
+        PublishServiceOdoKm(0);
     }
     return ok;
+}
+
+bool SystemAPI::GetServiceOdoKm(uint32_t* outKm) {
+    if (outKm) *outKm = 0;
+    if (!outKm) return false;
+
+    ServiceOdoState state = {};
+    if (!LoadServiceOdoState(&state)) return false;
+    *outKm = state.last_service_km;
+    return true;
+}
+
+bool SystemAPI::SetServiceOdoKm(uint32_t serviceKm) {
+    if (!storageMgr) return false;
+
+    uint32_t currentOdoKm = 0;
+    GetCurrentOrLastOdoKm(&currentOdoKm);
+
+    ServiceOdoState state = {};
+    LoadServiceOdoState(&state);
+    state.revision = bump_service_odo_revision(state.revision);
+    state.base_odo_valid = true;
+    state.base_odo_km = 0;
+    state.last_seen_odo_km = currentOdoKm;
+    state.last_service_km = serviceKm;
+
+    bool ok = StoreServiceOdoState(state);
+    if (ok) PublishServiceOdoKm(state.last_service_km);
+    return ok;
+}
+
+bool SystemAPI::GetServiceOdoBaseKm(uint32_t* outKm, bool* valid) {
+    if (outKm) *outKm = 0;
+    if (valid) *valid = false;
+    if (!outKm) return false;
+
+    ServiceOdoState state = {};
+    if (!LoadServiceOdoState(&state)) return false;
+    *outKm = state.last_service_km;
+    if (valid) *valid = true;
+    return true;
+}
+
+bool SystemAPI::SetServiceOdoBaseKm(uint32_t baseOdoKm) {
+    return SetServiceOdoKm(baseOdoKm);
 }
 
 bool SystemAPI::GetServiceOilCycleKm(uint32_t* outKm) {
@@ -368,6 +554,34 @@ extern "C" bool ui_reset_service_odo(void)
     SystemAPI* system = SystemAPI::getInstance();
     if (!system) return false;
     return system->ResetServiceOdo();
+}
+
+extern "C" bool ui_get_service_odo_km(uint32_t* outKm)
+{
+    SystemAPI* system = SystemAPI::getInstance();
+    if (!system) return false;
+    return system->GetServiceOdoKm(outKm);
+}
+
+extern "C" bool ui_set_service_odo_km(uint32_t serviceKm)
+{
+    SystemAPI* system = SystemAPI::getInstance();
+    if (!system) return false;
+    return system->SetServiceOdoKm(serviceKm);
+}
+
+extern "C" bool ui_get_service_odo_base_km(uint32_t* outKm, bool* valid)
+{
+    SystemAPI* system = SystemAPI::getInstance();
+    if (!system) return false;
+    return system->GetServiceOdoBaseKm(outKm, valid);
+}
+
+extern "C" bool ui_set_service_odo_base_km(uint32_t baseOdoKm)
+{
+    SystemAPI* system = SystemAPI::getInstance();
+    if (!system) return false;
+    return system->SetServiceOdoBaseKm(baseOdoKm);
 }
 
 extern "C" bool ui_get_service_oil_cycle_km(uint32_t* outKm)
@@ -467,13 +681,8 @@ void SystemAPI::PublishServiceDue(bool due) {
 }
 
 void SystemAPI::PublishServiceOdoKm(uint32_t totalKm) {
-    uint32_t cycleKm = SERVICE_OIL_CYCLE_DEFAULT_KM;
-    if (storageMgr) {
-        storageMgr->ReadServiceOilCycleKm(&cycleKm);
-    }
-    cycleKm = normalize_service_oil_cycle(cycleKm);
-
     if (LockUiState(pdMS_TO_TICKS(20))) {
+        uint32_t cycleKm = normalize_service_oil_cycle(uiState.serviceOilCycleKm);
         uiState.serviceOdoKm = totalKm;
         uiState.serviceOilCycleKm = cycleKm;
         uiState.serviceDue = totalKm >= cycleKm;

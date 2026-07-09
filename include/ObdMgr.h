@@ -19,8 +19,8 @@ struct ObdData
     uint16_t coolant;
     uint16_t voltage;
     uint16_t rpm;
-    uint32_t odometer_km;      // total distance in km (PID 0131 fallback)
-    uint32_t trip_distance_km; // delta since first odometer read after boot
+    uint32_t odometer_km;      // source distance counter in km (currently PID 0131)
+    uint32_t trip_distance_km; // delta since first source counter read after boot
     uint32_t drive_time_sec;   // seconds since boot
     int16_t outside_temp;
     bool outside_temp_valid;
@@ -97,6 +97,7 @@ protected:
     void QueryVoltage(uint16_t &voltage_level);
     void QueryRPM(uint16_t &rpm_value);
     void QueryOdometer(uint32_t &odometer_km);
+    bool QueryClusterOdometer(uint32_t &odometer_km, String* payloadOut = nullptr);
     void QueryDistAfterErrorClear(uint16_t &distance);
     void QueryMaf(float &fuel_consumption);
 
@@ -133,6 +134,22 @@ public:
     void ResetServiceOdoSessionBase(void);
     bool QueryOutsideTemp(float& outsideTempC);
     bool QueryPidRaw(const String& pidCommand, String& payloadOut, int8_t& stateOut);
+    bool QueryPidRawWithHeader(const String& header, const String& pidCommand, String& payloadOut, int8_t& stateOut);
+    bool QueryPidRawWithProtocolHeader(const char* protocol,
+                                       const String& header,
+                                       const String& pidCommand,
+                                       String& payloadOut,
+                                       int8_t& stateOut);
+    bool QueryPidValueWithHeader(const String& header,
+                                 uint8_t service,
+                                 uint16_t pid,
+                                 uint8_t numExpectedBytes,
+                                 double scaleFactor,
+                                 double& valueOut,
+                                 String& payloadOut,
+                                 int8_t& stateOut);
+    void PrintOdometerProbe(void);
+    void PrintCanOdometerProbe(uint32_t targetKm, uint32_t durationMs = 5000U);
 };
 
 #endif
